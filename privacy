@@ -1,1 +1,23 @@
-Test 2
+# RWordPad(Custom) — Privacy Policy
+
+RWordPad(Custom) respects user privacy and does not require an account with the application developer.
+
+**Google Drive Access**
+
+RWordPad(Custom) uses Google OAuth 2.0 to access Google Drive with the user's authorization. This access is used to upload, update, retrieve, and manage documents and their backup versions.
+
+**Data Storage**
+
+Documents are transferred directly between the user's computer and their Google Drive account. RWordPad(Custom) does not operate an independent cloud storage server.
+
+Authentication credentials are stored locally and protected using Windows Data Protection API (DPAPI).
+
+**Data Sharing**
+
+RWordPad(Custom) does not intentionally transmit document contents to the developer or unrelated third-party services. Google processes data according to its own privacy policies.
+
+**User Control**
+
+Users can disable cloud backups, revoke Google Drive authorization, and manage or delete their uploaded documents through Google Drive.
+
+Google Drive integration is optional and requires the user's explicit authorization.
