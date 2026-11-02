@@ -1,1 +1,17 @@
-Test
+# WordPad(Custom) — Overview
+
+WordPad(Custom) is a customized Windows text editor based on WordPad, featuring additional editing tools and document management capabilities.
+
+One of its features is **Google Drive Cloud Backup**, which allows users to upload documents directly to their own Google Drive account.
+
+The cloud backup system supports:
+
+- Manual and automatic document uploads.
+- Periodic automatic saving.
+- Document-specific backup settings.
+- Google Drive version history and recovery.
+- Secure Google OAuth authentication.
+
+WordPad(Custom) communicates directly with Google Drive through Google's official API. No additional synchronization software is required.
+
+The application is primarily developed for personal use.
