@@ -10896,9 +10896,8 @@ static INT_PTR CALLBACK rwp_bulk_dialog_proc(HWND dlg, UINT message,
 }
 
 /* Format Search mode. A criterion set to Any is ignored. All enabled
- * criteria must match the same rendered character. Paragraph alignment is
- * checked at paragraph level, but character edits never include paragraph or
- * table delimiters and therefore leave table structure alone. */
+ * criteria must match the same character. Ordinary paragraph endings are
+ * searchable for every formatting criterion; structural table marks are not. */
 typedef struct RWP_FORMAT_CRITERIA
 {
     WCHAR face[LF_FACESIZE];
@@ -11027,6 +11026,37 @@ static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
     return TRUE;
 }
 
+/* A paragraph ending is also a formatted Rich Edit character. Search it for
+ * every formatting criterion (size, face, color, highlight, bold, italic,
+ * underline, alignment) so formatting cannot survive solely on the mark.
+ * Keep row/cell structural delimiters excluded. */
+static BOOL rwp_format_searchable_paragraph_end(LONG cp)
+{
+    PARAFORMAT2 paragraph;
+    TEXTRANGEW preceding;
+    WCHAR character[2] = {0};
+
+    if (cp > 0)
+    {
+        preceding.chrg.cpMin = cp - 1;
+        preceding.chrg.cpMax = cp;
+        preceding.lpstrText = character;
+        SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&preceding);
+        if (character[0] == 0xFFF9 || character[0] == 0xFFFB ||
+            character[0] == 7)
+            return FALSE;
+    }
+    ZeroMemory(&paragraph, sizeof(paragraph));
+    paragraph.cbSize = sizeof(paragraph);
+    SendMessageW(hEditorWnd, EM_GETPARAFORMAT, 0, (LPARAM)&paragraph);
+    if (((paragraph.dwMask & PFM_TABLE) &&
+         (paragraph.wEffects & PFE_TABLE)) ||
+        ((paragraph.dwMask & PFM_TABLEROWDELIMITER) &&
+         (paragraph.wEffects & PFE_TABLEROWDELIMITER)))
+        return FALSE;
+    return TRUE;
+}
+
 static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
                                     const CHARFORMAT2W *cf,
                                     const PARAFORMAT2 *pf)
@@ -11070,9 +11100,9 @@ static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
     return TRUE;
 }
 
-/* Enumerate rendered text characters (including those within table cells),
- * never structural characters or inline object anchors. Adjacent matches are
- * coalesced, but only if their character positions are actually consecutive. */
+/* Enumerate text characters and ordinary paragraph endings for all formatting
+ * criteria. Exclude table structural marks and inline object anchors. Coalesce
+ * only matches at consecutive character positions. */
 static LONG rwp_format_search_apply(HWND dlg,
                                     const RWP_FORMAT_CRITERIA *criteria,
                                     const CHARFORMAT2W *replacement,
@@ -11140,7 +11170,10 @@ static LONG rwp_format_search_apply(HWND dlg,
             if (text[1] >= 0xDC00 && text[1] <= 0xDFFF) span = 2;
             else continue;
         }
-        else if (!text[0] || text[0] < 32 || text[0] == 0xFFFC ||
+        else if (!text[0] ||
+                 (text[0] < 32 && !(text[0] == L'\r' &&
+                   rwp_format_searchable_paragraph_end(cp))) ||
+                 text[0] == 0xFFFC ||
                  (text[0] >= 0xDC00 && text[0] <= 0xDFFF))
             continue;
         ZeroMemory(&cf, sizeof(cf));
@@ -12300,7 +12333,10 @@ static BOOL rwp_unified_char_match(LONG cp, const RWP_FORMAT_CRITERIA *criteria)
     textRange.chrg = range;
     textRange.lpstrText = chars;
     SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&textRange);
-    if (!chars[0] || chars[0] < 32 || chars[0] == 0xfffc ||
+    if (!chars[0] ||
+        (chars[0] < 32 && !(chars[0] == L'\r' &&
+          rwp_format_searchable_paragraph_end(cp))) ||
+        chars[0] == 0xfffc ||
         (chars[0] >= 0xd800 && chars[0] <= 0xdfff)) return FALSE;
     ZeroMemory(&cf, sizeof(cf));
     cf.cbSize = sizeof(cf);
