@@ -402,6 +402,14 @@ static HRESULT STDMETHODCALLTYPE RichEditOleCallback_GetContextMenu(
         AppendMenuW(*lphmenu, MF_STRING, ID_TABLE_SELECT_COLUMN,
                     italian ? L"Seleziona colonna" : L"Select column");
         AppendMenuW(*lphmenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(*lphmenu, MF_STRING, ID_TABLE_COPY_BORDER_FORMAT,
+                    italian ? L"Copia formato bordi cella" :
+                              L"Copy cell border format");
+        if (rwp_has_copied_cell_border_format())
+            AppendMenuW(*lphmenu, itemFlags, ID_TABLE_PASTE_BORDER_FORMAT,
+                        italian ? L"Incolla formato bordi cella" :
+                                  L"Paste cell border format");
+        AppendMenuW(*lphmenu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(*lphmenu, itemFlags, ID_TABLE_ADD_ROW,
                     italian ? L"Aggiungi riga..." : L"Add row...");
         AppendMenuW(*lphmenu, itemFlags, ID_TABLE_ADD_COLUMN,

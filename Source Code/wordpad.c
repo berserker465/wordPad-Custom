@@ -184,6 +184,11 @@ static void rwp_startup_profile_write(void)
 #ifndef GT_RAWTEXT
 #define GT_RAWTEXT 0x00000004
 #endif
+/* Exclude RichEdit's hidden HYPERLINK instructions when copying selected
+ * visible text into the Find field (also supported by modern MSFTEDIT). */
+#ifndef GT_NOHIDDENTEXT
+#define GT_NOHIDDENTEXT 0x00000008
+#endif
 /* RosBE's older GDI headers may omit this GetGlyphIndicesW flag. */
 #ifndef GGI_MARK_NONEXISTING_GLYPHS
 #define GGI_MARK_NONEXISTING_GLYPHS 0x0001
@@ -3806,15 +3811,70 @@ static void rwp_bookmarks_prune_deleted(void)
 static void rwp_bookmark_navigate(int index)
 {
     CHARRANGE anchor;
-    LONG pos;
+    LONG pos, bookmarkLine, firstVisibleLine;
+    LONG lastLine, lastLineCp;
+    ITextRange *endRange;
+    RECT textRect;
+    POINT viewportBottom;
+    LONG endX, endBottomY;
     if (index < 0 || index >= rwpBookmarkCount ||
         !rwpBookmarks[index].range) return;
     if (FAILED(rwpBookmarks[index].range->lpVtbl->GetStart(
             rwpBookmarks[index].range, &pos))) return;
     anchor.cpMin = anchor.cpMax = pos;
     SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&anchor);
-    SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
     SetFocus(hEditorWnd);
+    SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
+
+    /* Put the bookmark at the top when the remaining document permits it.
+     * EM_EXLINEFROMCHAR supports positions beyond 64K characters. */
+    bookmarkLine = (LONG)SendMessageW(hEditorWnd, EM_EXLINEFROMCHAR,
+                                      0, (LPARAM)pos);
+    firstVisibleLine = (LONG)SendMessageW(hEditorWnd, EM_GETFIRSTVISIBLELINE,
+                                          0, 0);
+    if (bookmarkLine > firstVisibleLine)
+        SendMessageW(hEditorWnd, EM_LINESCROLL, 0,
+                     (LPARAM)(bookmarkLine - firstVisibleLine));
+
+    /* EM_LINESCROLL can place the final document line near the top and
+     * expose unpopulated editor space below it. Measure the real bottom of
+     * that line through TOM, then scroll back up one displayed line at a
+     * time until the final line fits as low as possible in the viewport.
+     * Leave the cursor at the bookmark; do not change document contents. */
+    lastLine = (LONG)SendMessageW(hEditorWnd, EM_GETLINECOUNT, 0, 0) - 1;
+    if (lastLine < 0) return;
+    lastLineCp = (LONG)SendMessageW(hEditorWnd, EM_LINEINDEX,
+                                    (WPARAM)lastLine, 0);
+    if (lastLineCp < 0) return;
+    endRange = rwp_bookmark_capture_range(lastLineCp, lastLineCp);
+    if (!endRange) return;
+    SendMessageW(hEditorWnd, EM_GETRECT, 0, (LPARAM)&textRect);
+    viewportBottom.x = textRect.left;
+    viewportBottom.y = textRect.bottom;
+    ClientToScreen(hEditorWnd, &viewportBottom);
+
+    while (endRange->lpVtbl->GetPoint(endRange, tomStart | TA_BOTTOM,
+                                      &endX, &endBottomY) == S_OK &&
+           endBottomY < viewportBottom.y)
+    {
+        LONG previousFirst = (LONG)SendMessageW(hEditorWnd,
+                                 EM_GETFIRSTVISIBLELINE, 0, 0);
+        LONG newFirst;
+        if (previousFirst <= 0) break;
+        SendMessageW(hEditorWnd, EM_LINESCROLL, 0, (LPARAM)-1);
+        newFirst = (LONG)SendMessageW(hEditorWnd,
+                                      EM_GETFIRSTVISIBLELINE, 0, 0);
+        if (newFirst >= previousFirst) break;
+        if (endRange->lpVtbl->GetPoint(endRange, tomStart | TA_BOTTOM,
+                                       &endX, &endBottomY) != S_OK ||
+            endBottomY > viewportBottom.y)
+        {
+            /* Keep the last rendered line fully visible. */
+            SendMessageW(hEditorWnd, EM_LINESCROLL, 0, (LPARAM)1);
+            break;
+        }
+    }
+    endRange->lpVtbl->Release(endRange);
 }
 
 /* Both Add and Use selected text create the bookmark at the selection that
@@ -10896,9 +10956,8 @@ static INT_PTR CALLBACK rwp_bulk_dialog_proc(HWND dlg, UINT message,
 }
 
 /* Format Search mode. A criterion set to Any is ignored. All enabled
- * criteria must match the same rendered character. Paragraph alignment is
- * checked at paragraph level, but character edits never include paragraph or
- * table delimiters and therefore leave table structure alone. */
+ * criteria must match the same character. Ordinary paragraph endings are
+ * searchable for every formatting criterion; structural table marks are not. */
 typedef struct RWP_FORMAT_CRITERIA
 {
     WCHAR face[LF_FACESIZE];
@@ -11027,6 +11086,37 @@ static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
     return TRUE;
 }
 
+/* A paragraph ending is also a formatted Rich Edit character. Search it for
+ * every formatting criterion (size, face, color, highlight, bold, italic,
+ * underline, alignment) so formatting cannot survive solely on the mark.
+ * Keep row/cell structural delimiters excluded. */
+static BOOL rwp_format_searchable_paragraph_end(LONG cp)
+{
+    PARAFORMAT2 paragraph;
+    TEXTRANGEW preceding;
+    WCHAR character[2] = {0};
+
+    if (cp > 0)
+    {
+        preceding.chrg.cpMin = cp - 1;
+        preceding.chrg.cpMax = cp;
+        preceding.lpstrText = character;
+        SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&preceding);
+        if (character[0] == 0xFFF9 || character[0] == 0xFFFB ||
+            character[0] == 7)
+            return FALSE;
+    }
+    ZeroMemory(&paragraph, sizeof(paragraph));
+    paragraph.cbSize = sizeof(paragraph);
+    SendMessageW(hEditorWnd, EM_GETPARAFORMAT, 0, (LPARAM)&paragraph);
+    if (((paragraph.dwMask & PFM_TABLE) &&
+         (paragraph.wEffects & PFE_TABLE)) ||
+        ((paragraph.dwMask & PFM_TABLEROWDELIMITER) &&
+         (paragraph.wEffects & PFE_TABLEROWDELIMITER)))
+        return FALSE;
+    return TRUE;
+}
+
 static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
                                     const CHARFORMAT2W *cf,
                                     const PARAFORMAT2 *pf)
@@ -11070,9 +11160,9 @@ static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
     return TRUE;
 }
 
-/* Enumerate rendered text characters (including those within table cells),
- * never structural characters or inline object anchors. Adjacent matches are
- * coalesced, but only if their character positions are actually consecutive. */
+/* Enumerate text characters and ordinary paragraph endings for all formatting
+ * criteria. Exclude table structural marks and inline object anchors. Coalesce
+ * only matches at consecutive character positions. */
 static LONG rwp_format_search_apply(HWND dlg,
                                     const RWP_FORMAT_CRITERIA *criteria,
                                     const CHARFORMAT2W *replacement,
@@ -11140,7 +11230,10 @@ static LONG rwp_format_search_apply(HWND dlg,
             if (text[1] >= 0xDC00 && text[1] <= 0xDFFF) span = 2;
             else continue;
         }
-        else if (!text[0] || text[0] < 32 || text[0] == 0xFFFC ||
+        else if (!text[0] ||
+                 (text[0] < 32 && !(text[0] == L'\r' &&
+                   rwp_format_searchable_paragraph_end(cp))) ||
+                 text[0] == 0xFFFC ||
                  (text[0] >= 0xDC00 && text[0] <= 0xDFFF))
             continue;
         ZeroMemory(&cf, sizeof(cf));
@@ -12300,7 +12393,10 @@ static BOOL rwp_unified_char_match(LONG cp, const RWP_FORMAT_CRITERIA *criteria)
     textRange.chrg = range;
     textRange.lpstrText = chars;
     SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&textRange);
-    if (!chars[0] || chars[0] < 32 || chars[0] == 0xfffc ||
+    if (!chars[0] ||
+        (chars[0] < 32 && !(chars[0] == L'\r' &&
+          rwp_format_searchable_paragraph_end(cp))) ||
+        chars[0] == 0xfffc ||
         (chars[0] >= 0xd800 && chars[0] <= 0xdfff)) return FALSE;
     ZeroMemory(&cf, sizeof(cf));
     cf.cbSize = sizeof(cf);
@@ -12766,26 +12862,31 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
     return FALSE;
 }
 
-/* Ctrl+H mirrors Ctrl+F: use a short, single-paragraph selection as the
- * initial Find value. Never replace the user's query for an empty/oversized
- * or multiline selection. The editor's selection is not modified here. */
+/* Shared by Ctrl+F and Ctrl+H: prefill only short, single-paragraph
+ * VISIBLE selected text. Friendly-name hyperlinks include an invisible
+ * HYPERLINK instruction in RichEdit's character story; don't search for it.
+ * Validate the retrieved length rather than the raw selection length, since
+ * a short visible label can have a very long hidden destination. */
 static BOOL rwp_unified_selection_to_find(WCHAR *buffer, SIZE_T capacity)
 {
     CHARRANGE selection;
     GETTEXTEX request;
+    LRESULT copied;
     SIZE_T i;
     if (!hEditorWnd || capacity < 2) return FALSE;
     SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
-    if (selection.cpMin < 0 || selection.cpMax <= selection.cpMin ||
-        (SIZE_T)(selection.cpMax - selection.cpMin) >= capacity) return FALSE;
+    if (selection.cpMin < 0 || selection.cpMax <= selection.cpMin) return FALSE;
     ZeroMemory(&request, sizeof(request));
     request.cb = (DWORD)(capacity * sizeof(WCHAR));
-    request.flags = GT_SELECTION;
+    request.flags = GT_SELECTION | GT_NOHIDDENTEXT;
     request.codepage = 1200;
     buffer[0] = 0;
-    SendMessageW(hEditorWnd, EM_GETTEXTEX, (WPARAM)&request, (LPARAM)buffer);
+    copied = SendMessageW(hEditorWnd, EM_GETTEXTEX,
+                          (WPARAM)&request, (LPARAM)buffer);
     buffer[capacity - 1] = 0;
-    if (!buffer[0]) return FALSE;
+    /* Reject truncated selections instead of prefilling an incomplete query. */
+    if (copied <= 0 || (SIZE_T)copied >= capacity - 1 || !buffer[0])
+        return FALSE;
     for (i = 0; buffer[i]; ++i)
         if (buffer[i] == L'\r' || buffer[i] == L'\n') return FALSE;
     return TRUE;
@@ -15023,8 +15124,6 @@ static void dialog_find(LPFINDREPLACEW fr, BOOL replace)
     static WCHAR selBuffer[128];
     static WCHAR replaceBuffer[128];
     static FINDREPLACE_custom custom_data;
-    static const WCHAR endl = '\r';
-    FINDTEXTW ft;
 
     /* Allow only one search/replace dialog to open */
     if (hFindWnd)
@@ -15044,23 +15143,14 @@ static void dialog_find(LPFINDREPLACEW fr, BOOL replace)
     fr->lStructSize = sizeof(FINDREPLACEW);
     fr->hwndOwner = hMainWnd;
     fr->Flags = FR_HIDEUPDOWN;
-    /* Find field is filled with the selected text if it is non-empty
-     * and stays within the same paragraph, otherwise the previous
-     * find field is used. */
-    SendMessageW(hEditorWnd, EM_GETSEL, (WPARAM)&ft.chrg.cpMin,
-                 (LPARAM)&ft.chrg.cpMax);
-    ft.lpstrText = &endl;
-    if (ft.chrg.cpMin != ft.chrg.cpMax &&
-        SendMessageW(hEditorWnd, EM_FINDTEXTW, FR_DOWN, (LPARAM)&ft) == -1)
-    {
-        /* Use a temporary buffer for the selected text so that the saved
-         * find field is only overwritten when a find/replace is clicked. */
-        GETTEXTEX gt = {sizeof(selBuffer), GT_SELECTION, 1200, NULL, NULL};
-        SendMessageW(hEditorWnd, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)selBuffer);
+    /* Prefill with the selected visible text, excluding hidden hyperlink
+     * destinations. Keep the previous query for empty/multiline/long selections.
+     * Use a temporary buffer; the saved query is unchanged until execution. */
+    if (rwp_unified_selection_to_find(selBuffer,
+                      sizeof(selBuffer)/sizeof(selBuffer[0])))
         fr->lpstrFindWhat = selBuffer;
-    } else {
+    else
         fr->lpstrFindWhat = custom_data.findBuffer;
-    }
     fr->lpstrReplaceWith = replaceBuffer;
     custom_data.endPos = -1;
     custom_data.wrapped = FALSE;
@@ -19550,83 +19640,105 @@ static BYTE rwp_cell_at_position(const WCHAR *raw,
     return (BYTE)cell;
 }
 
-/* Table Management intentionally changes native Rich Edit formatting, not
- * raw RTF: unlike deleting rows, resizing borders/cells requires no changes
- * to table delimiters and should not split the table. All sizes are in mm. */
+/* Table management changes native Rich Edit cell properties, keeping the
+ * row/column structure intact. Each cell has independent top, bottom, left,
+ * and right colors and widths. Widths are stored in twips (20 twips/pt). */
+enum
+{
+    RWP_BORDER_ALL = 0,
+    RWP_BORDER_TOP,
+    RWP_BORDER_BOTTOM,
+    RWP_BORDER_LEFT,
+    RWP_BORDER_RIGHT,
+    RWP_BORDER_COUNT
+};
+
+typedef struct RWP_TABLE_BORDER_SETTING
+{
+    BOOL setWidth, setColor;
+    SHORT widthTwips;
+    COLORREF color;
+} RWP_TABLE_BORDER_SETTING;
+
 typedef struct RWP_TABLE_MANAGEMENT
 {
-    BOOL setHeight, setWidth, setBorderColor, setBorderThickness;
-    UINT heightMM, widthMM, borderTwips;
-    COLORREF borderColor;
+    BOOL setHeight, setWidth;
+    UINT heightMM, widthMM;
+    RWP_TABLE_BORDER_SETTING border[RWP_BORDER_COUNT];
+    SHORT initialWidths[RWP_BORDER_COUNT];
+    BOOL pasteCopiedBorders;
 } RWP_TABLE_MANAGEMENT;
 
-/* Older builds may still contain the original table-management dialog
- * resource even after wordpad.c is rebuilt. Add the missing thickness controls
- * dynamically in that case, making the feature usable without changing or
- * concealing the original height, width, color, or action controls. */
-static void rwp_ensure_table_thickness_controls(HWND dialog)
+/* Internal format painter clipboard: independent of text/data clipboard.
+ * Only valid after a successful Copy cell border format operation. */
+typedef struct RWP_COPIED_CELL_BORDER_FORMAT
 {
-    HWND field, label;
-    HWND height = GetDlgItem(dialog, IDC_TABLE_MGMT_HEIGHT);
-    HFONT font = height ? (HFONT)SendMessageW(height, WM_GETFONT, 0, 0) : NULL;
-    RECT rect = {0, 0, 0, 25};
-    RECT bounds;
-    int shift, i;
-    static const int moveIds[] = {
-        IDC_TABLE_MGMT_COLOR_BUTTON, IDC_TABLE_MGMT_COLOR_SWATCH,
-        IDC_TABLE_MGMT_NOTE, IDOK, IDCANCEL
+    BOOL valid;
+    RWP_TABLE_BORDER_SETTING side[RWP_BORDER_COUNT];
+} RWP_COPIED_CELL_BORDER_FORMAT;
+
+static RWP_COPIED_CELL_BORDER_FORMAT rwpCopiedCellBorders;
+
+BOOL rwp_has_copied_cell_border_format(void)
+{
+    return rwpCopiedCellBorders.valid;
+}
+
+static const int rwp_table_border_width_ids[RWP_BORDER_COUNT] = {
+    IDC_TABLE_MGMT_THICKNESS,
+    IDC_TABLE_MGMT_TOP_WIDTH, IDC_TABLE_MGMT_BOTTOM_WIDTH,
+    IDC_TABLE_MGMT_LEFT_WIDTH, IDC_TABLE_MGMT_RIGHT_WIDTH
+};
+static const int rwp_table_border_button_ids[RWP_BORDER_COUNT] = {
+    IDC_TABLE_MGMT_COLOR_BUTTON,
+    IDC_TABLE_MGMT_TOP_COLOR_BUTTON, IDC_TABLE_MGMT_BOTTOM_COLOR_BUTTON,
+    IDC_TABLE_MGMT_LEFT_COLOR_BUTTON, IDC_TABLE_MGMT_RIGHT_COLOR_BUTTON
+};
+static const int rwp_table_border_swatch_ids[RWP_BORDER_COUNT] = {
+    IDC_TABLE_MGMT_COLOR_SWATCH,
+    IDC_TABLE_MGMT_TOP_COLOR_SWATCH, IDC_TABLE_MGMT_BOTTOM_COLOR_SWATCH,
+    IDC_TABLE_MGMT_LEFT_COLOR_SWATCH, IDC_TABLE_MGMT_RIGHT_COLOR_SWATCH
+};
+
+/* Combo item zero deliberately means "do not touch existing edge". Index one
+ * sets an edge to 0 twips, so previously visible borders can be hidden. */
+static void rwp_table_management_init_width_combo(HWND dialog, int side,
+            SHORT initialTwips, BOOL italian)
+{
+    HWND list = GetDlgItem(dialog, rwp_table_border_width_ids[side]);
+    static const SHORT choicesTwips[] = {
+        0, 0, 10, 20, 30, 40, 60, 80, 100, 120, 160, 200
     };
-
-    field = GetDlgItem(dialog, IDC_TABLE_MGMT_THICKNESS);
-    label = GetDlgItem(dialog, IDC_TABLE_MGMT_THICKNESS_LABEL);
-    if (field && label) return; /* Updated resource: no adjustment. */
-
-    /* Original template: shift controls below the insertion point down by
-     * 25 dialog units, and grow the window by the same number of pixels. */
-    if (!field)
+    static const WCHAR *const labels[] = {
+        L"", L"0 pt (none)", L"0.5 pt", L"1 pt", L"1.5 pt", L"2 pt",
+        L"3 pt", L"4 pt", L"5 pt", L"6 pt", L"8 pt", L"10 pt"
+    };
+    static const WCHAR *const italianLabels[] = {
+        L"", L"0 pt (nessuno)", L"0,5 pt", L"1 pt", L"1,5 pt", L"2 pt",
+        L"3 pt", L"4 pt", L"5 pt", L"6 pt", L"8 pt", L"10 pt"
+    };
+    WCHAR unchanged[80];
+    int i;
+    if (!list) return;
+    if (side == RWP_BORDER_ALL)
+        lstrcpyW(unchanged, italian ? L"Invariato" : L"Unchanged");
+    else
     {
-        MapDialogRect(dialog, &rect);
-        shift = rect.bottom;
-        GetWindowRect(dialog, &bounds);
-        SetWindowPos(dialog, NULL, 0, 0, bounds.right - bounds.left,
-                     bounds.bottom - bounds.top + shift,
-                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        for (i = 0; i < sizeof(moveIds)/sizeof(moveIds[0]); ++i)
-        {
-            HWND child = GetDlgItem(dialog, moveIds[i]);
-            RECT pos;
-            if (!child) continue;
-            GetWindowRect(child, &pos);
-            MapWindowPoints(HWND_DESKTOP, dialog, (POINT *)&pos, 2);
-            SetWindowPos(child, NULL, pos.left, pos.top + shift, 0, 0,
-                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        LONG hundredths = (LONG)initialTwips * 5;
+        if (hundredths < 0) hundredths = 0;
+        wsprintfW(unchanged, italian ? L"Invariato (%ld,%02ld pt)"
+                                     : L"Unchanged (%ld.%02ld pt)",
+                 hundredths / 100, hundredths % 100);
     }
-    if (!label)
+    for (i = 0; i < (int)(sizeof(choicesTwips)/sizeof(choicesTwips[0])); ++i)
     {
-        RECT pos = {10, 60, 122, 73};
-        MapDialogRect(dialog, &pos);
-        label = CreateWindowExW(0, L"STATIC", L"Border thickness:",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            pos.left, pos.top, pos.right - pos.left, pos.bottom - pos.top,
-            dialog, (HMENU)(INT_PTR)IDC_TABLE_MGMT_THICKNESS_LABEL,
-            GetModuleHandleW(NULL), NULL);
-        if (label && font) SendMessageW(label, WM_SETFONT, (WPARAM)font, TRUE);
+        const WCHAR *label = i ? (italian ? italianLabels[i] : labels[i]) : unchanged;
+        LRESULT index = SendMessageW(list, CB_ADDSTRING, 0, (LPARAM)label);
+        if (index != CB_ERR && index != CB_ERRSPACE)
+            SendMessageW(list, CB_SETITEMDATA, (WPARAM)index,
+                         (LPARAM)choicesTwips[i]);
     }
-    if (!field)
-    {
-        RECT pos = {150, 57, 230, 142};
-        MapDialogRect(dialog, &pos);
-        field = CreateWindowExW(0, L"COMBOBOX", L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
-            pos.left, pos.top, pos.right - pos.left, pos.bottom - pos.top,
-            dialog, (HMENU)(INT_PTR)IDC_TABLE_MGMT_THICKNESS,
-            GetModuleHandleW(NULL), NULL);
-        if (field && font) SendMessageW(field, WM_SETFONT, (WPARAM)font, TRUE);
-    }
-    if (!field || !label)
-        MessageBoxW(dialog, L"Could not create the border thickness control.",
-                    L"Table management", MB_OK | MB_ICONERROR);
+    SendMessageW(list, CB_SETCURSEL, 0, 0);
 }
 
 static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
@@ -19635,98 +19747,111 @@ static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
     RWP_TABLE_MANAGEMENT *options =
         (RWP_TABLE_MANAGEMENT *)GetWindowLongPtrW(dialog, DWLP_USER);
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    int side;
     switch (message)
     {
     case WM_INITDIALOG:
-            rwp_theme_dialog(dialog);
         options = (RWP_TABLE_MANAGEMENT *)lParam;
         SetWindowLongPtrW(dialog, DWLP_USER, lParam);
-        rwp_ensure_table_thickness_controls(dialog);
+        rwp_theme_dialog(dialog);
         SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_HEIGHT, EM_SETLIMITTEXT, 3, 0);
         SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_WIDTH, EM_SETLIMITTEXT, 3, 0);
-        {
-            /* Selected units are twips (20 twips per pt); selection zero
-             * deliberately means "leave existing borders unchanged". */
-            static const WCHAR *const choices[] = {
-                L"Unchanged", L"0.5 pt", L"1 pt", L"1.5 pt", L"2 pt",
-                L"3 pt", L"4 pt", L"5 pt", L"6 pt", L"8 pt", L"10 pt"
-            };
-            static const UINT thicknesses[] = { 0, 10, 20, 30, 40, 60,
-                                                   80, 100, 120, 160, 200 };
-            UINT i;
-            HWND list = GetDlgItem(dialog, IDC_TABLE_MGMT_THICKNESS);
-            if (!list) break;
-            for (i = 0; i < sizeof(choices)/sizeof(choices[0]); ++i)
-            {
-                LRESULT index = SendMessageW(list, CB_ADDSTRING, 0,
-                                               (LPARAM)choices[i]);
-                if (index != CB_ERR && index != CB_ERRSPACE)
-                    SendMessageW(list, CB_SETITEMDATA, (WPARAM)index,
-                                 thicknesses[i]);
-            }
-            SendMessageW(list, CB_SETCURSEL, 0, 0);
-        }
+        for (side = 0; side < RWP_BORDER_COUNT; ++side)
+            rwp_table_management_init_width_combo(dialog, side,
+                options->initialWidths[side], italian);
         if (italian)
         {
             SetWindowTextW(dialog, L"Gestione tabella");
             SetDlgItemTextW(dialog, IDC_TABLE_MGMT_HEIGHT_LABEL, L"Altezza righe (mm):");
             SetDlgItemTextW(dialog, IDC_TABLE_MGMT_WIDTH_LABEL, L"Larghezza colonne (mm):");
-            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_COLOR_BUTTON, L"Colore bordo...");
-            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_THICKNESS_LABEL,
-                            L"Spessore bordi:");
-            SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_THICKNESS,
-                               CB_DELETESTRING, 0, 0);
-            SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_THICKNESS,
-                               CB_INSERTSTRING, 0, (LPARAM)L"Invariato");
-            SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_THICKNESS,
-                               CB_SETITEMDATA, 0, 0);
-            SendDlgItemMessageW(dialog, IDC_TABLE_MGMT_THICKNESS,
-                               CB_SETCURSEL, 0, 0);
-            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_NOTE,
-                L"Campi vuoti: invariati. Spessore: celle selezionate; colore: intera tabella.");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_EDGE_HEADER, L"Bordo");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_THICKNESS_LABEL, L"Spessore");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_COLOR_HEADER, L"Colore");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_ALL_LABEL, L"Tutti i lati");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_TOP_LABEL, L"Superiore");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_BOTTOM_LABEL, L"Inferiore");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_LEFT_LABEL, L"Sinistro");
+            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_RIGHT_LABEL, L"Destro");
             SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
         }
-        if (!italian)
-            SetDlgItemTextW(dialog, IDC_TABLE_MGMT_NOTE,
-                L"Blank fields: unchanged. Thickness: selected cells; color: entire table.");
-        /* The border-thickness combo is created dynamically above. */
+        SetDlgItemTextW(dialog, IDC_TABLE_MGMT_NOTE, italian ?
+            L"Invariato conserva i valori; 0 pt nasconde il bordo. I lati condivisi aggiornano entrambe le celle." :
+            L"Unchanged preserves values; 0 pt hides the border. Shared edges update both adjoining cells.");
+        for (side = 0; side < RWP_BORDER_COUNT; ++side)
+            SetDlgItemTextW(dialog, rwp_table_border_button_ids[side],
+                            italian ? L"Scegli..." : L"Choose...");
         rwp_theme_dialog(dialog);
         rwp_enlarge_legacy_dialog(dialog);
         SetFocus(GetDlgItem(dialog, IDC_TABLE_MGMT_HEIGHT));
         return FALSE;
 
     case WM_DRAWITEM:
-        if (wParam == IDC_TABLE_MGMT_COLOR_SWATCH && options)
-        {
-            draw_table_color_swatch((const DRAWITEMSTRUCT *)lParam,
-                                    options->borderColor);
-            return TRUE;
-        }
+        if (options)
+            for (side = 0; side < RWP_BORDER_COUNT; ++side)
+                if ((int)wParam == rwp_table_border_swatch_ids[side])
+                {
+                    draw_table_color_swatch((const DRAWITEMSTRUCT *)lParam,
+                                            options->border[side].color);
+                    return TRUE;
+                }
         break;
 
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDC_TABLE_MGMT_COLOR_BUTTON && options)
+        if (HIWORD(wParam) == CBN_SELCHANGE &&
+            LOWORD(wParam) == IDC_TABLE_MGMT_THICKNESS)
         {
-            HMENU popup = GetSubMenu(hColorPopupMenu, 0);
-            HWND button = GetDlgItem(dialog, IDC_TABLE_MGMT_COLOR_BUTTON);
-            RECT rect;
-            int selected;
-            decorate_color_menu(popup);
-            EnableMenuItem(popup, ID_COLOR_AUTOMATIC, MF_BYCOMMAND | MF_GRAYED);
-            GetWindowRect(button, &rect);
-            selected = TrackPopupMenu(popup,
-                          TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON |
-                          TPM_RETURNCMD | TPM_NONOTIFY,
-                          rect.left, rect.bottom, 0, dialog, NULL);
-            EnableMenuItem(popup, ID_COLOR_AUTOMATIC, MF_BYCOMMAND | MF_ENABLED);
-            if (selected >= ID_COLOR_FIRST && selected <= ID_COLOR_LAST &&
-                selected != ID_COLOR_AUTOMATIC)
-            {
-                options->setBorderColor = TRUE;
-                options->borderColor = textcolors[selected - ID_COLOR_FIRST];
-                InvalidateRect(GetDlgItem(dialog, IDC_TABLE_MGMT_COLOR_SWATCH), NULL, TRUE);
-            }
+            /* Choosing All sides after individual widths resets those
+             * overrides. A later individual choice overrides All sides. */
+            HWND allList = GetDlgItem(dialog, IDC_TABLE_MGMT_THICKNESS);
+            if (SendMessageW(allList, CB_GETCURSEL, 0, 0) > 0)
+                for (side = RWP_BORDER_TOP; side < RWP_BORDER_COUNT; ++side)
+                    SendDlgItemMessageW(dialog, rwp_table_border_width_ids[side],
+                                        CB_SETCURSEL, 0, 0);
             return TRUE;
+        }
+        if (options)
+        {
+            for (side = 0; side < RWP_BORDER_COUNT; ++side)
+                if (LOWORD(wParam) == rwp_table_border_button_ids[side])
+                {
+                    HMENU popup = GetSubMenu(hColorPopupMenu, 0);
+                    HWND button = GetDlgItem(dialog, rwp_table_border_button_ids[side]);
+                    RECT rect;
+                    int selected, k;
+                    if (!popup || !button) return TRUE;
+                    decorate_color_menu(popup);
+                    EnableMenuItem(popup, ID_COLOR_AUTOMATIC,
+                                   MF_BYCOMMAND | MF_GRAYED);
+                    GetWindowRect(button, &rect);
+                    selected = TrackPopupMenu(popup,
+                            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON |
+                            TPM_RETURNCMD | TPM_NONOTIFY,
+                            rect.left, rect.bottom, 0, dialog, NULL);
+                    EnableMenuItem(popup, ID_COLOR_AUTOMATIC,
+                                   MF_BYCOMMAND | MF_ENABLED);
+                    if (selected >= ID_COLOR_FIRST && selected <= ID_COLOR_LAST &&
+                        selected != ID_COLOR_AUTOMATIC)
+                    {
+                        COLORREF chosen = textcolors[selected - ID_COLOR_FIRST];
+                        options->border[side].setColor = TRUE;
+                        options->border[side].color = chosen;
+                        if (side == RWP_BORDER_ALL)
+                        {
+                            /* All sides chosen last replaces prior specific
+                             * colors; sides picked afterward take precedence. */
+                            for (k = RWP_BORDER_TOP; k < RWP_BORDER_COUNT; ++k)
+                            {
+                                options->border[k].setColor = FALSE;
+                                options->border[k].color = chosen;
+                                InvalidateRect(GetDlgItem(dialog,
+                                    rwp_table_border_swatch_ids[k]), NULL, TRUE);
+                            }
+                        }
+                        InvalidateRect(GetDlgItem(dialog,
+                            rwp_table_border_swatch_ids[side]), NULL, TRUE);
+                    }
+                    return TRUE;
+                }
         }
         if (LOWORD(wParam) == IDCANCEL)
         {
@@ -19736,17 +19861,20 @@ static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
         if (LOWORD(wParam) == IDOK && options)
         {
             WCHAR height[16], width[16];
-            BOOL valid;
+            BOOL valid, changed = FALSE;
             GetDlgItemTextW(dialog, IDC_TABLE_MGMT_HEIGHT, height, 16);
             GetDlgItemTextW(dialog, IDC_TABLE_MGMT_WIDTH, width, 16);
+            for (side = 0; side < RWP_BORDER_COUNT; ++side)
             {
-                HWND list = GetDlgItem(dialog, IDC_TABLE_MGMT_THICKNESS);
-                LRESULT index = SendMessageW(list, CB_GETCURSEL, 0, 0);
-                LRESULT twips = (index == CB_ERR) ? 0 :
-                        SendMessageW(list, CB_GETITEMDATA, index, 0);
-                options->setBorderThickness = (index != CB_ERR &&
-                                               twips != CB_ERR && twips > 0);
-                if (options->setBorderThickness) options->borderTwips = (UINT)twips;
+                HWND list = GetDlgItem(dialog, rwp_table_border_width_ids[side]);
+                LRESULT index = list ? SendMessageW(list, CB_GETCURSEL, 0, 0) : CB_ERR;
+                LRESULT twips = (index == CB_ERR) ? CB_ERR :
+                                 SendMessageW(list, CB_GETITEMDATA, index, 0);
+                options->border[side].setWidth = index > 0 && twips != CB_ERR;
+                if (options->border[side].setWidth)
+                    options->border[side].widthTwips = (SHORT)twips;
+                if (options->border[side].setColor || options->border[side].setWidth)
+                    changed = TRUE;
             }
             options->setHeight = height[0] != 0;
             options->setWidth = width[0] != 0;
@@ -19758,7 +19886,7 @@ static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
                 {
                     MessageBoxW(dialog,
                         italian ? L"L'altezza deve essere tra 0 e 300 mm (0 = automatica)."
-                                : L"Height must be 0–300 mm (0 = automatic).",
+                                : L"Height must be 0-300 mm (0 = automatic).",
                         italian ? L"Tabella" : L"Table", MB_OK | MB_ICONINFORMATION);
                     return TRUE;
                 }
@@ -19771,13 +19899,12 @@ static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
                 {
                     MessageBoxW(dialog,
                         italian ? L"La larghezza deve essere tra 5 e 300 mm."
-                                : L"Width must be 5–300 mm.",
+                                : L"Width must be 5-300 mm.",
                         italian ? L"Tabella" : L"Table", MB_OK | MB_ICONINFORMATION);
                     return TRUE;
                 }
             }
-            if (!options->setHeight && !options->setWidth &&
-                !options->setBorderColor && !options->setBorderThickness)
+            if (!options->setHeight && !options->setWidth && !changed)
             {
                 EndDialog(dialog, IDCANCEL);
                 return TRUE;
@@ -19806,10 +19933,178 @@ static BOOL rwp_management_get_row(LONG cp, RWP_TABLEROWPARMS *row,
            row->cCell > 0 && row->cCell <= 63;
 }
 
-/* Set the selected rows' height, selected columns' widths (in every table
- * row), border thickness for the selected cells, and/or border color for the
- * complete table. This is deliberately not an RTF text edit: all existing
- * content and delimiter positions stay. */
+/* Independently update a single cell edge. A specific edge overrides the
+ * All-sides shortcut for that property; color alone never reveals a 0-width
+ * (hidden) edge. This preserves the other three edges exactly. */
+static void rwp_apply_cell_edge(RWP_TABLECELLPARMS *cell,
+                                const RWP_TABLE_MANAGEMENT *options, int side)
+{
+    const RWP_TABLE_BORDER_SETTING *all = &options->border[RWP_BORDER_ALL];
+    const RWP_TABLE_BORDER_SETTING *specific = &options->border[side];
+    const RWP_TABLE_BORDER_SETTING *width = specific->setWidth ? specific : all;
+    const RWP_TABLE_BORDER_SETTING *color = specific->setColor ? specific : all;
+    SHORT *edgeWidth = NULL;
+    COLORREF *edgeColor = NULL;
+    switch (side)
+    {
+    case RWP_BORDER_TOP:
+        edgeWidth = &cell->dyBrdrTop;
+        edgeColor = &cell->crBrdrTop;
+        break;
+    case RWP_BORDER_BOTTOM:
+        edgeWidth = &cell->dyBrdrBottom;
+        edgeColor = &cell->crBrdrBottom;
+        break;
+    case RWP_BORDER_LEFT:
+        edgeWidth = &cell->dxBrdrLeft;
+        edgeColor = &cell->crBrdrLeft;
+        break;
+    case RWP_BORDER_RIGHT:
+        edgeWidth = &cell->dxBrdrRight;
+        edgeColor = &cell->crBrdrRight;
+        break;
+    default:
+        return;
+    }
+    if (width->setWidth) *edgeWidth = width->widthTwips;
+    if (color->setColor) *edgeColor = color->color;
+}
+
+/* Does a real text selection include any part of this cell, including its
+ * terminal mark for empty cells? Walk cell marks in this row, rather than
+ * applying a rectangle to intermediate rows of a linear Rich Edit selection. */
+static BOOL rwp_cell_intersects_table_selection(const WCHAR *raw, LONG rawLength,
+            const RWP_TABLE_ROW_RANGE *row, const CHARRANGE *selection, int column)
+{
+    LONG cellStart = row->start + 2, cellEnd;
+    int cell = 0;
+    if (!raw || !row || !selection || column < 0 ||
+        cellStart >= row->end || cellStart >= rawLength) return FALSE;
+    while (cellStart < row->end && cellStart < rawLength)
+    {
+        cellEnd = cellStart;
+        while (cellEnd < row->end && cellEnd < rawLength && raw[cellEnd] != 7)
+            ++cellEnd;
+        if (cellEnd >= row->end || cellEnd >= rawLength) return FALSE;
+        if (cell == column)
+            return selection->cpMin <= cellEnd &&
+                   selection->cpMax > cellStart;
+        cellStart = cellEnd + 1;
+        ++cell;
+    }
+    return FALSE;
+}
+
+/* An internal grid line belongs visually to two adjacent cells. RichEdit
+ * can render the opposite cell's border instead of the one being edited.
+ * Selectors here mirror precisely the existing real-selection semantics, so
+ * mirroring never unexpectedly expands a text selection into a rectangle. */
+static BOOL rwp_management_cell_targeted(const WCHAR *raw, LONG rawLength,
+        const RWP_TABLE_ROW_RANGE *rows, SIZE_T rowIndex,
+        SIZE_T selectedFirst, SIZE_T selectedLast, const CHARRANGE *selection,
+        BYTE activeColumn, int column)
+{
+    if (rowIndex < selectedFirst || rowIndex > selectedLast) return FALSE;
+    if (selection->cpMax <= selection->cpMin) return column == activeColumn;
+    return rwp_cell_intersects_table_selection(raw, rawLength,
+                                               &rows[rowIndex], selection, column);
+}
+
+/* An explicit setting for one side overrides the All-sides shortcut per
+ * property. Never infer a change from a displayed "Unchanged" value. */
+static RWP_TABLE_BORDER_SETTING rwp_management_requested_edge(
+        const RWP_TABLE_MANAGEMENT *options, int side)
+{
+    RWP_TABLE_BORDER_SETTING requested = options->border[side];
+    const RWP_TABLE_BORDER_SETTING *all = &options->border[RWP_BORDER_ALL];
+    if (!requested.setWidth && all->setWidth)
+    {
+        requested.setWidth = TRUE;
+        requested.widthTwips = all->widthTwips;
+    }
+    if (!requested.setColor && all->setColor)
+    {
+        requested.setColor = TRUE;
+        requested.color = all->color;
+    }
+    return requested;
+}
+
+/* On a shared boundary, RichEdit may paint the other cell's edge. Mirror only
+ * explicitly edited properties onto its opposite edge so both cells describe
+ * the same visible line. A selected neighbor's own explicit setting for a
+ * given property wins over mirroring that property. */
+static BOOL rwp_management_sync_shared_edge(RWP_TABLECELLPARMS *cell, int side,
+        const RWP_TABLE_BORDER_SETTING *requested,
+        const RWP_TABLE_BORDER_SETTING *ownSetting, BOOL ownSelected)
+{
+    SHORT *width;
+    COLORREF *color;
+    BOOL changed = FALSE;
+    switch (side)
+    {
+    case RWP_BORDER_TOP:
+        width = &cell->dyBrdrTop;
+        color = &cell->crBrdrTop;
+        break;
+    case RWP_BORDER_BOTTOM:
+        width = &cell->dyBrdrBottom;
+        color = &cell->crBrdrBottom;
+        break;
+    case RWP_BORDER_LEFT:
+        width = &cell->dxBrdrLeft;
+        color = &cell->crBrdrLeft;
+        break;
+    case RWP_BORDER_RIGHT:
+        width = &cell->dxBrdrRight;
+        color = &cell->crBrdrRight;
+        break;
+    default:
+        return FALSE;
+    }
+    if (requested->setWidth && !(ownSelected && ownSetting->setWidth) &&
+        *width != requested->widthTwips)
+    {
+        *width = requested->widthTwips;
+        changed = TRUE;
+    }
+    if (requested->setColor && !(ownSelected && ownSetting->setColor) &&
+        *color != requested->color)
+    {
+        *color = requested->color;
+        changed = TRUE;
+    }
+    return changed;
+}
+
+/* Avoid syncing unrelated cells in irregular tables, where the same column
+ * index may represent a different horizontal interval. Only two unmerged
+ * vertically adjacent cells covering the identical interval share a border. */
+static BOOL rwp_management_vertically_aligned(
+        const RWP_TABLEROWPARMS *aRow, const RWP_TABLECELLPARMS *a,
+        const RWP_TABLEROWPARMS *bRow, const RWP_TABLECELLPARMS *b, int column)
+{
+    LONG aLeft, bLeft;
+    int n;
+    if (column >= aRow->cCell || column >= bRow->cCell ||
+        aRow->dxIndent != bRow->dxIndent ||
+        aRow->nAlignment != bRow->nAlignment) return FALSE;
+    if (a[column].fMergeTop || a[column].fMergePrev ||
+        a[column].fMergeStart || a[column].fMergeCont ||
+        b[column].fMergeTop || b[column].fMergePrev ||
+        b[column].fMergeStart || b[column].fMergeCont) return FALSE;
+    aLeft = bLeft = 0;
+    for (n = 0; n < column; ++n)
+    {
+        aLeft += a[n].dxWidth;
+        bLeft += b[n].dxWidth;
+    }
+    return aLeft == bLeft && a[column].dxWidth == b[column].dxWidth;
+}
+
+/* Height applies to the selected row(s), column width to the specified
+ * columns throughout the same table (as before), and border controls ONLY
+ * to the clicked cell or cells intersecting the real text selection. */
 static BOOL rwp_apply_table_management(const RWP_TABLE_MANAGEMENT *options)
 {
     RWP_TABLE_ROW_RANGE *rows = NULL;
@@ -19826,9 +20121,9 @@ static BOOL rwp_apply_table_management(const RWP_TABLE_MANAGEMENT *options)
     RTF_MEMORY backup = {0};
     RTF_INPUT_MEMORY restore;
     BOOL modifiedBefore, changed = FALSE, success = FALSE;
-    BOOL selectionColumns = FALSE;
+    BOOL selectionColumns = FALSE, changeBorders = FALSE;
     LONG widthTwips = 0, heightTwips = 0;
-    int col;
+    int col, side;
 
     if (!options || !rwp_get_current_table_row(&currentRow, currentCells,
              &activeColumn, &rowStart, &rowEnd) ||
@@ -19838,22 +20133,23 @@ static BOOL rwp_apply_table_management(const RWP_TABLE_MANAGEMENT *options)
     if (!rwp_get_raw_document(&raw, &rawLength)) goto done;
     leftColumn = rightColumn = activeColumn;
 
-    /* A genuine, retained text/cell selection determines the column span.
-     * A plain right-click without selection changes only the clicked column. */
+    /* A genuine retained cell selection determines the column span. When
+     * a popup is opened outside that selection, the resolved selection is
+     * collapsed to the right-clicked point and only its cell is targeted. */
     if (selection.cpMax > selection.cpMin)
     {
         LONG endpoints[2] = { selection.cpMin, selection.cpMax - 1 };
         BYTE cols[2];
-        int side;
+        int endpoint;
         selectionColumns = TRUE;
-        for (side = 0; side < 2; ++side)
+        for (endpoint = 0; endpoint < 2; ++endpoint)
         {
             SIZE_T j;
             for (j = first; j <= last; ++j)
-                if (endpoints[side] >= rows[j].start &&
-                    endpoints[side] < rows[j].end + 2) break;
+                if (endpoints[endpoint] >= rows[j].start &&
+                    endpoints[endpoint] < rows[j].end + 2) break;
             if (j > last) { selectionColumns = FALSE; break; }
-            cols[side] = rwp_cell_at_position(raw, &rows[j], endpoints[side]);
+            cols[endpoint] = rwp_cell_at_position(raw, &rows[j], endpoints[endpoint]);
         }
         if (selectionColumns)
         {
@@ -19861,21 +20157,20 @@ static BOOL rwp_apply_table_management(const RWP_TABLE_MANAGEMENT *options)
             rightColumn = cols[0] > cols[1] ? cols[0] : cols[1];
         }
     }
+    for (side = 0; side < RWP_BORDER_COUNT; ++side)
+    {
+        if (options->border[side].setColor || options->border[side].setWidth)
+            changeBorders = TRUE;
+    }
     if (options->setWidth) widthTwips = MulDiv(options->widthMM, 14400, 254);
     if (options->setHeight) heightTwips = MulDiv(options->heightMM, 14400, 254);
 
-    /* Validate ALL target rows before making the first change. */
+    /* Validate all targets before changing anything. */
     for (i = first; i <= last; ++i)
     {
         LONG tableWidth = 0;
         if (!rwp_management_get_row(rows[i].start, &row, cells)) goto done;
         if (options->setWidth && rightColumn >= row.cCell) goto done;
-        /* A selected column must exist in every selected row. Refuse the
-         * operation entirely rather than partially modifying ragged tables. */
-        if (options->setBorderThickness &&
-            ((i >= selectedFirst && i <= selectedLast) ||
-             (selectedLast < last && i == selectedLast + 1)) &&
-            rightColumn >= row.cCell) goto done;
         if (options->setWidth)
         {
             for (col = 0; col < row.cCell; ++col)
@@ -19897,59 +20192,132 @@ static BOOL rwp_apply_table_management(const RWP_TABLE_MANAGEMENT *options)
     {
         BOOL selectedHeight = options->setHeight &&
             i >= selectedFirst && i <= selectedLast;
-        BOOL selectedThickness = options->setBorderThickness &&
+        BOOL selectedBorders = changeBorders &&
             i >= selectedFirst && i <= selectedLast;
-        /* On interior row boundaries, Rich Edit may draw the next cell's
-         * top edge over this cell's bottom edge. Match that top edge too. */
-        BOOL nextRowTop = options->setBorderThickness &&
-            selectedLast < last && i == selectedLast + 1;
-        if (!options->setWidth && !options->setBorderColor &&
-            !selectedThickness && !nextRowTop && !selectedHeight)
-            continue;
+        BOOL rowChanged = options->setWidth || selectedHeight;
+        if (!options->setWidth && !selectedHeight && !selectedBorders) continue;
         if (!rwp_management_get_row(rows[i].start, &row, cells)) goto rollback;
         if (selectedHeight) row.dyHeight = heightTwips;
         for (col = 0; col < row.cCell; ++col)
         {
             if (options->setWidth && col >= leftColumn && col <= rightColumn)
                 cells[col].dxWidth = widthTwips;
-            /* Only the rows and columns covered by the retained cell
-             * selection receive the new thickness. With no selection this
-             * resolves to the cell containing the caret/right-click. */
-            if (selectedThickness && col >= leftColumn && col <= rightColumn)
+            if (selectedBorders &&
+                rwp_management_cell_targeted(raw, rawLength, rows, i,
+                    selectedFirst, selectedLast, &selection, activeColumn, col))
             {
-                cells[col].dxBrdrLeft = (SHORT)options->borderTwips;
-                cells[col].dyBrdrTop = (SHORT)options->borderTwips;
-                cells[col].dxBrdrRight = (SHORT)options->borderTwips;
-                cells[col].dyBrdrBottom = (SHORT)options->borderTwips;
-            }
-            if (nextRowTop && col >= leftColumn && col <= rightColumn)
-                cells[col].dyBrdrTop = (SHORT)options->borderTwips;
-            if (options->setBorderColor)
-            {
-                if (cells[col].dxBrdrLeft == 0) cells[col].dxBrdrLeft = 20;
-                if (cells[col].dyBrdrTop == 0) cells[col].dyBrdrTop = 20;
-                if (cells[col].dxBrdrRight == 0) cells[col].dxBrdrRight = 20;
-                if (cells[col].dyBrdrBottom == 0) cells[col].dyBrdrBottom = 20;
-                cells[col].crBrdrLeft = options->borderColor;
-                cells[col].crBrdrTop = options->borderColor;
-                cells[col].crBrdrRight = options->borderColor;
-                cells[col].crBrdrBottom = options->borderColor;
+                for (side = RWP_BORDER_TOP; side < RWP_BORDER_COUNT; ++side)
+                    rwp_apply_cell_edge(&cells[col], options, side);
+                rowChanged = TRUE;
             }
         }
+        if (!rowChanged) continue;
         row.cRow = 1;
         row.iCell = 0;
         row.fIdentCells = 0;
         row.cpStartRow = rows[i].start;
-        /* A failure might occur after Rich Edit has started mutating the
-         * row; treat any attempted SET as requiring backup restoration. */
+        /* SETTABLEPARMS may have mutated the document even on failure. */
         changed = TRUE;
         if ((HRESULT)SendMessageW(hEditorWnd, EM_SETTABLEPARMS,
                                   (WPARAM)&row, (LPARAM)cells) != S_OK)
             goto rollback;
     }
+    /* Each internal grid line has TWO stored cell edges. RichEdit may draw
+     * the neighbor's edge instead of the edge the user changed. Mirror the
+     * changed COLOR and/or WIDTH onto the opposite edge, without touching
+     * unrelated formatting. Keep independently edited neighbor properties.
+     * On FORMAT PASTE to multiple selected cells, two copied sides can
+     * disagree on the same internal boundary. Prefer the left cell's RIGHT
+     * and upper cell's BOTTOM edge, so both touching cells end up matching. */
+    if (changeBorders)
+    {
+        RWP_TABLE_BORDER_SETTING top =
+            rwp_management_requested_edge(options, RWP_BORDER_TOP);
+        RWP_TABLE_BORDER_SETTING bottom =
+            rwp_management_requested_edge(options, RWP_BORDER_BOTTOM);
+        RWP_TABLE_BORDER_SETTING left =
+            rwp_management_requested_edge(options, RWP_BORDER_LEFT);
+        RWP_TABLE_BORDER_SETTING right =
+            rwp_management_requested_edge(options, RWP_BORDER_RIGHT);
+        BOOL hasTop = top.setWidth || top.setColor;
+        BOOL hasBottom = bottom.setWidth || bottom.setColor;
+        BOOL hasLeft = left.setWidth || left.setColor;
+        BOOL hasRight = right.setWidth || right.setColor;
+        for (i = first; i <= last; ++i)
+        {
+            RWP_TABLEROWPARMS aboveRow, belowRow;
+            RWP_TABLECELLPARMS above[63], below[63];
+            BOOL haveAbove = FALSE, haveBelow = FALSE, rowChanged = FALSE;
+            if (!rwp_management_get_row(rows[i].start, &row, cells)) goto rollback;
+            if (i > first && hasBottom && i - 1 >= selectedFirst &&
+                i - 1 <= selectedLast)
+            {
+                if (!rwp_management_get_row(rows[i-1].start, &aboveRow, above))
+                    goto rollback;
+                haveAbove = TRUE;
+            }
+            if (i < last && hasTop && i + 1 >= selectedFirst &&
+                i + 1 <= selectedLast)
+            {
+                if (!rwp_management_get_row(rows[i+1].start, &belowRow, below))
+                    goto rollback;
+                haveBelow = TRUE;
+            }
+            for (col = 0; col < row.cCell; ++col)
+            {
+                BOOL own = rwp_management_cell_targeted(raw, rawLength,
+                          rows, i, selectedFirst, selectedLast,
+                          &selection, activeColumn, col);
+                /* Current left edge shares previous cell's right edge. */
+                if (hasRight && col > 0 &&
+                    !cells[col].fMergeCont && !cells[col-1].fMergeStart &&
+                    rwp_management_cell_targeted(raw, rawLength, rows, i,
+                       selectedFirst, selectedLast, &selection,
+                       activeColumn, col-1))
+                    rowChanged |= rwp_management_sync_shared_edge(&cells[col],
+                        RWP_BORDER_LEFT, &right, &left,
+                        own && !options->pasteCopiedBorders);
+                /* Current right edge shares next cell's left edge. */
+                if (hasLeft && col+1 < row.cCell &&
+                    !cells[col].fMergeStart && !cells[col+1].fMergeCont &&
+                    rwp_management_cell_targeted(raw, rawLength, rows, i,
+                       selectedFirst, selectedLast, &selection,
+                       activeColumn, col+1))
+                    rowChanged |= rwp_management_sync_shared_edge(&cells[col],
+                        RWP_BORDER_RIGHT, &left, &right, own);
+                /* Current top edge shares row-above cell's bottom edge. */
+                if (haveAbove &&
+                    rwp_management_vertically_aligned(&row, cells,
+                                                       &aboveRow, above, col) &&
+                    rwp_management_cell_targeted(raw, rawLength, rows, i-1,
+                       selectedFirst, selectedLast, &selection,
+                       activeColumn, col))
+                    rowChanged |= rwp_management_sync_shared_edge(&cells[col],
+                        RWP_BORDER_TOP, &bottom, &top,
+                        own && !options->pasteCopiedBorders);
+                /* Current bottom edge shares row-below cell's top edge. */
+                if (haveBelow &&
+                    rwp_management_vertically_aligned(&row, cells,
+                                                       &belowRow, below, col) &&
+                    rwp_management_cell_targeted(raw, rawLength, rows, i+1,
+                       selectedFirst, selectedLast, &selection,
+                       activeColumn, col))
+                    rowChanged |= rwp_management_sync_shared_edge(&cells[col],
+                        RWP_BORDER_BOTTOM, &top, &bottom, own);
+            }
+            if (!rowChanged) continue;
+            row.cRow = 1;
+            row.iCell = 0;
+            row.fIdentCells = 0;
+            row.cpStartRow = rows[i].start;
+            changed = TRUE;
+            if ((HRESULT)SendMessageW(hEditorWnd, EM_SETTABLEPARMS,
+                                      (WPARAM)&row, (LPARAM)cells) != S_OK)
+                goto rollback;
+        }
+    }
     if (changed)
     {
-        /* Formatting may change layout, but must not change cell/row count. */
         RWP_TABLE_ROW_RANGE *updated = NULL;
         SIZE_T updatedCount = 0;
         BOOL intact = rwp_collect_table_rows(&updated, &updatedCount) &&
@@ -19995,6 +20363,89 @@ done:
     return success;
 }
 
+/* Copy only four border colors and widths: no dimensions, shading, text,
+ * column contents, or cell merge properties. When several cells are selected,
+ * take the first cell in document (row-major) order, not the right-clicked one.
+ * This also works if the caret remains in a different selected cell. */
+static BOOL rwp_copy_cell_border_format(void)
+{
+    RWP_TABLEROWPARMS row;
+    RWP_TABLECELLPARMS cells[63];
+    RWP_TABLE_ROW_RANGE *rows = NULL;
+    RWP_COPIED_CELL_BORDER_FORMAT copied = {0};
+    WCHAR *raw = NULL;
+    LONG rawLength = 0, start, end;
+    BYTE clickedColumn;
+    SIZE_T count = 0, first, last, selectedFirst, selectedLast, i;
+    CHARRANGE selection;
+    int column = -1;
+    BOOL found = FALSE;
+
+    if (!hEditorWnd || !rwp_get_current_table_row(&row, cells,
+              &clickedColumn, &start, &end) ||
+        !rwp_collect_table_rows(&rows, &count) || !count ||
+        !rwp_selected_table_rows(rows, count, &first, &last,
+              &selectedFirst, &selectedLast, &selection)) goto done;
+
+    if (selection.cpMax > selection.cpMin)
+    {
+        if (!rwp_get_raw_document(&raw, &rawLength)) goto done;
+        for (i = selectedFirst; i <= selectedLast && !found; ++i)
+        {
+            if (!rwp_management_get_row(rows[i].start, &row, cells)) goto done;
+            for (column = 0; column < row.cCell; ++column)
+                if (rwp_cell_intersects_table_selection(raw, rawLength,
+                        &rows[i], &selection, column))
+                {
+                    found = TRUE;
+                    break;
+                }
+        }
+    }
+    else
+    {
+        column = (int)clickedColumn;
+        found = TRUE;
+    }
+    if (!found || column < 0 || column >= row.cCell) goto done;
+
+    copied.side[RWP_BORDER_TOP].widthTwips = cells[column].dyBrdrTop;
+    copied.side[RWP_BORDER_TOP].color = cells[column].crBrdrTop;
+    copied.side[RWP_BORDER_BOTTOM].widthTwips = cells[column].dyBrdrBottom;
+    copied.side[RWP_BORDER_BOTTOM].color = cells[column].crBrdrBottom;
+    copied.side[RWP_BORDER_LEFT].widthTwips = cells[column].dxBrdrLeft;
+    copied.side[RWP_BORDER_LEFT].color = cells[column].crBrdrLeft;
+    copied.side[RWP_BORDER_RIGHT].widthTwips = cells[column].dxBrdrRight;
+    copied.side[RWP_BORDER_RIGHT].color = cells[column].crBrdrRight;
+    for (column = RWP_BORDER_TOP; column < RWP_BORDER_COUNT; ++column)
+        copied.side[column].setWidth = copied.side[column].setColor = TRUE;
+    copied.valid = TRUE;
+    rwpCopiedCellBorders = copied;
+    found = TRUE;
+
+done:
+    if (raw) HeapFree(GetProcessHeap(), 0, raw);
+    if (rows) HeapFree(GetProcessHeap(), 0, rows);
+    return found && copied.valid;
+}
+
+/* Pasting uses the exact same proven per-cell table formatting engine as
+ * Table management, including its undo/rollback and shared-edge mirroring.
+ * A selection gets all selected cells; otherwise only the clicked cell. */
+static BOOL rwp_paste_cell_border_format(void)
+{
+    RWP_TABLE_MANAGEMENT options;
+    int side;
+    if (!rwpCopiedCellBorders.valid || !hEditorWnd ||
+        (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+        return FALSE;
+    ZeroMemory(&options, sizeof(options));
+    for (side = RWP_BORDER_TOP; side < RWP_BORDER_COUNT; ++side)
+        options.border[side] = rwpCopiedCellBorders.side[side];
+    options.pasteCopiedBorders = TRUE;
+    return rwp_apply_table_management(&options);
+}
+
 static void rwp_dialog_table_management(void)
 {
     RWP_TABLE_MANAGEMENT options;
@@ -20007,7 +20458,15 @@ static void rwp_dialog_table_management(void)
     if (!rwp_get_current_table_row(&row, cells, &cellIndex, &start, &end))
         return;
     ZeroMemory(&options, sizeof(options));
-    options.borderColor = cells[cellIndex].crBrdrLeft;
+    options.border[RWP_BORDER_TOP].color = cells[cellIndex].crBrdrTop;
+    options.border[RWP_BORDER_BOTTOM].color = cells[cellIndex].crBrdrBottom;
+    options.border[RWP_BORDER_LEFT].color = cells[cellIndex].crBrdrLeft;
+    options.border[RWP_BORDER_RIGHT].color = cells[cellIndex].crBrdrRight;
+    options.border[RWP_BORDER_ALL].color = cells[cellIndex].crBrdrLeft;
+    options.initialWidths[RWP_BORDER_TOP] = cells[cellIndex].dyBrdrTop;
+    options.initialWidths[RWP_BORDER_BOTTOM] = cells[cellIndex].dyBrdrBottom;
+    options.initialWidths[RWP_BORDER_LEFT] = cells[cellIndex].dxBrdrLeft;
+    options.initialWidths[RWP_BORDER_RIGHT] = cells[cellIndex].dxBrdrRight;
     result = DialogBoxParamW(GetModuleHandleW(NULL),
                   MAKEINTRESOURCEW(IDD_TABLE_MANAGEMENT),
                   hMainWnd, rwp_table_management_proc, (LPARAM)&options);
@@ -22465,7 +22924,7 @@ static LRESULT rwp_show_editor_context_menu(HWND editor, LPARAM lParam)
     POINT point;
     UINT command;
     LONG contextCp;
-    BOOL inTable;
+    BOOL inTable, clickedTable = FALSE;
     const BOOL italian =
         (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN);
 
@@ -22491,6 +22950,7 @@ static LRESULT rwp_show_editor_context_menu(HWND editor, LPARAM lParam)
         if (rwp_locate_table_row(contextCp, &rowStart, &rowEnd))
         {
             inTable = TRUE;
+            clickedTable = TRUE;
             rwpTableContextCp = contextCp;
         }
     }
@@ -22607,6 +23067,19 @@ static LRESULT rwp_show_editor_context_menu(HWND editor, LPARAM lParam)
                     italian ? L"Copia colonna" : L"Copy column");
         AppendMenuW(popup, MF_STRING, ID_TABLE_SELECT_COLUMN,
                     italian ? L"Seleziona colonna" : L"Select column");
+        if (clickedTable)
+        {
+            AppendMenuW(popup, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(popup, MF_STRING, ID_TABLE_COPY_BORDER_FORMAT,
+                        italian ? L"Copia formato bordi cella" :
+                                  L"Copy cell border format");
+            if (rwp_has_copied_cell_border_format())
+                AppendMenuW(popup, MF_STRING |
+                    ((SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY) ?
+                       MF_GRAYED : 0), ID_TABLE_PASTE_BORDER_FORMAT,
+                        italian ? L"Incolla formato bordi cella" :
+                                  L"Paste cell border format");
+        }
     }
     /* Temporary fallback: table membership detection is unreliable on this
      * MSFTEDIT build.  Always show these commands, as in the Insert menu;
@@ -22652,98 +23125,199 @@ static HWND get_clipboard_command_target(HWND hWnd, HWND hwndEditor)
     return hwndEditor;
 }
 
-/* Native TOM case conversion operates on text in-place and keeps every
- * character's original rich formatting, unlike EM_REPLACESEL. Upper/lower are
- * direct operations. For word/sentence case, lowercase the selected range
- * first, then uppercase its initial letters. Scan from right to left so any
- * locale-specific change in character count cannot shift earlier positions.
- * Periods are sentence boundaries even without intervening whitespace. */
+/* Case conversion must be a real Rich Edit undoable text edit. TOM's
+ * ChangeCase changes the glyphs directly on MSFTEDIT, but does not reliably
+ * create an undo record: Ctrl+Z can then undo a previous, unrelated edit.
+ *
+ * Calculate the new case without modifying the document, then replace only
+ * changed UTF-16 code units with EM_REPLACESEL(TRUE). Preserve each original
+ * character format and collect the changes into one native Undo/Redo entry.
+ * Unchanged text (including embedded objects, bookmarks and hidden fields)
+ * stays in place; there is no whole-selection RTF/paste round trip.
+ *
+ * Title and sentence mode use the same right-to-left boundary rules as the
+ * original TOM implementation. The fixed-length Windows character mapping
+ * keeps existing Rich Edit character positions stable. */
 static void rwp_change_selected_capitalization(UINT command)
 {
-    ITextSelection *selection;
+    ITextSelection *selection = NULL;
     ITextRange *character = NULL;
     ITextDocument *undo = NULL;
-    LONG first = 0, last = 0, cp, candidate = -1;
+    WCHAR *text = NULL, *originalText = NULL;
+    BSTR retrieved = NULL;
+    LONG first = 0, last = 0, length, cp, candidate = -1;
     long symbol = 0;
-    HRESULT result;
-    BOOL wordMode, sentenceMode, success = FALSE;
+    CHARRANGE original, glyph;
+    POINT scrollPosition;
+    BOOL wordMode, sentenceMode, changed = FALSE, success = FALSE;
+    BOOL scrollKnown = FALSE, redrawDisabled = FALSE, failed = FALSE;
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
 
     if (!rwp_capitalization_available(hEditorWnd)) return;
     selection = rwp_get_text_selection();
     if (!selection) return;
 
+    if (FAILED(selection->lpVtbl->GetStart(selection, &first)) ||
+        FAILED(selection->lpVtbl->GetEnd(selection, &last)) ||
+        last <= first) goto done;
+    length = last - first;
+    if ((SIZE_T)length > (SIZE_T)-1 / sizeof(*text)) goto done;
+    text = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)length * sizeof(*text));
+    originalText = HeapAlloc(GetProcessHeap(), 0,
+                             (SIZE_T)length * sizeof(*originalText));
+    if (!text || !originalText) goto done;
+    if (FAILED(selection->lpVtbl->GetDuplicate(selection, &character)) ||
+        !character) goto done;
+
+    /* TOM GetText is much faster for large selections. Fall back to GetChar
+     * when paragraph normalization changes the number of UTF-16 units. */
+    if (SUCCEEDED(selection->lpVtbl->GetText(selection, &retrieved)) &&
+        retrieved && SysStringLen(retrieved) == (UINT)length)
+        memcpy(originalText, retrieved, (SIZE_T)length * sizeof(*text));
+    else
+    {
+        for (cp = first; cp < last; ++cp)
+        {
+            if (FAILED(character->lpVtbl->SetRange(character, cp, cp + 1)) ||
+                FAILED(character->lpVtbl->GetChar(character, &symbol))) goto done;
+            originalText[cp - first] = (WCHAR)symbol;
+        }
+    }
+    if (retrieved) { SysFreeString(retrieved); retrieved = NULL; }
+    memcpy(text, originalText, (SIZE_T)length * sizeof(*text));
+
     wordMode = command == ID_CAPITALIZE_WORDS;
     sentenceMode = command == ID_CAPITALIZE_SENTENCES;
-    if (wordMode || sentenceMode)
-    {
-        result = selection->lpVtbl->GetDuplicate(selection, &character);
-        if (FAILED(result) || !character) goto done;
-    }
-
-    if (wordMode || sentenceMode)
-        undo = rwp_begin_table_edit_collection(2);
-
-    result = selection->lpVtbl->ChangeCase(selection,
-                 command == ID_CAPITALIZE_UPPER ? 1 /* tomUpperCase */ :
-                                                  0 /* tomLowerCase */);
-    if (FAILED(result)) goto done;
+    if (command == ID_CAPITALIZE_UPPER)
+        CharUpperBuffW(text, length);
+    else
+        CharLowerBuffW(text, length);
 
     if (wordMode || sentenceMode)
     {
-        /* Read the range after conversion in case a locale-specific mapping
-         * has changed the text length. S_FALSE from ChangeCase is also fine:
-         * the selection may have been lowercase already. */
-        if (FAILED(selection->lpVtbl->GetStart(selection, &first)) ||
-            FAILED(selection->lpVtbl->GetEnd(selection, &last)))
-            goto done;
-
-        /* All text is lowercase at this point. Candidate is the earliest
-         * letter found while walking backward through the current word or
-         * sentence. Only these one-character ranges need further changes. */
-        for (cp = last; cp > first; )
+        for (cp = length; cp > 0; )
         {
+            WCHAR ch;
             BOOL boundary;
             --cp;
-            if (FAILED(character->lpVtbl->SetRange(character, cp, cp + 1)) ||
-                FAILED(character->lpVtbl->GetChar(character, &symbol)))
-                goto done;
-
-            if (IsCharAlphaW((WCHAR)symbol))
+            ch = text[cp];
+            if (IsCharAlphaW(ch))
             {
                 candidate = cp;
                 continue;
             }
-            boundary = wordMode || symbol == L'.' || symbol == L'!' ||
-                       symbol == L'?' || symbol == L'\r' ||
-                       symbol == L'\n' || symbol == L'\v' ||
-                       symbol == L'\f' || symbol == 0x2029;
-            /* Apostrophes within words are not title-case separators. */
-            if (wordMode &&
-                (symbol == L'\'' || symbol == 0x2019 ||
-                 IsCharAlphaNumericW((WCHAR)symbol)))
+            boundary = wordMode || ch == L'.' || ch == L'!' ||
+                       ch == L'?' || ch == L'\r' || ch == L'\n' ||
+                       ch == L'\v' || ch == L'\f' || ch == 0x2029;
+            if (wordMode && (ch == L'\'' || ch == 0x2019 ||
+                             IsCharAlphaNumericW(ch)))
                 boundary = FALSE;
             if (boundary && candidate >= 0)
             {
-                if (FAILED(character->lpVtbl->SetRange(character,
-                                                         candidate, candidate + 1)) ||
-                    FAILED(character->lpVtbl->ChangeCase(character, 1)))
-                    goto done;
+                CharUpperBuffW(text + candidate, 1);
                 candidate = -1;
             }
         }
-        if (candidate >= 0 &&
-            (FAILED(character->lpVtbl->SetRange(character, candidate, candidate + 1)) ||
-             FAILED(character->lpVtbl->ChangeCase(character, 1))))
-            goto done;
+        if (candidate >= 0) CharUpperBuffW(text + candidate, 1);
     }
-    success = TRUE;
+
+    /* Do not create a phantom Undo step for a case conversion that changes
+     * nothing. Check against the original document, without editing it. */
+    for (cp = 0; cp < length; ++cp)
+    {
+        if (originalText[cp] != text[cp])
+        {
+            changed = TRUE;
+            break;
+        }
+    }
+    if (!changed) { success = TRUE; goto done; }
+
+    /* Avoid touching the document if one-step Undo is unavailable. */
+    SendMessageW(hEditorWnd, EM_STOPGROUPTYPING, 0, 0);
+    undo = rwp_begin_table_edit_collection(2);
+    if (!undo)
+    {
+        MessageBoxW(hMainWnd,
+            italian ? L"Impossibile raggruppare la modifica in un'azione annullabile. Il testo non è stato modificato."
+                    : L"Single-step Undo is unavailable. No text was changed.",
+            wszAppTitle, MB_OK | MB_ICONWARNING);
+        goto done;
+    }
+
+    /* The document-background history is independent of Rich Edit Undo.
+     * A text edit must invalidate it to preserve strict Undo ordering. */
+    reset_background_history();
+    original.cpMin = first;
+    original.cpMax = last;
+    scrollKnown = SendMessageW(hEditorWnd, EM_GETSCROLLPOS, 0,
+                               (LPARAM)&scrollPosition) != 0;
+    SendMessageW(hEditorWnd, WM_SETREDRAW, FALSE, 0);
+    redrawDisabled = TRUE;
+
+    /* Backward replacement keeps the coordinates of all earlier characters.
+     * Saving/restoring the format of each replaced character is important
+     * for selections containing multiple colors, fonts, and highlights. */
+    for (cp = last; cp > first; )
+    {
+        CHARFORMAT2W format;
+        WCHAR replacement[2];
+        --cp;
+        if (originalText[cp - first] == text[cp - first]) continue;
+
+        glyph.cpMin = cp;
+        glyph.cpMax = cp + 1;
+        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&glyph);
+        ZeroMemory(&format, sizeof(format));
+        format.cbSize = sizeof(format);
+        SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION,
+                     (LPARAM)&format);
+
+        replacement[0] = text[cp - first];
+        replacement[1] = 0;
+        SendMessageW(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)replacement);
+        if (FAILED(character->lpVtbl->SetRange(character, cp, cp + 1)) ||
+            FAILED(character->lpVtbl->GetChar(character, &symbol)) ||
+            (WCHAR)symbol != replacement[0])
+        {
+            failed = TRUE;
+            break;
+        }
+        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&glyph);
+        if (!SendMessageW(hEditorWnd, EM_SETCHARFORMAT, SCF_SELECTION,
+                          (LPARAM)&format))
+        {
+            failed = TRUE;
+            break;
+        }
+    }
+    success = !failed && cp == first;
+
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&original);
+    if (scrollKnown)
+        SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0,
+                     (LPARAM)&scrollPosition);
 
 done:
+    if (redrawDisabled)
+    {
+        SendMessageW(hEditorWnd, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(hEditorWnd, NULL, FALSE);
+    }
     if (undo) rwp_end_table_edit_collection(undo);
     if (character) character->lpVtbl->Release(character);
-    selection->lpVtbl->Release(selection);
-    if (success)
+    if (selection) selection->lpVtbl->Release(selection);
+    if (retrieved) SysFreeString(retrieved);
+    if (text) HeapFree(GetProcessHeap(), 0, text);
+    if (originalText) HeapFree(GetProcessHeap(), 0, originalText);
+    if (failed)
+        MessageBoxW(hMainWnd,
+            italian ? L"Una parte della conversione non è riuscita. Controllare il testo e, se necessario, annullare la modifica."
+                    : L"Part of the conversion failed. Check the text and undo the change if needed.",
+            wszAppTitle, MB_OK | MB_ICONWARNING);
+    if (success && changed)
     {
+        SendMessageW(hEditorWnd, EM_STOPGROUPTYPING, 0, 0);
         SetFocus(hEditorWnd);
         PostMessageW(hMainWnd, WM_USER, 0, 0);
     }
@@ -23278,6 +23852,36 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 
     case ID_TABLE_MANAGE:
         rwp_dialog_table_management();
+        rwpTableContextCp = -1;
+        break;
+
+    case ID_TABLE_COPY_BORDER_FORMAT:
+        if (!rwp_copy_cell_border_format())
+        {
+            const BOOL italian =
+                PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+            MessageBoxW(hMainWnd,
+                italian ? L"Impossibile copiare il formato bordi della cella selezionata." :
+                          L"Could not copy the selected cell's border format.",
+                italian ? L"Copia formato bordi cella" :
+                          L"Copy cell border format",
+                MB_OK | MB_ICONWARNING);
+        }
+        rwpTableContextCp = -1;
+        break;
+
+    case ID_TABLE_PASTE_BORDER_FORMAT:
+        if (!rwp_paste_cell_border_format())
+        {
+            const BOOL italian =
+                PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+            MessageBoxW(hMainWnd,
+                italian ? L"Impossibile incollare il formato bordi nelle celle selezionate." :
+                          L"Could not paste border formatting into the selected cells.",
+                italian ? L"Incolla formato bordi cella" :
+                          L"Paste cell border format",
+                MB_OK | MB_ICONWARNING);
+        }
         rwpTableContextCp = -1;
         break;
 

@@ -8,7 +8,7 @@ The customized editor includes additional text-editing commands, extended find-a
 
 ## Building
 
-The project uses CMake and Ninja for compilation and requires a suitable Windows build environment, such as the ReactOS Build Environment (RosBE).
+This is Windows-oriented C code. The repository contains `CMakeLists.txt` and a `Build_Cloud_Beta.cmd` helper, which expects CMake and Ninja to be available in a suitable Windows build environment (such as a configured ReactOS Build Environment / RosBE command prompt).
 
 Example, from this directory in a properly configured build environment:
 
@@ -17,7 +17,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-Build requirements and compatibility depend on the selected Windows toolchain. The commands above have not been re-tested as part of this source-publication preparation. The native Google Drive implementation is contained in cloud_native.c and cloud_native.h.
+Build requirements and compatibility depend on the selected Windows toolchain. The commands above have not been re-tested as part of this source-publication preparation. The `cloud_beta/` directory contains an earlier PowerShell-based Google Drive upload proof of concept; the native cloud implementation is in `cloud_native.c` and `cloud_native.h`.
 
 ## Licensing and upstream attribution
 

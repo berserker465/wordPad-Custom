@@ -188,6 +188,8 @@
 #define ID_SHOW_SHORTCUTS 1634
 #define ID_DOCUMENT_COUNTER 1635
 #define ID_INSERT_AT_SIGN 1636
+#define ID_TABLE_COPY_BORDER_FORMAT 1637
+#define ID_TABLE_PASTE_BORDER_FORMAT 1638
 
 #define ID_DATETIME 1600
 #define ID_PARAFORMAT 1601
@@ -304,6 +306,26 @@
 #define IDC_TABLE_MGMT_NOTE 2036
 #define IDC_TABLE_MGMT_THICKNESS 2037
 #define IDC_TABLE_MGMT_THICKNESS_LABEL 2038
+/* Table management: per-edge border controls (All, Top, Bottom, Left, Right). */
+#define IDC_TABLE_MGMT_TOP_WIDTH 28600
+#define IDC_TABLE_MGMT_TOP_COLOR_BUTTON 28601
+#define IDC_TABLE_MGMT_TOP_COLOR_SWATCH 28602
+#define IDC_TABLE_MGMT_BOTTOM_WIDTH 28603
+#define IDC_TABLE_MGMT_BOTTOM_COLOR_BUTTON 28604
+#define IDC_TABLE_MGMT_BOTTOM_COLOR_SWATCH 28605
+#define IDC_TABLE_MGMT_LEFT_WIDTH 28606
+#define IDC_TABLE_MGMT_LEFT_COLOR_BUTTON 28607
+#define IDC_TABLE_MGMT_LEFT_COLOR_SWATCH 28608
+#define IDC_TABLE_MGMT_RIGHT_WIDTH 28609
+#define IDC_TABLE_MGMT_RIGHT_COLOR_BUTTON 28610
+#define IDC_TABLE_MGMT_RIGHT_COLOR_SWATCH 28611
+#define IDC_TABLE_MGMT_ALL_LABEL 28612
+#define IDC_TABLE_MGMT_TOP_LABEL 28613
+#define IDC_TABLE_MGMT_BOTTOM_LABEL 28614
+#define IDC_TABLE_MGMT_LEFT_LABEL 28615
+#define IDC_TABLE_MGMT_RIGHT_LABEL 28616
+#define IDC_TABLE_MGMT_COLOR_HEADER 28617
+#define IDC_TABLE_MGMT_EDGE_HEADER 28618
 #define IDC_IMAGE_NATIVE_LABEL 2040
 #define IDC_IMAGE_CURRENT_LABEL 2041
 #define IDC_IMAGE_USE_PERCENT 2042
@@ -596,6 +618,7 @@ void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp);
 
 /* Shared with olecallback.c for context-menu table targeting. */
 BOOL rwp_set_table_context_for_popup(HWND editor, LONG cp);
+BOOL rwp_has_copied_cell_border_format(void);
 void rwp_set_insert_context_for_popup(HWND editor, LONG cp);
 /* Register the clicked OLE object for the Export preview menu command. */
 BOOL rwp_prepare_object_export_context(HWND editor, LONG cp, void *clickedObject);
