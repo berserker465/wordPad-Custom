@@ -398,6 +398,19 @@ static UINT ID_FINDMSGSTRING;
 static DWORD wordWrap[2];
 static DWORD barState[2];
 static WPARAM fileFormat = SF_RTF;
+/* Plain-text byte encoding is independent of the Rich Edit document format.
+ * Keep it for ordinary saves and Save As to preserve BOM-less UTF-8 files. */
+static UINT rwpTextCodePage = CP_UTF8;
+static BOOL rwpTextUtf8Bom = FALSE;
+
+/* Include the code page only in Rich Edit stream message flags, never in
+ * fileFormat: that variable is also used to index format settings/menus. */
+static WPARAM rwp_text_stream_format(WPARAM format)
+{
+    if (format == SF_TEXT && rwpTextCodePage == CP_UTF8)
+        return SF_TEXT | SF_USECODEPAGE | ((WPARAM)CP_UTF8 << 16);
+    return format;
+}
 /* A file opened as plain text may acquire formatting through toolbar commands,
  * paragraph settings, or an RTF clipboard paste. Preserve that formatting by
  * using RTF on the next ordinary save, regardless of filename extension. */
@@ -8324,6 +8337,59 @@ static void rwp_open_cloud_doc_settings(void)
     }
 }
 
+/* Validate the entire unmarked file, not just its first few bytes. A chunk
+ * boundary may occur inside a multibyte character, so keep UTF-8 state
+ * between ReadFile calls. Reject overlong forms, surrogates, and > U+10FFFF.
+ * Invalid UTF-8 falls back to the existing Windows ANSI code-page path. */
+static BOOL rwp_file_is_valid_utf8(HANDLE hFile)
+{
+    BYTE buffer[16384];
+    DWORD read, i;
+    int remaining = 0;
+    BYTE minimum = 0x80, maximum = 0xbf;
+
+    for (;;)
+    {
+        if (!ReadFile(hFile, buffer, sizeof(buffer), &read, NULL))
+            return FALSE;
+        if (!read) break;
+
+        for (i = 0; i < read; ++i)
+        {
+            BYTE ch = buffer[i];
+            if (remaining)
+            {
+                if (ch < minimum || ch > maximum)
+                    return FALSE;
+                --remaining;
+                minimum = 0x80;
+                maximum = 0xbf;
+            }
+            else if (ch < 0x80)
+            {
+                /* NULs strongly suggest binary/UTF-16 data, not UTF-8 text. */
+                if (!ch) return FALSE;
+            }
+            else if (ch >= 0xc2 && ch <= 0xdf)
+                remaining = 1;
+            else if (ch >= 0xe0 && ch <= 0xef)
+            {
+                remaining = 2;
+                if (ch == 0xe0) minimum = 0xa0;
+                else if (ch == 0xed) maximum = 0x9f;
+            }
+            else if (ch >= 0xf0 && ch <= 0xf4)
+            {
+                remaining = 3;
+                if (ch == 0xf0) minimum = 0x90;
+                else if (ch == 0xf4) maximum = 0x8f;
+            }
+            else return FALSE;
+        }
+    }
+    return remaining == 0;
+}
+
 static void DoOpenFile(LPCWSTR szOpenFileName)
 {
     WCHAR recoveryPath[MAX_PATH];
@@ -8333,9 +8399,11 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     BOOL recovered = FALSE;
     HANDLE hFile;
     EDITSTREAM es;
-    char fileStart[5];
-    DWORD readOut;
+    BYTE fileStart[5] = {0};
+    DWORD readOut = 0;
     WPARAM format = SF_TEXT;
+    UINT textCodePage = CP_UTF8;
+    BOOL textUtf8Bom = FALSE;
     RTF_INPUT_MEMORY normalizedRtf;
     BOOL useNormalizedRtf = FALSE;
 
@@ -8358,27 +8426,44 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
         return;
     }
 
-    ReadFile(hFile, fileStart, 5, &readOut, NULL);
+    if (!ReadFile(hFile, fileStart, sizeof(fileStart), &readOut, NULL))
+    {
+        DWORD error = GetLastError();
+        CloseHandle(hFile);
+        ShowOpenError(error);
+        return;
+    }
     SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
 
-    if(readOut >= 2 && (BYTE)fileStart[0] == 0xff && (BYTE)fileStart[1] == 0xfe)
+    if (readOut >= 2 && fileStart[0] == 0xff && fileStart[1] == 0xfe)
     {
         format = SF_TEXT | SF_UNICODE;
         SetFilePointer(hFile, 2, NULL, FILE_BEGIN);
-    } else if(readOut >= 5)
+    }
+    else if (readOut >= 5 && !memcmp(fileStart, "{\\rtf", 5))
+        format = SF_RTF;
+    else if (readOut >= 4 &&
+             !memcmp(fileStart, "\xd0\xcf\x11\xe0", 4))
     {
-        static const char header[] = "{\\rtf";
-        static const BYTE STG_magic[] = { 0xd0,0xcf,0x11,0xe0 };
-
-        if(!memcmp(header, fileStart, 5))
-            format = SF_RTF;
-        else if (!memcmp(STG_magic, fileStart, sizeof(STG_magic)))
-        {
-            CloseHandle(hFile);
-            MessageBoxWithResStringW(hMainWnd, MAKEINTRESOURCEW(STRING_OLE_STORAGE_NOT_SUPPORTED),
-                    wszAppTitle, MB_OK | MB_ICONEXCLAMATION);
-            return;
-        }
+        CloseHandle(hFile);
+        MessageBoxWithResStringW(hMainWnd,
+                MAKEINTRESOURCEW(STRING_OLE_STORAGE_NOT_SUPPORTED),
+                wszAppTitle, MB_OK | MB_ICONEXCLAMATION);
+        return;
+    }
+    else if (readOut >= 3 && fileStart[0] == 0xef &&
+             fileStart[1] == 0xbb && fileStart[2] == 0xbf)
+    {
+        /* Explicit UTF-8 BOM: keep its presence when saving. */
+        textUtf8Bom = TRUE;
+        SetFilePointer(hFile, 3, NULL, FILE_BEGIN);
+    }
+    else
+    {
+        /* No BOM: trust UTF-8 only when every byte sequence is valid. */
+        if (!rwp_file_is_valid_utf8(hFile))
+            textCodePage = CP_ACP;
+        SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
     }
 
     es.dwCookie = (DWORD_PTR)hFile;
@@ -8389,6 +8474,8 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     rwp_reset_applied_text_color();
     reset_background_history();
     backgroundSaveEpoch = 0;
+    rwpTextCodePage = textCodePage;
+    rwpTextUtf8Bom = textUtf8Bom;
     clear_formatting();
     set_fileformat(format);
     if (format == SF_RTF)
@@ -8447,7 +8534,8 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
         clear_document_background();
         rwp_original_images_clear();
     }
-    SendMessageW(hEditorWnd, EM_STREAMIN, format, (LPARAM)&es);
+    SendMessageW(hEditorWnd, EM_STREAMIN, rwp_text_stream_format(format),
+                 (LPARAM)&es);
     if (format == SF_RTF && es.dwError == 0)
         rwp_bookmarks_restore_scanned();
     if (useNormalizedRtf)
@@ -8506,6 +8594,7 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
     RTF_MEMORY memory;
     BOOL buffered;
     BOOL successful;
+    WPARAM streamFormat;
     /* Do not silently discard new Rich Edit formatting from a plain-text
      * document on Ctrl+S or when saving changes while closing. A deliberate
      * Save As -> Plain Text remains allowed after its existing warning. */
@@ -8592,19 +8681,23 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
         return FALSE;
     }
 
-    if(format == (SF_TEXT | SF_UNICODE))
+    if (format == (SF_TEXT | SF_UNICODE) ||
+        (format == SF_TEXT && rwpTextCodePage == CP_UTF8 && rwpTextUtf8Bom))
     {
         static const BYTE unicode[] = {0xff,0xfe};
-        DWORD writeOut;
-        WriteFile(hFile, &unicode, sizeof(unicode), &writeOut, 0);
-
-        if(writeOut != sizeof(unicode))
+        static const BYTE utf8[] = {0xef,0xbb,0xbf};
+        const BYTE *bom = format == (SF_TEXT | SF_UNICODE) ? unicode : utf8;
+        DWORD bomSize = format == (SF_TEXT | SF_UNICODE) ? sizeof(unicode) : sizeof(utf8);
+        DWORD writeOut = 0;
+        if (!WriteFile(hFile, bom, bomSize, &writeOut, NULL) ||
+            writeOut != bomSize)
         {
             CloseHandle(hFile);
             return FALSE;
         }
     }
 
+    streamFormat = rwp_text_stream_format(format);
     stream.dwCookie = (DWORD_PTR)hFile;
     stream.dwError = 0;
     stream.pfnCallback = stream_out;
@@ -8620,7 +8713,8 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
     }
     else
     {
-        ret = SendMessageW(hEditorWnd, EM_STREAMOUT, format, (LPARAM)&stream);
+        ret = SendMessageW(hEditorWnd, EM_STREAMOUT, streamFormat,
+                           (LPARAM)&stream);
         successful = (ret != 0 && stream.dwError == 0);
     }
 
@@ -16129,7 +16223,8 @@ static BOOL rwp_get_current_document_size(SIZE_T *sizeOut)
     stream.dwCookie = (DWORD_PTR)&memory;
     stream.dwError = 0;
     stream.pfnCallback = stream_out_memory;
-    result = SendMessageW(hEditorWnd, EM_STREAMOUT, format, (LPARAM)&stream);
+    result = SendMessageW(hEditorWnd, EM_STREAMOUT,
+                          rwp_text_stream_format(format), (LPARAM)&stream);
     if (!result || stream.dwError || memory.failed)
     {
         if (memory.data) HeapFree(GetProcessHeap(), 0, memory.data);
@@ -16139,6 +16234,8 @@ static BOOL rwp_get_current_document_size(SIZE_T *sizeOut)
     *sizeOut = memory.used;
     if (format == (SF_TEXT | SF_UNICODE))
         *sizeOut += 2; /* UTF-16 LE BOM written by DoSaveFile. */
+    else if (format == SF_TEXT && rwpTextCodePage == CP_UTF8 && rwpTextUtf8Bom)
+        *sizeOut += 3; /* Preserve an existing UTF-8 BOM. */
     HeapFree(GetProcessHeap(), 0, memory.data);
     return TRUE;
 }
@@ -23636,6 +23733,8 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
                 rwp_backup_begin_interval();
                 set_caption(NULL);
                 wszFileName[0] = '\0';
+                rwpTextCodePage = CP_UTF8;
+                rwpTextUtf8Bom = FALSE;
                 clear_formatting();
                 rwp_bookmarks_clear();
                 rwp_cloud_reset();
