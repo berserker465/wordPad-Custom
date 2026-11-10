@@ -2933,6 +2933,55 @@ static BOOL normalize_link_url(LPCWSTR input, LPWSTR result, SIZE_T count)
     return link_valid_url(result);
 }
 
+/* The quick "Use source text" action accepts trailing whitespace in the
+ * selected address. Keep that whitespace in the document, outside the link.
+ * CR and LF are checked separately because Rich Edit may store a paragraph
+ * boundary as a single character position. */
+static BOOL link_is_trailing_whitespace(WCHAR c)
+{
+    return iswspace(c) || c == 0x00a0 || c == 0x202f;
+}
+
+/* Shrink the live selection only when its prefix exactly matches the URL
+ * label and everything following it is whitespace. This leaves selected
+ * spaces/paragraph breaks untouched instead of replacing or linking them.
+ * Read each remaining character at its actual Rich Edit CP position. */
+static void link_exclude_source_trailing_whitespace(LPCWSTR label)
+{
+    CHARRANGE selection;
+    TEXTRANGEW textRange;
+    WCHAR prefix[RWP_LINK_MAX_NAME + 2];
+    WCHAR character[4];
+    LONG length = lstrlenW(label), cp;
+    int j;
+
+    if (!length || length >= RWP_LINK_MAX_NAME) return;
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
+    if (selection.cpMax <= selection.cpMin + length) return;
+
+    textRange.chrg.cpMin = selection.cpMin;
+    textRange.chrg.cpMax = selection.cpMin + length;
+    textRange.lpstrText = prefix;
+    prefix[0] = 0;
+    SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&textRange);
+    if (lstrcmpW(prefix, label)) return;
+
+    for (cp = selection.cpMin + length; cp < selection.cpMax; ++cp)
+    {
+        ZeroMemory(character, sizeof(character));
+        textRange.chrg.cpMin = cp;
+        textRange.chrg.cpMax = cp + 1;
+        textRange.lpstrText = character;
+        if (!SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0,
+                          (LPARAM)&textRange)) return;
+        /* A paragraph boundary can be represented by a CRLF pair. */
+        for (j = 0; character[j]; ++j)
+            if (!link_is_trailing_whitespace(character[j])) return;
+    }
+    selection.cpMax = selection.cpMin + length;
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&selection);
+}
+
 /* Rich Edit's Text Object Model 2 can assign and remove a URL without
  * replacing the displayed characters. RosBE supplies TOM 1 headers, so keep
  * the documented ITextRange2 slots for GetURL (84), SetURL (85), and
@@ -3358,7 +3407,7 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
      * changes CP positions at/after the insertion, not before it. */
     if (n >= 2 && !_wcsicmp(name, url))
     {
-        CHARRANGE selected, latter, former;
+        CHARRANGE selected, latter, former, afterLatter, afterFormer, caret;
         LONG split = n / 2;
         SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selected);
         if (selected.cpMax - selected.cpMin != n)
@@ -3374,11 +3423,23 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
         SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&latter);
         if (!attach_url_to_selected_text(url))
             return FALSE;
+        /* The latter field has already been inserted. Its current end is
+         * the desired final caret location, before the former field shifts
+         * the following character positions. */
+        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&afterLatter);
         former.cpMin = selected.cpMin;
         former.cpMax = selected.cpMin + split;
         SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&former);
         if (!attach_url_to_selected_text(url))
             return FALSE;
+        /* Inserting the former RTF field increases the Rich Edit story's
+         * CP offsets, including hidden field instructions. Measure that
+         * increase from its actual post-insertion caret, then place the
+         * caret after BOTH adjacent fields, not at the halfway split. */
+        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&afterFormer);
+        caret.cpMin = caret.cpMax = afterLatter.cpMax +
+                      (afterFormer.cpMax - former.cpMax);
+        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&caret);
     }
     else if (!attach_url_to_selected_text(url))
     {
@@ -4961,7 +5022,12 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 else
                 {
                     if (useSource)
+                    {
+                        SIZE_T length = lstrlenW(text);
+                        while (length && link_is_trailing_whitespace(text[length-1]))
+                            text[--length] = 0;
                         lstrcpynW(input, text, RWP_LINK_MAX_URL);
+                    }
                     else
                         GetDlgItemTextW(hwnd, IDC_LINK_URL, input, RWP_LINK_MAX_URL);
                     if (!normalize_link_url(input, url, RWP_LINK_MAX_URL))
@@ -4973,6 +5039,8 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                         return TRUE;
                     }
                     if (!text[0]) lstrcpynW(text, url, RWP_LINK_MAX_NAME);
+                    if (useSource)
+                        link_exclude_source_trailing_whitespace(text);
                 }
                 if (!insert_hyperlink(text, url))
                 {
