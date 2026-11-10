@@ -759,6 +759,7 @@ static LPCWSTR toolbar_tooltip(int command)
     case ID_FORMAT_BOLD:      return italian ? L"Grassetto" : L"Bold";
     case ID_FORMAT_ITALIC:    return italian ? L"Corsivo" : L"Italic";
     case ID_FORMAT_UNDERLINE: return italian ? L"Sottolineato" : L"Underline";
+    case ID_FORMAT_STRIKETHROUGH: return italian ? L"Barrato" : L"Strikethrough";
     case ID_FORMAT_COLOR:     return italian ? L"Applica l'ultimo colore (Alt+Q)" :
                                                 L"Apply last text color (Alt+Q)";
     case ID_FORMAT_HIGHLIGHT: return italian ? L"Applica ultimo evidenziatore" :
@@ -2801,6 +2802,7 @@ static void AddButton(HWND hwndToolBar, int nImage, int nCommand)
         case ID_FORMAT_BOLD:
         case ID_FORMAT_ITALIC:
         case ID_FORMAT_UNDERLINE:
+        case ID_FORMAT_STRIKETHROUGH:
         case ID_BULLET:
         case ID_OVERTYPE:
         case ID_CAPSLOCK:
@@ -10654,6 +10656,7 @@ static void rwp_bulk_refresh_radios(HWND dlg)
         IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_HIGHLIGHT_REMOVE,
         IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE,
         IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE,
+        IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_APPLY, IDC_BULK_STRIKE_REMOVE,
         IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE,
         IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY
     };
@@ -10757,6 +10760,13 @@ static BOOL rwp_bulk_read_format(HWND dlg, RWP_BULK_DIALOG *state,
         cf->dwMask |= CFM_UNDERLINE;
         if (IsDlgButtonChecked(dlg, IDC_BULK_UNDERLINE_APPLY) == BST_CHECKED)
             cf->dwEffects |= CFE_UNDERLINE;
+    }
+    if (IsDlgButtonChecked(dlg, IDC_BULK_STRIKE_APPLY) == BST_CHECKED ||
+        IsDlgButtonChecked(dlg, IDC_BULK_STRIKE_REMOVE) == BST_CHECKED)
+    {
+        cf->dwMask |= CFM_STRIKEOUT;
+        if (IsDlgButtonChecked(dlg, IDC_BULK_STRIKE_APPLY) == BST_CHECKED)
+            cf->dwEffects |= CFE_STRIKEOUT;
     }
     if (IsDlgButtonChecked(dlg, IDC_BULK_ITALIC_APPLY) == BST_CHECKED ||
         IsDlgButtonChecked(dlg, IDC_BULK_ITALIC_REMOVE) == BST_CHECKED)
@@ -11130,7 +11140,7 @@ typedef struct RWP_FORMAT_CRITERIA
     BOOL colorDefault;
     BOOL highlightSet, highlightRemoved, highlightAny;
     COLORREF highlightColor;
-    int bold, underline, italic; /* 0=Any, 1=On, 2=Off */
+    int bold, underline, italic, strike; /* 0=Any, 1=On, 2=Off */
 } RWP_FORMAT_CRITERIA;
 
 #define RWP_FORMAT_SEARCH_MAX_CHARS 300000
@@ -11199,12 +11209,16 @@ static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
     criteria->bold = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_BOLD_VALUE, CB_GETCURSEL, 0, 0);
     criteria->underline = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_GETCURSEL, 0, 0);
     criteria->italic = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_ITALIC_VALUE, CB_GETCURSEL, 0, 0);
-    if (criteria->bold == CB_ERR || criteria->underline == CB_ERR || criteria->italic == CB_ERR)
+    /* The legacy standalone format-search template does not expose strikeout. */
+    criteria->strike = GetDlgItem(dlg, IDC_BULK_FIND_STRIKE_VALUE) ?
+        (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_GETCURSEL, 0, 0) : 0;
+    if (criteria->bold == CB_ERR || criteria->underline == CB_ERR ||
+        criteria->italic == CB_ERR || criteria->strike == CB_ERR)
         return FALSE;
     if (!criteria->font && !criteria->sizeSet && !criteria->colorSet &&
         !criteria->highlightSet &&
         !criteria->alignmentSet && !criteria->bold &&
-        !criteria->underline && !criteria->italic)
+        !criteria->underline && !criteria->italic && !criteria->strike)
     {
         MessageBoxW(dlg,
             italian ? L"Seleziona almeno una condizione di ricerca."
@@ -11250,7 +11264,7 @@ static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
 
 /* A paragraph ending is also a formatted Rich Edit character. Search it for
  * every formatting criterion (size, face, color, highlight, bold, italic,
- * underline, alignment) so formatting cannot survive solely on the mark.
+ * underline, strikethrough, alignment) so formatting cannot survive solely on the mark.
  * Keep row/cell structural delimiters excluded. */
 static BOOL rwp_format_searchable_paragraph_end(LONG cp)
 {
@@ -11319,6 +11333,8 @@ static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
         ((cf->dwEffects & CFE_ITALIC) != 0) != (match->italic == 1))) return FALSE;
     if (match->underline && (!(cf->dwMask & CFM_UNDERLINE) ||
         ((cf->dwEffects & CFE_UNDERLINE) != 0) != (match->underline == 1))) return FALSE;
+    if (match->strike && (!(cf->dwMask & CFM_STRIKEOUT) ||
+        ((cf->dwEffects & CFE_STRIKEOUT) != 0) != (match->strike == 1))) return FALSE;
     return TRUE;
 }
 
@@ -11514,11 +11530,11 @@ static INT_PTR CALLBACK rwp_format_search_dialog_proc(HWND dlg, UINT message,
             IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
             IDC_BULK_HIGHLIGHT_NONE,
             IDC_BULK_BOLD_NONE, IDC_BULK_UNDERLINE_NONE,
-            IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE
+            IDC_BULK_STRIKE_NONE, IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE
         };
         static const int toggleIds[] = {
             IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_UNDERLINE_VALUE,
-            IDC_BULK_FIND_ITALIC_VALUE
+            IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_STRIKE_VALUE
         };
         SIZE_T i;
         state = (RWP_BULK_DIALOG *)lParam;
@@ -11556,25 +11572,27 @@ static INT_PTR CALLBACK rwp_format_search_dialog_proc(HWND dlg, UINT message,
             static const int labels[] = {
                 IDC_BULK_FONT_LABEL, IDC_BULK_SIZE_LABEL, IDC_BULK_COLOR_LABEL,
                 IDC_BULK_HIGHLIGHT_LABEL, IDC_BULK_BOLD_LABEL, IDC_BULK_UNDERLINE_LABEL,
-                IDC_BULK_ITALIC_LABEL, IDC_BULK_ALIGN_LABEL
+                IDC_BULK_ITALIC_LABEL, IDC_BULK_ALIGN_LABEL,
+                IDC_BULK_STRIKE_LABEL
             };
             static const WCHAR *translations[] = {
                 L"Carattere", L"Dimensione", L"Colore", L"Evidenziatore", L"Grassetto",
-                L"Sottolineato", L"Corsivo", L"Allineamento"
+                L"Sottolineato", L"Corsivo", L"Allineamento", L"Barrato"
             };
             static const int noChange[] = {
                 IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
                 IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_BOLD_NONE, IDC_BULK_UNDERLINE_NONE,
-                IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE
+                IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE, IDC_BULK_STRIKE_NONE
             };
             static const int apply[] = {
                 IDC_BULK_FONT_APPLY, IDC_BULK_SIZE_APPLY, IDC_BULK_COLOR_APPLY,
                 IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_BOLD_APPLY, IDC_BULK_UNDERLINE_APPLY,
-                IDC_BULK_ITALIC_APPLY, IDC_BULK_ALIGN_APPLY
+                IDC_BULK_ITALIC_APPLY, IDC_BULK_ALIGN_APPLY, IDC_BULK_STRIKE_APPLY
             };
             static const int remove[] = {
                 IDC_BULK_BOLD_REMOVE, IDC_BULK_UNDERLINE_REMOVE,
-                IDC_BULK_ITALIC_REMOVE, IDC_BULK_HIGHLIGHT_REMOVE
+                IDC_BULK_ITALIC_REMOVE, IDC_BULK_HIGHLIGHT_REMOVE,
+                IDC_BULK_STRIKE_REMOVE
             };
             SetWindowTextW(dlg, L"Formattazione multipla - Cerca formato");
             SetDlgItemTextW(dlg, IDC_BULK_FIND_TITLE,
@@ -11655,6 +11673,7 @@ static INT_PTR CALLBACK rwp_format_search_dialog_proc(HWND dlg, UINT message,
         if (lParam && (wParam == IDC_BULK_FIND_BOLD_VALUE ||
                        wParam == IDC_BULK_FIND_UNDERLINE_VALUE ||
                        wParam == IDC_BULK_FIND_ITALIC_VALUE ||
+                       wParam == IDC_BULK_FIND_STRIKE_VALUE ||
                        wParam == IDC_BULK_FIND_ALIGN_VALUE ||
                        wParam == IDC_BULK_ALIGN_VALUE))
             return rwp_bulk_draw_combo((DRAWITEMSTRUCT *)lParam,
@@ -11889,10 +11908,10 @@ static int rwpUnifiedPage = 0; /* 0 = search attributes, 1 = replacement */
 static int rwpUnifiedCopyTarget = IDC_UNIFIED_FIND_TEXT;
 
 static const int rwpUnifiedFindControls[] = {
-IDC_BULK_FIND_TITLE, IDC_UNIFIED_LABEL_0, IDC_BULK_FIND_FONT_CHECK, IDC_BULK_FIND_FONT_VALUE, IDC_UNIFIED_LABEL_1, IDC_BULK_FIND_SIZE_CHECK, IDC_BULK_FIND_SIZE_VALUE, IDC_UNIFIED_LABEL_2, IDC_UNIFIED_LABEL_3, IDC_BULK_FIND_COLOR_CHECK, IDC_BULK_FIND_COLOR_PALETTE, IDC_BULK_FIND_COLOR_VALUE, IDC_UNIFIED_LABEL_12, IDC_BULK_FIND_HIGHLIGHT_CHECK, IDC_BULK_FIND_HIGHLIGHT_PALETTE, IDC_BULK_FIND_HIGHLIGHT_VALUE, IDC_UNIFIED_LABEL_4, IDC_BULK_FIND_BOLD_VALUE, IDC_UNIFIED_LABEL_5, IDC_BULK_FIND_UNDERLINE_VALUE, IDC_UNIFIED_LABEL_6, IDC_BULK_FIND_ITALIC_VALUE, IDC_UNIFIED_LABEL_7, IDC_BULK_FIND_ALIGN_CHECK, IDC_BULK_FIND_ALIGN_VALUE
+IDC_BULK_FIND_TITLE, IDC_UNIFIED_LABEL_0, IDC_BULK_FIND_FONT_CHECK, IDC_BULK_FIND_FONT_VALUE, IDC_UNIFIED_LABEL_1, IDC_BULK_FIND_SIZE_CHECK, IDC_BULK_FIND_SIZE_VALUE, IDC_UNIFIED_LABEL_2, IDC_UNIFIED_LABEL_3, IDC_BULK_FIND_COLOR_CHECK, IDC_BULK_FIND_COLOR_PALETTE, IDC_BULK_FIND_COLOR_VALUE, IDC_UNIFIED_LABEL_12, IDC_BULK_FIND_HIGHLIGHT_CHECK, IDC_BULK_FIND_HIGHLIGHT_PALETTE, IDC_BULK_FIND_HIGHLIGHT_VALUE, IDC_UNIFIED_LABEL_4, IDC_BULK_FIND_BOLD_VALUE, IDC_UNIFIED_LABEL_5, IDC_BULK_FIND_UNDERLINE_VALUE, IDC_UNIFIED_LABEL_13, IDC_BULK_FIND_STRIKE_VALUE, IDC_UNIFIED_LABEL_6, IDC_BULK_FIND_ITALIC_VALUE, IDC_UNIFIED_LABEL_7, IDC_BULK_FIND_ALIGN_CHECK, IDC_BULK_FIND_ALIGN_VALUE
 };
 static const int rwpUnifiedReplaceControls[] = {
-IDC_BULK_REPLACE_TITLE, IDC_UNIFIED_LABEL_8, IDC_UNIFIED_LABEL_9, IDC_UNIFIED_LABEL_10, IDC_BULK_FONT_LABEL, IDC_BULK_FONT_NONE, IDC_BULK_FONT_APPLY, IDC_BULK_FONT_VALUE, IDC_BULK_SIZE_LABEL, IDC_BULK_SIZE_NONE, IDC_BULK_SIZE_APPLY, IDC_BULK_SIZE_VALUE, IDC_UNIFIED_LABEL_11, IDC_BULK_COLOR_LABEL, IDC_BULK_COLOR_NONE, IDC_BULK_COLOR_APPLY, IDC_BULK_COLOR_PALETTE, IDC_BULK_COLOR_VALUE, IDC_BULK_HIGHLIGHT_LABEL, IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_HIGHLIGHT_REMOVE, IDC_BULK_HIGHLIGHT_PALETTE, IDC_BULK_HIGHLIGHT_VALUE, IDC_BULK_BOLD_LABEL, IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE, IDC_BULK_UNDERLINE_LABEL, IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE, IDC_BULK_ITALIC_LABEL, IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE, IDC_BULK_ALIGN_LABEL, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY, IDC_BULK_ALIGN_VALUE
+IDC_BULK_REPLACE_TITLE, IDC_UNIFIED_LABEL_8, IDC_UNIFIED_LABEL_9, IDC_UNIFIED_LABEL_10, IDC_BULK_FONT_LABEL, IDC_BULK_FONT_NONE, IDC_BULK_FONT_APPLY, IDC_BULK_FONT_VALUE, IDC_BULK_SIZE_LABEL, IDC_BULK_SIZE_NONE, IDC_BULK_SIZE_APPLY, IDC_BULK_SIZE_VALUE, IDC_UNIFIED_LABEL_11, IDC_BULK_COLOR_LABEL, IDC_BULK_COLOR_NONE, IDC_BULK_COLOR_APPLY, IDC_BULK_COLOR_PALETTE, IDC_BULK_COLOR_VALUE, IDC_BULK_HIGHLIGHT_LABEL, IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_HIGHLIGHT_REMOVE, IDC_BULK_HIGHLIGHT_PALETTE, IDC_BULK_HIGHLIGHT_VALUE, IDC_BULK_BOLD_LABEL, IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE, IDC_BULK_UNDERLINE_LABEL, IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE, IDC_BULK_STRIKE_LABEL, IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_APPLY, IDC_BULK_STRIKE_REMOVE, IDC_BULK_ITALIC_LABEL, IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE, IDC_BULK_ALIGN_LABEL, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY, IDC_BULK_ALIGN_VALUE
 };
 
 static BOOL rwp_unified_has_find_conditions(HWND dlg)
@@ -11904,7 +11923,8 @@ static BOOL rwp_unified_has_find_conditions(HWND dlg)
            IsDlgButtonChecked(dlg, IDC_BULK_FIND_ALIGN_CHECK) == BST_CHECKED ||
            SendDlgItemMessageW(dlg, IDC_BULK_FIND_BOLD_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
            SendDlgItemMessageW(dlg, IDC_BULK_FIND_ITALIC_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
-           SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_GETCURSEL, 0, 0) > 0;
+           SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
+           SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_GETCURSEL, 0, 0) > 0;
 }
 
 static BOOL rwp_unified_has_replace_options(HWND dlg)
@@ -11912,7 +11932,7 @@ static BOOL rwp_unified_has_replace_options(HWND dlg)
     static const int unchanged[] = {
         IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
         IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_BOLD_NONE, IDC_BULK_ITALIC_NONE,
-        IDC_BULK_UNDERLINE_NONE, IDC_BULK_ALIGN_NONE
+        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE, IDC_BULK_ALIGN_NONE
     };
     SIZE_T i;
     for (i = 0; i < sizeof(unchanged)/sizeof(unchanged[0]); ++i)
@@ -11930,11 +11950,11 @@ static void rwp_unified_reset_format(HWND dlg)
     static const int unchanged[] = {
         IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
         IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_BOLD_NONE, IDC_BULK_ITALIC_NONE,
-        IDC_BULK_UNDERLINE_NONE, IDC_BULK_ALIGN_NONE
+        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE, IDC_BULK_ALIGN_NONE
     };
     static const int any[] = {
         IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_ITALIC_VALUE,
-        IDC_BULK_FIND_UNDERLINE_VALUE
+        IDC_BULK_FIND_UNDERLINE_VALUE, IDC_BULK_FIND_STRIKE_VALUE
     };
     SIZE_T i;
     rwpUnifiedState.findHighlightAny = FALSE;
@@ -11950,6 +11970,7 @@ static void rwp_unified_reset_format(HWND dlg)
         else if (unchanged[i] == IDC_BULK_BOLD_NONE) rangeLast = IDC_BULK_BOLD_REMOVE;
         else if (unchanged[i] == IDC_BULK_UNDERLINE_NONE) rangeLast = IDC_BULK_UNDERLINE_REMOVE;
         else if (unchanged[i] == IDC_BULK_ITALIC_NONE) rangeLast = IDC_BULK_ITALIC_REMOVE;
+        else if (unchanged[i] == IDC_BULK_STRIKE_NONE) rangeLast = IDC_BULK_STRIKE_REMOVE;
         else if (unchanged[i] == IDC_BULK_ALIGN_NONE) rangeLast = IDC_BULK_ALIGN_APPLY;
         CheckRadioButton(dlg, unchanged[i], rangeLast, unchanged[i]);
     }
@@ -12227,16 +12248,16 @@ static void rwp_unified_layout(HWND dlg)
     units.left = units.top = 0;
     units.right = 0;
     /* Keep 14-point text readable while using the compact resource rows. */
-    units.bottom = expanded ? 310 : 124;
+    units.bottom = expanded ? 326 : 124;
     MapDialogRect(dlg, &units);
     dialogHeight = units.bottom + (window.bottom - window.top) - client.bottom;
-    baseY = 279;
-    desiredY = expanded ? 279 : 94;
+    baseY = 295;
+    desiredY = expanded ? 295 : 94;
     units.left = units.top = 0;
     units.right = 0;
     units.bottom = desiredY - baseY;
     MapDialogRect(dlg, &units);
-    /* Position from the fixed 279-DLU footer row, not incrementally. */
+    /* Position from the fixed 295-DLU footer row, not incrementally. */
     for (i = 0; i < (int)(sizeof(footer)/sizeof(footer[0])); ++i)
     {
         HWND button = GetDlgItem(dlg, footer[i]);
@@ -12249,7 +12270,7 @@ static void rwp_unified_layout(HWND dlg)
         /* All footer buttons share the same top edge, including
          * the two-line Copy Format button. */
         {
-            RECT pos = {0, 0, 0, 279};
+            RECT pos = {0, 0, 0, 295};
             MapDialogRect(dlg, &pos);
             SetWindowPos(button, NULL, point.x, pos.bottom + units.bottom,
                          0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -12425,6 +12446,8 @@ static void rwp_unified_copy_selected_format(HWND dlg)
             (cf.dwMask & CFM_ITALIC) ? ((cf.dwEffects & CFE_ITALIC) ? 1 : 2) : 0, 0);
         SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_SETCURSEL,
             (cf.dwMask & CFM_UNDERLINE) ? ((cf.dwEffects & CFE_UNDERLINE) ? 1 : 2) : 0, 0);
+        SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_SETCURSEL,
+            (cf.dwMask & CFM_STRIKEOUT) ? ((cf.dwEffects & CFE_STRIKEOUT) ? 1 : 2) : 0, 0);
         if (pf.dwMask & PFM_ALIGNMENT)
         {
             alignment = pf.wAlignment == PFA_CENTER ? 1 :
@@ -12457,6 +12480,9 @@ static void rwp_unified_copy_selected_format(HWND dlg)
         CheckRadioButton(dlg, IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_REMOVE,
             !(cf.dwMask & CFM_UNDERLINE) ? IDC_BULK_UNDERLINE_NONE :
             (cf.dwEffects & CFE_UNDERLINE) ? IDC_BULK_UNDERLINE_APPLY : IDC_BULK_UNDERLINE_REMOVE);
+        CheckRadioButton(dlg, IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_REMOVE,
+            !(cf.dwMask & CFM_STRIKEOUT) ? IDC_BULK_STRIKE_NONE :
+            (cf.dwEffects & CFE_STRIKEOUT) ? IDC_BULK_STRIKE_APPLY : IDC_BULK_STRIKE_REMOVE);
         CheckRadioButton(dlg, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY,
             (pf.dwMask & PFM_ALIGNMENT) ? IDC_BULK_ALIGN_APPLY : IDC_BULK_ALIGN_NONE);
         if (cf.dwMask & CFM_FACE)
@@ -12818,6 +12844,7 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_12, L"Evidenziatore");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_4, L"Grassetto");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_5, L"Sottolineato");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_13, L"Barrato");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_6, L"Corsivo");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_7, L"Allineamento");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_8, L"Proprieta");
@@ -12831,7 +12858,8 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
         {
             static const int dropdowns[] = {
                 IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_UNDERLINE_VALUE,
-                IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_ALIGN_VALUE,
+                IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_STRIKE_VALUE,
+                IDC_BULK_FIND_ALIGN_VALUE,
                 IDC_BULK_ALIGN_VALUE
             };
             HDC dc = GetDC(dlg);
@@ -16756,8 +16784,9 @@ static void rwp_set_highlight_toolbar_visible(HWND owner, BOOL visible)
         ZeroMemory(&band, sizeof(band));
         band.cbSize = REBARBANDINFOW_V6_SIZE;
         band.fMask = RBBIM_SIZE | RBBIM_CHILDSIZE;
-        band.cx = visible ? 498 : 426;
-        band.cxMinChild = visible ? 462 : 390;
+        /* One additional 36px formatting button: strikethrough. */
+        band.cx = visible ? 534 : 462;
+        band.cxMinChild = visible ? 498 : 426;
         SendMessageW(rebar, RB_SETBANDINFOW, index, (LPARAM)&band);
     }
 }
@@ -16895,7 +16924,8 @@ static LRESULT OnCreate( HWND hWnd )
     SendMessageW(hFormatBarWnd, TB_SETBITMAPSIZE, 0, MAKELONG(24, 24));
     SendMessageW(hFormatBarWnd, TB_SETBUTTONSIZE, 0, MAKELONG(36, 36));
     SendMessageW(hFormatBarWnd, TB_SETMAXTEXTROWS, 0, 0);
-    rwpFormatImageList = rwp_install_toolbar_icons(hFormatBarWnd, hInstance, IDB_FORMATBAR, 9);
+    /* The sprite now includes the crossed-S icon at index 9. */
+    rwpFormatImageList = rwp_install_toolbar_icons(hFormatBarWnd, hInstance, IDB_FORMATBAR, 10);
     rwp_append_highlight_icon(hInstance);
     AddButton(hFormatBarWnd, 0, ID_FORMAT_BOLD);
     AddButton(hFormatBarWnd, 1, ID_FORMAT_ITALIC);
@@ -16917,7 +16947,8 @@ static LRESULT OnCreate( HWND hWnd )
     AddButton(hFormatBarWnd, 4, ID_ALIGN_LEFT);
     AddButton(hFormatBarWnd, 5, ID_ALIGN_CENTER);
     AddButton(hFormatBarWnd, 6, ID_ALIGN_RIGHT);
-    AddButton(hFormatBarWnd, 9, ID_FORMAT_HIGHLIGHT);
+    AddButton(hFormatBarWnd, 9, ID_FORMAT_STRIKETHROUGH);
+    AddButton(hFormatBarWnd, 10, ID_FORMAT_HIGHLIGHT);
     AddButton(hFormatBarWnd, I_IMAGENONE, ID_FORMAT_HIGHLIGHT_PICK);
     {
         TBBUTTONINFOW dropdown;
@@ -16935,7 +16966,7 @@ static LRESULT OnCreate( HWND hWnd )
     rwp_disable_native_theme(hFormatBarWnd);
     SendMessageW(hFormatBarWnd, TB_AUTOSIZE, 0, 0);
     rwp_insert_ui_band(hReBarWnd, hFormatBarWnd, BANDID_FORMATBAR,
-                       426, 390, 44, FALSE);
+                       462, 426, 44, FALSE);
 
     /* Row 3: ruler gets its own height, not the toolbar's stale value. */
     hRulerWnd = CreateWindowExW(0, WC_STATICW, NULL, WS_VISIBLE | WS_CHILD,
@@ -17060,6 +17091,10 @@ static LRESULT OnUser( HWND hWnd )
     SendMessageW(hwndFormatBar, TB_CHECKBUTTON, ID_FORMAT_UNDERLINE, (fmt.dwMask & CFM_UNDERLINE) &&
             (fmt.dwEffects & CFE_UNDERLINE));
     SendMessageW(hwndFormatBar, TB_INDETERMINATE, ID_FORMAT_UNDERLINE, !(fmt.dwMask & CFM_UNDERLINE));
+    SendMessageW(hwndFormatBar, TB_CHECKBUTTON, ID_FORMAT_STRIKETHROUGH,
+                 (fmt.dwMask & CFM_STRIKEOUT) && (fmt.dwEffects & CFE_STRIKEOUT));
+    SendMessageW(hwndFormatBar, TB_INDETERMINATE, ID_FORMAT_STRIKETHROUGH,
+                 !(fmt.dwMask & CFM_STRIKEOUT));
 
     SendMessageW(hwndEditor, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
     {
@@ -24070,13 +24105,16 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
     case ID_FORMAT_BOLD:
     case ID_FORMAT_ITALIC:
     case ID_FORMAT_UNDERLINE:
+    case ID_FORMAT_STRIKETHROUGH:
         {
         CHARFORMAT2W fmt;
         int effects = CFE_BOLD;
+        DWORD originalMask;
 
         ZeroMemory(&fmt, sizeof(fmt));
         fmt.cbSize = sizeof(fmt);
         SendMessageW(hwndEditor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        originalMask = fmt.dwMask;
 
         fmt.dwMask = CFM_BOLD;
 
@@ -24088,12 +24126,25 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         {
             effects = CFE_UNDERLINE;
             fmt.dwMask = CFM_UNDERLINE;
+        } else if (LOWORD(wParam) == ID_FORMAT_STRIKETHROUGH)
+        {
+            effects = CFE_STRIKEOUT;
+            fmt.dwMask = CFM_STRIKEOUT;
+            /* A mixed selection should become entirely struck through. */
+            if (!(originalMask & CFM_STRIKEOUT))
+                fmt.dwEffects &= ~CFE_STRIKEOUT;
         }
 
         fmt.dwEffects ^= effects;
 
         reset_background_history();
-        SendMessageW(hwndEditor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        if (SendMessageW(hwndEditor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt))
+        {
+            CHARRANGE selected;
+            SendMessageW(hwndEditor, EM_EXGETSEL, 0, (LPARAM)&selected);
+            if (selected.cpMin != selected.cpMax)
+                rwpRichFormattingChanged = TRUE;
+        }
         break;
         }
 
