@@ -3040,14 +3040,100 @@ done:
     return range2;
 }
 
+/* Rich Edit's TOM GetURL may expose the RTF field instruction as a
+ * quoted/escaped string (e.g. "https\://www\.example\.com") rather than a
+ * plain URL. Decode the instruction first, then accept only external URLs.
+ * This also excludes quoted internal "#Bookmark" destinations. */
+static BOOL rwp_decode_context_link_url(LPCWSTR encoded, WCHAR *url,
+                                        SIZE_T capacity)
+{
+    SIZE_T first = 0, last, i, used = 0;
+
+    if (!encoded || !url || capacity < 2) return FALSE;
+    last = (SIZE_T)lstrlenW(encoded);
+    while (first < last && iswspace(encoded[first])) ++first;
+    while (last > first && iswspace(encoded[last - 1])) --last;
+    if (last - first >= 2 && encoded[first] == L'"' &&
+        encoded[last - 1] == L'"')
+    {
+        ++first;
+        --last;
+    }
+
+    for (i = first; i < last; ++i)
+    {
+        WCHAR value = encoded[i];
+        if (value == L'\\' && i + 1 < last)
+        {
+            WCHAR next = encoded[i + 1];
+            if (next == L'u')
+            {
+                /* RTF \uN? encodes a signed UTF-16 code unit. */
+                SIZE_T j = i + 2;
+                BOOL negative = FALSE;
+                unsigned int number = 0;
+                int digits = 0;
+                if (j < last && encoded[j] == L'-')
+                {
+                    negative = TRUE;
+                    ++j;
+                }
+                while (j < last && digits < 5 &&
+                       encoded[j] >= L'0' && encoded[j] <= L'9')
+                {
+                    number = number * 10 + (unsigned int)(encoded[j] - L'0');
+                    ++j;
+                    ++digits;
+                }
+                if (digits && number <= (negative ? 32768U : 65535U))
+                {
+                    value = (WCHAR)(unsigned short)(negative ?
+                                          (0U - number) : number);
+                    if (j < last && encoded[j] == L'?') ++j;
+                    i = j - 1;
+                }
+            }
+            /* Rich Edit also backslash-escapes URL punctuation (\:, \.,
+             * etc.). Preserve an ordinary slash only if it is not an RTF
+             * escape, so an unescaped URL remains unchanged. */
+            if (value == L'\\' &&
+                (next == L'\\' || next == L'{' || next == L'}' ||
+                 (next < 128 && iswpunct(next))))
+            {
+                value = next;
+                ++i;
+            }
+        }
+        if (used + 1 >= capacity) return FALSE;
+        url[used++] = value;
+    }
+    url[used] = 0;
+    return link_valid_url(url); /* No #Bookmark targets or quoted strings. */
+}
+
+/* Resolve the external destination without changing the live selection. */
+static BOOL rwp_external_link_url_from_range(RWP_TEXT_RANGE2 *range,
+                                               WCHAR *url, SIZE_T capacity)
+{
+    BSTR encoded = NULL;
+    BOOL result = FALSE;
+    if (range && SUCCEEDED(range->lpVtbl->GetURL(range, &encoded)) && encoded)
+        result = rwp_decode_context_link_url(encoded, url, capacity);
+    if (encoded) SysFreeString(encoded);
+    return result;
+}
+
 /* Shared by the normal OLE context menu and the editor's fallback menu.
- * The combined remove command appears for a hyperlink, a bookmark range,
- * or both. The clicked character is used rather than the edit caret. */
+ * Copy link is shown only for external URLs, never document bookmarks.
+ * Remove Link/Bookmark also appears on plain bookmark ranges. Both actions
+ * address the clicked character, never the current selection. */
 void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp)
 {
     RWP_TEXT_RANGE2 *range = NULL;
+    WCHAR decodedUrl[RWP_LINK_MAX_URL + 1];
     BOOL hasBookmark = FALSE;
     BOOL hasLink = FALSE;
+    BOOL canCopyLink = FALSE;
     const BOOL italian =
         PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     rwpLinkContextCp = -1;
@@ -3067,15 +3153,62 @@ void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp)
     range = rwp_hyperlink_range_at(cp);
     hasLink = range != NULL;
     if (range)
+    {
+        canCopyLink = rwp_external_link_url_from_range(range, decodedUrl,
+                                sizeof(decodedUrl) / sizeof(decodedUrl[0]));
         ((IUnknown *)range)->lpVtbl->Release((IUnknown *)range);
+    }
     hasBookmark = rwp_bookmark_index_at(cp) >= 0;
     if (!hasLink && !hasBookmark) return;
     rwpLinkContextCp = cp;
     AppendMenuW(popup, MF_SEPARATOR, 0, NULL);
+    if (canCopyLink)
+        AppendMenuW(popup, MF_STRING, ID_COPY_LINK,
+                    italian ? L"Copia collegamento" : L"Copy link");
     AppendMenuW(popup, MF_STRING |
         ((SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY) ?
           MF_GRAYED : 0), ID_REMOVE_LINK,
         italian ? L"Rimuovi collegamento/segnalibro" : L"Remove Link/Bookmark");
+}
+
+/* Copy only the decoded external destination, not its RTF-quoted form.
+ * A separate TOM range preserves the current selection and caret. */
+static void rwp_copy_context_hyperlink(void)
+{
+    LONG cp = rwpLinkContextCp;
+    RWP_TEXT_RANGE2 *range;
+    WCHAR url[RWP_LINK_MAX_URL + 1];
+    HGLOBAL textMemory = NULL;
+    WCHAR *text;
+    SIZE_T length, bytes;
+
+    rwpLinkContextCp = -1;
+    if (cp < 0 || !hEditorWnd) return;
+    range = rwp_hyperlink_range_at(cp);
+    if (!range) return;
+    if (!rwp_external_link_url_from_range(range, url,
+                         sizeof(url) / sizeof(url[0]))) goto done;
+
+    length = (SIZE_T)lstrlenW(url);
+    bytes = (length + 1) * sizeof(WCHAR);
+    textMemory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!textMemory) goto done;
+    text = GlobalLock(textMemory);
+    if (!text) goto done;
+    memcpy(text, url, bytes);
+    GlobalUnlock(textMemory);
+
+    if (OpenClipboard(hEditorWnd))
+    {
+        if (EmptyClipboard() &&
+            SetClipboardData(CF_UNICODETEXT, textMemory))
+            textMemory = NULL; /* Ownership transferred to the clipboard. */
+        CloseClipboard();
+    }
+
+done:
+    if (textMemory) GlobalFree(textMemory);
+    ((IUnknown *)range)->lpVtbl->Release((IUnknown *)range);
 }
 
 /* SetURL(NULL) unlinks the full friendly-name hyperlink even if the range
@@ -23325,7 +23458,8 @@ static LRESULT rwp_show_editor_context_menu(HWND editor, LPARAM lParam)
     DestroyMenu(menu);
     if (command)
     {
-        if (command != ID_REMOVE_LINK) rwpLinkContextCp = -1;
+        if (command != ID_REMOVE_LINK && command != ID_COPY_LINK)
+            rwpLinkContextCp = -1;
         PostMessageW(hMainWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
     }
     else
@@ -24542,6 +24676,10 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 
     case ID_INSERT_LINK:
         dialog_insert_hyperlink(FALSE);
+        break;
+
+    case ID_COPY_LINK:
+        rwp_copy_context_hyperlink();
         break;
 
     case ID_REMOVE_LINK:

@@ -191,6 +191,7 @@
 #define ID_INSERT_AT_SIGN 1636
 #define ID_TABLE_COPY_BORDER_FORMAT 1637
 #define ID_TABLE_PASTE_BORDER_FORMAT 1638
+#define ID_COPY_LINK 1639
 
 #define ID_DATETIME 1600
 #define ID_PARAFORMAT 1601
@@ -621,7 +622,8 @@ BOOL rwp_rtf_data_has_table_markup(const BYTE *data, SIZE_T length);
 BOOL rwp_insert_capitalization_menu(HMENU menu, UINT position, HWND editor);
 /* Shared Paste without formatting entry for both native context-menu paths. */
 BOOL rwp_insert_plain_paste_menu_item(HMENU menu, BOOL showShortcuts);
-/* Show Remove Link only for a right-click on actual hyperlink text. */
+/* Add the hyperlink context actions only at the right-click target. Copy
+ * link is disabled for internal bookmark destinations. */
 void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp);
 
 /* Shared with olecallback.c for context-menu table targeting. */
