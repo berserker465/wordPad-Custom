@@ -335,6 +335,8 @@ static BOOL rwpLastHighlightRemove = FALSE;
 static COLORREF rwpLastHighlightColor = RGB(255, 255, 0);
 /* Hidden by default: users can enable the toolbar control in View. */
 static BOOL rwpHighlightButtonVisible = FALSE;
+/* Pair is visible by default; its registry preference is independent of Highlight. */
+static BOOL rwpScriptButtonsVisible = TRUE;
 
 static BOOL rwp_set_color_format_preserving_combining_sequences(
     HWND editor, const CHARFORMAT2W *format);
@@ -760,6 +762,8 @@ static LPCWSTR toolbar_tooltip(int command)
     case ID_FORMAT_ITALIC:    return italian ? L"Corsivo" : L"Italic";
     case ID_FORMAT_UNDERLINE: return italian ? L"Sottolineato" : L"Underline";
     case ID_FORMAT_STRIKETHROUGH: return italian ? L"Barrato" : L"Strikethrough";
+    case ID_FORMAT_SUPERSCRIPT: return italian ? L"Apice" : L"Superscript";
+    case ID_FORMAT_SUBSCRIPT: return italian ? L"Pedice" : L"Subscript";
     case ID_FORMAT_COLOR:     return italian ? L"Applica l'ultimo colore (Alt+Q)" :
                                                 L"Apply last text color (Alt+Q)";
     case ID_FORMAT_HIGHLIGHT: return italian ? L"Applica ultimo evidenziatore" :
@@ -795,6 +799,22 @@ static void rwp_append_highlight_icon(HINSTANCE instance)
     if (!bitmap) return;
     ImageList_AddMasked(rwpFormatImageList, bitmap, RGB(192, 192, 192));
     DeleteObject(bitmap);
+}
+
+/* Both typography icons use one identical X glyph, so their baselines align. */
+static void rwp_append_script_icons(HINSTANCE instance)
+{
+    static const UINT icons[] = { IDB_SUPERSCRIPT_ICON, IDB_SUBSCRIPT_ICON };
+    SIZE_T i;
+    if (!rwpFormatImageList) return;
+    for (i = 0; i < sizeof(icons)/sizeof(icons[0]); ++i)
+    {
+        HBITMAP bitmap = (HBITMAP)LoadImageW(instance, MAKEINTRESOURCEW(icons[i]),
+                            IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+        if (!bitmap) continue;
+        ImageList_AddMasked(rwpFormatImageList, bitmap, RGB(192, 192, 192));
+        DeleteObject(bitmap);
+    }
 }
 
 static HIMAGELIST rwp_install_toolbar_icons(HWND toolbar, HINSTANCE instance,
@@ -2803,6 +2823,8 @@ static void AddButton(HWND hwndToolBar, int nImage, int nCommand)
         case ID_FORMAT_ITALIC:
         case ID_FORMAT_UNDERLINE:
         case ID_FORMAT_STRIKETHROUGH:
+        case ID_FORMAT_SUPERSCRIPT:
+        case ID_FORMAT_SUBSCRIPT:
         case ID_BULLET:
         case ID_OVERTYPE:
         case ID_CAPSLOCK:
@@ -10790,6 +10812,8 @@ static void rwp_bulk_refresh_radios(HWND dlg)
         IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE,
         IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE,
         IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_APPLY, IDC_BULK_STRIKE_REMOVE,
+        IDC_BULK_SUPER_NONE, IDC_BULK_SUPER_APPLY, IDC_BULK_SUPER_REMOVE,
+        IDC_BULK_SUB_NONE, IDC_BULK_SUB_APPLY, IDC_BULK_SUB_REMOVE,
         IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE,
         IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY
     };
@@ -10900,6 +10924,29 @@ static BOOL rwp_bulk_read_format(HWND dlg, RWP_BULK_DIALOG *state,
         cf->dwMask |= CFM_STRIKEOUT;
         if (IsDlgButtonChecked(dlg, IDC_BULK_STRIKE_APPLY) == BST_CHECKED)
             cf->dwEffects |= CFE_STRIKEOUT;
+    }
+    /* Both styles share CFM_SUBSCRIPT/CFM_SUPERSCRIPT. Applying one clears
+     * the other; mutually conflicting requests are rejected explicitly. */
+    if (IsDlgButtonChecked(dlg, IDC_BULK_SUPER_APPLY) == BST_CHECKED &&
+        IsDlgButtonChecked(dlg, IDC_BULK_SUB_APPLY) == BST_CHECKED)
+    {
+        MessageBoxW(dlg,
+            italian ? L"Apice e Pedice non possono essere applicati insieme."
+                    : L"Superscript and Subscript cannot both be applied.",
+            L"Search and Replace", MB_OK | MB_ICONWARNING);
+        return FALSE;
+    }
+    if (IsDlgButtonChecked(dlg, IDC_BULK_SUPER_APPLY) == BST_CHECKED ||
+        IsDlgButtonChecked(dlg, IDC_BULK_SUPER_REMOVE) == BST_CHECKED ||
+        IsDlgButtonChecked(dlg, IDC_BULK_SUB_APPLY) == BST_CHECKED ||
+        IsDlgButtonChecked(dlg, IDC_BULK_SUB_REMOVE) == BST_CHECKED)
+    {
+        cf->dwMask |= CFM_SUPERSCRIPT;
+        if (IsDlgButtonChecked(dlg, IDC_BULK_SUPER_APPLY) == BST_CHECKED)
+            cf->dwEffects |= CFE_SUPERSCRIPT;
+        else if (IsDlgButtonChecked(dlg, IDC_BULK_SUB_APPLY) == BST_CHECKED)
+            cf->dwEffects |= CFE_SUBSCRIPT;
+        /* Both Remove actions clear baseline shifts to normal text. */
     }
     if (IsDlgButtonChecked(dlg, IDC_BULK_ITALIC_APPLY) == BST_CHECKED ||
         IsDlgButtonChecked(dlg, IDC_BULK_ITALIC_REMOVE) == BST_CHECKED)
@@ -11273,7 +11320,7 @@ typedef struct RWP_FORMAT_CRITERIA
     BOOL colorDefault;
     BOOL highlightSet, highlightRemoved, highlightAny;
     COLORREF highlightColor;
-    int bold, underline, italic, strike; /* 0=Any, 1=On, 2=Off */
+    int bold, underline, italic, strike, superscript, subscript; /* 0=Any, 1=On, 2=Off */
 } RWP_FORMAT_CRITERIA;
 
 #define RWP_FORMAT_SEARCH_MAX_CHARS 300000
@@ -11326,6 +11373,30 @@ static void rwp_format_find_update(HWND dlg)
         IsDlgButtonChecked(dlg, IDC_BULK_FIND_HIGHLIGHT_CHECK) == BST_CHECKED);
 }
 
+/* The standalone Format Search tool still uses three-state combos.
+ * In unified Find/Replace, the same criteria come from radio button groups.
+ * Both interfaces map to 0=Any, 1=On, 2=Off. */
+static int rwp_format_find_boolean_state(HWND dlg, int comboId,
+                                         int anyId, int onId, int offId)
+{
+    if (GetDlgItem(dlg, anyId))
+    {
+        if (IsDlgButtonChecked(dlg, onId) == BST_CHECKED) return 1;
+        if (IsDlgButtonChecked(dlg, offId) == BST_CHECKED) return 2;
+        return 0;
+    }
+    if (!GetDlgItem(dlg, comboId)) return 0;
+    return (int)SendDlgItemMessageW(dlg, comboId, CB_GETCURSEL, 0, 0);
+}
+
+/* Copy Format and Restore Defaults use the same native three-radio group. */
+static void rwp_unified_set_find_boolean(HWND dlg, int anyId,
+                                         int onId, int offId, int state)
+{
+    CheckRadioButton(dlg, anyId, offId,
+                     state == 1 ? onId : state == 2 ? offId : anyId);
+}
+
 static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
                                      RWP_FORMAT_CRITERIA *criteria)
 {
@@ -11339,19 +11410,28 @@ static BOOL rwp_format_read_criteria(HWND dlg, RWP_BULK_DIALOG *state,
     criteria->colorSet = IsDlgButtonChecked(dlg, IDC_BULK_FIND_COLOR_CHECK) == BST_CHECKED;
     criteria->highlightSet = IsDlgButtonChecked(dlg, IDC_BULK_FIND_HIGHLIGHT_CHECK) == BST_CHECKED;
     criteria->alignmentSet = IsDlgButtonChecked(dlg, IDC_BULK_FIND_ALIGN_CHECK) == BST_CHECKED;
-    criteria->bold = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_BOLD_VALUE, CB_GETCURSEL, 0, 0);
-    criteria->underline = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_GETCURSEL, 0, 0);
-    criteria->italic = (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_ITALIC_VALUE, CB_GETCURSEL, 0, 0);
-    /* The legacy standalone format-search template does not expose strikeout. */
-    criteria->strike = GetDlgItem(dlg, IDC_BULK_FIND_STRIKE_VALUE) ?
-        (int)SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_GETCURSEL, 0, 0) : 0;
+    criteria->bold = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_BOLD_VALUE,
+        IDC_UNIFIED_FIND_BOLD_ANY, IDC_UNIFIED_FIND_BOLD_ON, IDC_UNIFIED_FIND_BOLD_OFF);
+    criteria->underline = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_UNDERLINE_VALUE,
+        IDC_UNIFIED_FIND_UNDERLINE_ANY, IDC_UNIFIED_FIND_UNDERLINE_ON, IDC_UNIFIED_FIND_UNDERLINE_OFF);
+    criteria->italic = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_ITALIC_VALUE,
+        IDC_UNIFIED_FIND_ITALIC_ANY, IDC_UNIFIED_FIND_ITALIC_ON, IDC_UNIFIED_FIND_ITALIC_OFF);
+    /* The legacy standalone dialog has no strikethrough/super/sub controls. */
+    criteria->strike = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_STRIKE_VALUE,
+        IDC_UNIFIED_FIND_STRIKE_ANY, IDC_UNIFIED_FIND_STRIKE_ON, IDC_UNIFIED_FIND_STRIKE_OFF);
+    criteria->superscript = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_SUPER_VALUE,
+        IDC_UNIFIED_FIND_SUPER_ANY, IDC_UNIFIED_FIND_SUPER_ON, IDC_UNIFIED_FIND_SUPER_OFF);
+    criteria->subscript = rwp_format_find_boolean_state(dlg, IDC_BULK_FIND_SUB_VALUE,
+        IDC_UNIFIED_FIND_SUB_ANY, IDC_UNIFIED_FIND_SUB_ON, IDC_UNIFIED_FIND_SUB_OFF);
     if (criteria->bold == CB_ERR || criteria->underline == CB_ERR ||
-        criteria->italic == CB_ERR || criteria->strike == CB_ERR)
+        criteria->italic == CB_ERR || criteria->strike == CB_ERR ||
+        criteria->superscript == CB_ERR || criteria->subscript == CB_ERR)
         return FALSE;
     if (!criteria->font && !criteria->sizeSet && !criteria->colorSet &&
         !criteria->highlightSet &&
         !criteria->alignmentSet && !criteria->bold &&
-        !criteria->underline && !criteria->italic && !criteria->strike)
+        !criteria->underline && !criteria->italic && !criteria->strike &&
+        !criteria->superscript && !criteria->subscript)
     {
         MessageBoxW(dlg,
             italian ? L"Seleziona almeno una condizione di ricerca."
@@ -11468,6 +11548,10 @@ static BOOL rwp_format_char_matches(const RWP_FORMAT_CRITERIA *match,
         ((cf->dwEffects & CFE_UNDERLINE) != 0) != (match->underline == 1))) return FALSE;
     if (match->strike && (!(cf->dwMask & CFM_STRIKEOUT) ||
         ((cf->dwEffects & CFE_STRIKEOUT) != 0) != (match->strike == 1))) return FALSE;
+    if (match->superscript && (!(cf->dwMask & CFM_SUPERSCRIPT) ||
+        ((cf->dwEffects & CFE_SUPERSCRIPT) != 0) != (match->superscript == 1))) return FALSE;
+    if (match->subscript && (!(cf->dwMask & CFM_SUBSCRIPT) ||
+        ((cf->dwEffects & CFE_SUBSCRIPT) != 0) != (match->subscript == 1))) return FALSE;
     return TRUE;
 }
 
@@ -11663,11 +11747,13 @@ static INT_PTR CALLBACK rwp_format_search_dialog_proc(HWND dlg, UINT message,
             IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
             IDC_BULK_HIGHLIGHT_NONE,
             IDC_BULK_BOLD_NONE, IDC_BULK_UNDERLINE_NONE,
-            IDC_BULK_STRIKE_NONE, IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE
+            IDC_BULK_STRIKE_NONE, IDC_BULK_ITALIC_NONE, IDC_BULK_ALIGN_NONE,
+            IDC_BULK_SUPER_NONE, IDC_BULK_SUB_NONE
         };
         static const int toggleIds[] = {
             IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_UNDERLINE_VALUE,
-            IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_STRIKE_VALUE
+            IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_STRIKE_VALUE,
+            IDC_BULK_FIND_SUPER_VALUE, IDC_BULK_FIND_SUB_VALUE
         };
         SIZE_T i;
         state = (RWP_BULK_DIALOG *)lParam;
@@ -11807,6 +11893,8 @@ static INT_PTR CALLBACK rwp_format_search_dialog_proc(HWND dlg, UINT message,
                        wParam == IDC_BULK_FIND_UNDERLINE_VALUE ||
                        wParam == IDC_BULK_FIND_ITALIC_VALUE ||
                        wParam == IDC_BULK_FIND_STRIKE_VALUE ||
+                       wParam == IDC_BULK_FIND_SUPER_VALUE ||
+                       wParam == IDC_BULK_FIND_SUB_VALUE ||
                        wParam == IDC_BULK_FIND_ALIGN_VALUE ||
                        wParam == IDC_BULK_ALIGN_VALUE))
             return rwp_bulk_draw_combo((DRAWITEMSTRUCT *)lParam,
@@ -12039,12 +12127,21 @@ static HBRUSH rwpUnifiedDisabledEditBrush = NULL;
 static RWP_BULK_DIALOG rwpUnifiedState;
 static int rwpUnifiedPage = 0; /* 0 = search attributes, 1 = replacement */
 static int rwpUnifiedCopyTarget = IDC_UNIFIED_FIND_TEXT;
+/* One independent scroll position per format tab; the top fields and footer
+ * remain stationary while the format property rows move in 16-DLU steps. */
+static int rwpUnifiedScrollRows[2] = {0, 0};
+static int rwpUnifiedAppliedOffset[2] = {0, 0};
+#define RWP_UNIFIED_MAX_SCROLL_ROWS 2
 
 static const int rwpUnifiedFindControls[] = {
-IDC_BULK_FIND_TITLE, IDC_UNIFIED_LABEL_0, IDC_BULK_FIND_FONT_CHECK, IDC_BULK_FIND_FONT_VALUE, IDC_UNIFIED_LABEL_1, IDC_BULK_FIND_SIZE_CHECK, IDC_BULK_FIND_SIZE_VALUE, IDC_UNIFIED_LABEL_2, IDC_UNIFIED_LABEL_3, IDC_BULK_FIND_COLOR_CHECK, IDC_BULK_FIND_COLOR_PALETTE, IDC_BULK_FIND_COLOR_VALUE, IDC_UNIFIED_LABEL_12, IDC_BULK_FIND_HIGHLIGHT_CHECK, IDC_BULK_FIND_HIGHLIGHT_PALETTE, IDC_BULK_FIND_HIGHLIGHT_VALUE, IDC_UNIFIED_LABEL_4, IDC_BULK_FIND_BOLD_VALUE, IDC_UNIFIED_LABEL_5, IDC_BULK_FIND_UNDERLINE_VALUE, IDC_UNIFIED_LABEL_13, IDC_BULK_FIND_STRIKE_VALUE, IDC_UNIFIED_LABEL_6, IDC_BULK_FIND_ITALIC_VALUE, IDC_UNIFIED_LABEL_7, IDC_BULK_FIND_ALIGN_CHECK, IDC_BULK_FIND_ALIGN_VALUE
+IDC_BULK_FIND_TITLE, IDC_UNIFIED_LABEL_0, IDC_BULK_FIND_FONT_CHECK, IDC_BULK_FIND_FONT_VALUE, IDC_UNIFIED_LABEL_1, IDC_BULK_FIND_SIZE_CHECK, IDC_BULK_FIND_SIZE_VALUE, IDC_UNIFIED_LABEL_2, IDC_UNIFIED_LABEL_3, IDC_BULK_FIND_COLOR_CHECK, IDC_BULK_FIND_COLOR_PALETTE, IDC_BULK_FIND_COLOR_VALUE, IDC_UNIFIED_LABEL_12, IDC_BULK_FIND_HIGHLIGHT_CHECK, IDC_BULK_FIND_HIGHLIGHT_PALETTE, IDC_BULK_FIND_HIGHLIGHT_VALUE, IDC_UNIFIED_LABEL_4, IDC_UNIFIED_FIND_BOLD_ANY, IDC_UNIFIED_FIND_BOLD_ON, IDC_UNIFIED_FIND_BOLD_OFF, IDC_UNIFIED_LABEL_5, IDC_UNIFIED_FIND_UNDERLINE_ANY, IDC_UNIFIED_FIND_UNDERLINE_ON, IDC_UNIFIED_FIND_UNDERLINE_OFF, IDC_UNIFIED_LABEL_13, IDC_UNIFIED_FIND_STRIKE_ANY, IDC_UNIFIED_FIND_STRIKE_ON, IDC_UNIFIED_FIND_STRIKE_OFF,
+IDC_UNIFIED_LABEL_SUPER, IDC_UNIFIED_FIND_SUPER_ANY, IDC_UNIFIED_FIND_SUPER_ON, IDC_UNIFIED_FIND_SUPER_OFF, IDC_UNIFIED_LABEL_SUB, IDC_UNIFIED_FIND_SUB_ANY, IDC_UNIFIED_FIND_SUB_ON, IDC_UNIFIED_FIND_SUB_OFF,
+IDC_UNIFIED_LABEL_6, IDC_UNIFIED_FIND_ITALIC_ANY, IDC_UNIFIED_FIND_ITALIC_ON, IDC_UNIFIED_FIND_ITALIC_OFF, IDC_UNIFIED_LABEL_7, IDC_BULK_FIND_ALIGN_CHECK, IDC_BULK_FIND_ALIGN_VALUE
 };
 static const int rwpUnifiedReplaceControls[] = {
-IDC_BULK_REPLACE_TITLE, IDC_UNIFIED_LABEL_8, IDC_UNIFIED_LABEL_9, IDC_UNIFIED_LABEL_10, IDC_BULK_FONT_LABEL, IDC_BULK_FONT_NONE, IDC_BULK_FONT_APPLY, IDC_BULK_FONT_VALUE, IDC_BULK_SIZE_LABEL, IDC_BULK_SIZE_NONE, IDC_BULK_SIZE_APPLY, IDC_BULK_SIZE_VALUE, IDC_UNIFIED_LABEL_11, IDC_BULK_COLOR_LABEL, IDC_BULK_COLOR_NONE, IDC_BULK_COLOR_APPLY, IDC_BULK_COLOR_PALETTE, IDC_BULK_COLOR_VALUE, IDC_BULK_HIGHLIGHT_LABEL, IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_HIGHLIGHT_REMOVE, IDC_BULK_HIGHLIGHT_PALETTE, IDC_BULK_HIGHLIGHT_VALUE, IDC_BULK_BOLD_LABEL, IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE, IDC_BULK_UNDERLINE_LABEL, IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE, IDC_BULK_STRIKE_LABEL, IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_APPLY, IDC_BULK_STRIKE_REMOVE, IDC_BULK_ITALIC_LABEL, IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE, IDC_BULK_ALIGN_LABEL, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY, IDC_BULK_ALIGN_VALUE
+IDC_BULK_REPLACE_TITLE, IDC_UNIFIED_LABEL_8, IDC_UNIFIED_LABEL_9, IDC_UNIFIED_LABEL_10, IDC_BULK_FONT_LABEL, IDC_BULK_FONT_NONE, IDC_BULK_FONT_APPLY, IDC_BULK_FONT_VALUE, IDC_BULK_SIZE_LABEL, IDC_BULK_SIZE_NONE, IDC_BULK_SIZE_APPLY, IDC_BULK_SIZE_VALUE, IDC_UNIFIED_LABEL_11, IDC_BULK_COLOR_LABEL, IDC_BULK_COLOR_NONE, IDC_BULK_COLOR_APPLY, IDC_BULK_COLOR_PALETTE, IDC_BULK_COLOR_VALUE, IDC_BULK_HIGHLIGHT_LABEL, IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_HIGHLIGHT_APPLY, IDC_BULK_HIGHLIGHT_REMOVE, IDC_BULK_HIGHLIGHT_PALETTE, IDC_BULK_HIGHLIGHT_VALUE, IDC_BULK_BOLD_LABEL, IDC_BULK_BOLD_NONE, IDC_BULK_BOLD_APPLY, IDC_BULK_BOLD_REMOVE, IDC_BULK_UNDERLINE_LABEL, IDC_BULK_UNDERLINE_NONE, IDC_BULK_UNDERLINE_APPLY, IDC_BULK_UNDERLINE_REMOVE, IDC_BULK_STRIKE_LABEL, IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_APPLY, IDC_BULK_STRIKE_REMOVE,
+IDC_BULK_SUPER_LABEL, IDC_BULK_SUPER_NONE, IDC_BULK_SUPER_APPLY, IDC_BULK_SUPER_REMOVE,
+IDC_BULK_SUB_LABEL, IDC_BULK_SUB_NONE, IDC_BULK_SUB_APPLY, IDC_BULK_SUB_REMOVE, IDC_BULK_ITALIC_LABEL, IDC_BULK_ITALIC_NONE, IDC_BULK_ITALIC_APPLY, IDC_BULK_ITALIC_REMOVE, IDC_BULK_ALIGN_LABEL, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY, IDC_BULK_ALIGN_VALUE
 };
 
 static BOOL rwp_unified_has_find_conditions(HWND dlg)
@@ -12054,10 +12151,18 @@ static BOOL rwp_unified_has_find_conditions(HWND dlg)
            IsDlgButtonChecked(dlg, IDC_BULK_FIND_COLOR_CHECK) == BST_CHECKED ||
            IsDlgButtonChecked(dlg, IDC_BULK_FIND_HIGHLIGHT_CHECK) == BST_CHECKED ||
            IsDlgButtonChecked(dlg, IDC_BULK_FIND_ALIGN_CHECK) == BST_CHECKED ||
-           SendDlgItemMessageW(dlg, IDC_BULK_FIND_BOLD_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
-           SendDlgItemMessageW(dlg, IDC_BULK_FIND_ITALIC_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
-           SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_GETCURSEL, 0, 0) > 0 ||
-           SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_GETCURSEL, 0, 0) > 0;
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_BOLD_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_BOLD_OFF) == BST_CHECKED) ||
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_ITALIC_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_ITALIC_OFF) == BST_CHECKED) ||
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_UNDERLINE_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_UNDERLINE_OFF) == BST_CHECKED) ||
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_STRIKE_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_STRIKE_OFF) == BST_CHECKED) ||
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_SUPER_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_SUPER_OFF) == BST_CHECKED) ||
+           (IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_SUB_ON) == BST_CHECKED ||
+            IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_SUB_OFF) == BST_CHECKED);
 }
 
 static BOOL rwp_unified_has_replace_options(HWND dlg)
@@ -12065,7 +12170,8 @@ static BOOL rwp_unified_has_replace_options(HWND dlg)
     static const int unchanged[] = {
         IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
         IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_BOLD_NONE, IDC_BULK_ITALIC_NONE,
-        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE, IDC_BULK_ALIGN_NONE
+        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE,
+        IDC_BULK_SUPER_NONE, IDC_BULK_SUB_NONE, IDC_BULK_ALIGN_NONE
     };
     SIZE_T i;
     for (i = 0; i < sizeof(unchanged)/sizeof(unchanged[0]); ++i)
@@ -12083,12 +12189,10 @@ static void rwp_unified_reset_format(HWND dlg)
     static const int unchanged[] = {
         IDC_BULK_FONT_NONE, IDC_BULK_SIZE_NONE, IDC_BULK_COLOR_NONE,
         IDC_BULK_HIGHLIGHT_NONE, IDC_BULK_BOLD_NONE, IDC_BULK_ITALIC_NONE,
-        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE, IDC_BULK_ALIGN_NONE
+        IDC_BULK_UNDERLINE_NONE, IDC_BULK_STRIKE_NONE,
+        IDC_BULK_SUPER_NONE, IDC_BULK_SUB_NONE, IDC_BULK_ALIGN_NONE
     };
-    static const int any[] = {
-        IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_ITALIC_VALUE,
-        IDC_BULK_FIND_UNDERLINE_VALUE, IDC_BULK_FIND_STRIKE_VALUE
-    };
+
     SIZE_T i;
     rwpUnifiedState.findHighlightAny = FALSE;
     for (i = 0; i < sizeof(unchecked)/sizeof(unchecked[0]); ++i)
@@ -12104,11 +12208,23 @@ static void rwp_unified_reset_format(HWND dlg)
         else if (unchanged[i] == IDC_BULK_UNDERLINE_NONE) rangeLast = IDC_BULK_UNDERLINE_REMOVE;
         else if (unchanged[i] == IDC_BULK_ITALIC_NONE) rangeLast = IDC_BULK_ITALIC_REMOVE;
         else if (unchanged[i] == IDC_BULK_STRIKE_NONE) rangeLast = IDC_BULK_STRIKE_REMOVE;
+        else if (unchanged[i] == IDC_BULK_SUPER_NONE) rangeLast = IDC_BULK_SUPER_REMOVE;
+        else if (unchanged[i] == IDC_BULK_SUB_NONE) rangeLast = IDC_BULK_SUB_REMOVE;
         else if (unchanged[i] == IDC_BULK_ALIGN_NONE) rangeLast = IDC_BULK_ALIGN_APPLY;
         CheckRadioButton(dlg, unchanged[i], rangeLast, unchanged[i]);
     }
-    for (i = 0; i < sizeof(any)/sizeof(any[0]); ++i)
-        SendDlgItemMessageW(dlg, any[i], CB_SETCURSEL, 0, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_BOLD_ANY,
+        IDC_UNIFIED_FIND_BOLD_ON, IDC_UNIFIED_FIND_BOLD_OFF, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_ITALIC_ANY,
+        IDC_UNIFIED_FIND_ITALIC_ON, IDC_UNIFIED_FIND_ITALIC_OFF, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_UNDERLINE_ANY,
+        IDC_UNIFIED_FIND_UNDERLINE_ON, IDC_UNIFIED_FIND_UNDERLINE_OFF, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_STRIKE_ANY,
+        IDC_UNIFIED_FIND_STRIKE_ON, IDC_UNIFIED_FIND_STRIKE_OFF, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUPER_ANY,
+        IDC_UNIFIED_FIND_SUPER_ON, IDC_UNIFIED_FIND_SUPER_OFF, 0);
+    rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUB_ANY,
+        IDC_UNIFIED_FIND_SUB_ON, IDC_UNIFIED_FIND_SUB_OFF, 0);
     rwp_format_find_update(dlg);
     rwp_bulk_update_controls(dlg);
     InvalidateRect(dlg, NULL, TRUE);
@@ -12319,6 +12435,131 @@ static void rwp_unified_theme_checkboxes(HWND dlg)
     }
 }
 
+static void rwp_unified_layout(HWND dlg);
+
+/* Show the formatting rows through a native vertical scrollbar.  No actual
+ * document formatting changes occur here.  Rows outside the fixed viewport
+ * are hidden to avoid covering the Copy Format / Find / Replace footer. */
+static void rwp_unified_scroll_format_rows(HWND dlg, BOOL expanded, BOOL findEnabled,
+                                           BOOL replaceEnabled, BOOL scrollOnly)
+{
+    static const int *pages[] = {
+        rwpUnifiedFindControls, rwpUnifiedReplaceControls
+    };
+    static const SIZE_T counts[] = {
+        sizeof(rwpUnifiedFindControls) / sizeof(rwpUnifiedFindControls[0]),
+        sizeof(rwpUnifiedReplaceControls) / sizeof(rwpUnifiedReplaceControls[0])
+    };
+    HWND scrollbar = GetDlgItem(dlg, IDC_UNIFIED_FORMAT_SCROLL);
+    RECT units = {0, 0, 0, 0};
+    int viewportTop, viewportBottom, rowHeight, page;
+    SCROLLINFO info;
+    units.bottom = 140;
+    MapDialogRect(dlg, &units);
+    viewportTop = units.bottom;
+    units.bottom = 286;
+    MapDialogRect(dlg, &units);
+    viewportBottom = units.bottom;
+    units.bottom = 16;
+    MapDialogRect(dlg, &units);
+    rowHeight = units.bottom;
+    for (page = 0; page < 2; ++page)
+    {
+        BOOL active = expanded && (page == rwpUnifiedPage) &&
+                      (page == 0 ? findEnabled : replaceEnabled);
+        int currentOffset = rwpUnifiedAppliedOffset[page];
+        int nextOffset = rwpUnifiedScrollRows[page] * rowHeight;
+        SIZE_T i;
+        /* A scrollbar movement must not disturb the hidden format tab. */
+        if (scrollOnly && page != rwpUnifiedPage) continue;
+        for (i = 0; i < counts[page]; ++i)
+        {
+            int id = pages[page][i];
+            HWND control;
+            RECT rectangle;
+            POINT origin;
+            int originalY, shiftedY;
+            /* Headings and the fixed Property/Action/Value legend do not scroll. */
+            if (id == IDC_BULK_FIND_TITLE || id == IDC_BULK_REPLACE_TITLE ||
+                id == IDC_UNIFIED_LABEL_8 || id == IDC_UNIFIED_LABEL_9 ||
+                id == IDC_UNIFIED_LABEL_10) continue;
+            control = GetDlgItem(dlg, id);
+            if (!control || !GetWindowRect(control, &rectangle)) continue;
+            origin.x = rectangle.left;
+            origin.y = rectangle.top;
+            ScreenToClient(dlg, &origin);
+            originalY = origin.y + currentOffset;
+            shiftedY = originalY - nextOffset;
+            /* A row may be 14 or 16 DLU tall. Permit the last row while
+             * keeping the footer completely unobstructed. */
+            {
+                BOOL visible = active && shiftedY >= viewportTop - 3 &&
+                               shiftedY < viewportBottom - (rowHeight / 2);
+                if (scrollOnly)
+                {
+                    /* Moving/showing child windows without immediate painting
+                     * avoids an erase/redraw cycle for every row. The panel is
+                     * invalidated exactly once after all controls are placed. */
+                    if (shiftedY != origin.y || IsWindowVisible(control) != visible)
+                        SetWindowPos(control, NULL, origin.x, shiftedY, 0, 0,
+                                     SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE |
+                                     SWP_NOREDRAW |
+                                     (visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+                }
+                else
+                {
+                    if (shiftedY != origin.y)
+                        SetWindowPos(control, NULL, origin.x, shiftedY, 0, 0,
+                                     SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
+                    if (IsWindowVisible(control) != visible)
+                        ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+                }
+            }
+        }
+        rwpUnifiedAppliedOffset[page] = nextOffset;
+    }
+    if (!scrollbar) return;
+    ShowWindow(scrollbar, expanded ? SW_SHOW : SW_HIDE);
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    info.nMin = 0;
+    info.nMax = RWP_UNIFIED_MAX_SCROLL_ROWS;
+    info.nPage = 1;
+    info.nPos = rwpUnifiedScrollRows[rwpUnifiedPage];
+    SetScrollInfo(scrollbar, SB_CTL, &info, TRUE);
+    if (scrollOnly)
+    {
+        /* Restrict repainting to the formatting viewport. The title,
+         * search/replacement fields, tabs and footer stay untouched. */
+        RECT viewport;
+        GetClientRect(dlg, &viewport);
+        viewport.top = viewportTop;
+        viewport.bottom = viewportBottom;
+        RedrawWindow(dlg, &viewport, NULL,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
+static void rwp_unified_step_scroll(HWND dlg, int target)
+{
+    if (target < 0) target = 0;
+    if (target > RWP_UNIFIED_MAX_SCROLL_ROWS)
+        target = RWP_UNIFIED_MAX_SCROLL_ROWS;
+    if (rwpUnifiedScrollRows[rwpUnifiedPage] != target)
+    {
+        rwpUnifiedScrollRows[rwpUnifiedPage] = target;
+        /* Only move the formatting rows. Rebuilding the entire dialog on
+         * each notch used to cause a full-window flash while scrolling. */
+        {
+            BOOL findEnabled = IsDlgButtonChecked(dlg, IDC_UNIFIED_FIND_FORMAT) == BST_CHECKED;
+            BOOL replaceEnabled = IsDlgButtonChecked(dlg, IDC_UNIFIED_REPLACE_FORMAT) == BST_CHECKED;
+            rwp_unified_scroll_format_rows(dlg, findEnabled || replaceEnabled,
+                                           findEnabled, replaceEnabled, TRUE);
+        }
+    }
+}
+
 /* One visible formatting panel at a time. The window starts compact: the
  * majority of Ctrl+H usage should need neither formatting panel. */
 static void rwp_unified_layout(HWND dlg)
@@ -12376,6 +12617,7 @@ static void rwp_unified_layout(HWND dlg)
         SetDlgItemTextW(dlg, IDC_UNIFIED_REPLACE_TAB,
             rwpUnifiedPage == 1 ? L"[ Replacement formatting ]" : L"Replacement formatting");
     }
+    rwp_unified_scroll_format_rows(dlg, expanded, f, r, FALSE);
     GetClientRect(dlg, &client);
     GetWindowRect(dlg, &window);
     units.left = units.top = 0;
@@ -12573,14 +12815,24 @@ static void rwp_unified_copy_selected_format(HWND dlg)
             rwpUnifiedState.findHighlightColor = cf.crBackColor;
             rwp_format_color_caption(dlg, IDC_BULK_FIND_HIGHLIGHT_VALUE, cf.crBackColor);
         }
-        SendDlgItemMessageW(dlg, IDC_BULK_FIND_BOLD_VALUE, CB_SETCURSEL,
-            (cf.dwMask & CFM_BOLD) ? ((cf.dwEffects & CFE_BOLD) ? 1 : 2) : 0, 0);
-        SendDlgItemMessageW(dlg, IDC_BULK_FIND_ITALIC_VALUE, CB_SETCURSEL,
-            (cf.dwMask & CFM_ITALIC) ? ((cf.dwEffects & CFE_ITALIC) ? 1 : 2) : 0, 0);
-        SendDlgItemMessageW(dlg, IDC_BULK_FIND_UNDERLINE_VALUE, CB_SETCURSEL,
-            (cf.dwMask & CFM_UNDERLINE) ? ((cf.dwEffects & CFE_UNDERLINE) ? 1 : 2) : 0, 0);
-        SendDlgItemMessageW(dlg, IDC_BULK_FIND_STRIKE_VALUE, CB_SETCURSEL,
-            (cf.dwMask & CFM_STRIKEOUT) ? ((cf.dwEffects & CFE_STRIKEOUT) ? 1 : 2) : 0, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_BOLD_ANY,
+            IDC_UNIFIED_FIND_BOLD_ON, IDC_UNIFIED_FIND_BOLD_OFF,
+            (cf.dwMask & CFM_BOLD) ? ((cf.dwEffects & CFE_BOLD) ? 1 : 2) : 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_ITALIC_ANY,
+            IDC_UNIFIED_FIND_ITALIC_ON, IDC_UNIFIED_FIND_ITALIC_OFF,
+            (cf.dwMask & CFM_ITALIC) ? ((cf.dwEffects & CFE_ITALIC) ? 1 : 2) : 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_UNDERLINE_ANY,
+            IDC_UNIFIED_FIND_UNDERLINE_ON, IDC_UNIFIED_FIND_UNDERLINE_OFF,
+            (cf.dwMask & CFM_UNDERLINE) ? ((cf.dwEffects & CFE_UNDERLINE) ? 1 : 2) : 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_STRIKE_ANY,
+            IDC_UNIFIED_FIND_STRIKE_ON, IDC_UNIFIED_FIND_STRIKE_OFF,
+            (cf.dwMask & CFM_STRIKEOUT) ? ((cf.dwEffects & CFE_STRIKEOUT) ? 1 : 2) : 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUPER_ANY,
+            IDC_UNIFIED_FIND_SUPER_ON, IDC_UNIFIED_FIND_SUPER_OFF,
+            (cf.dwMask & CFM_SUPERSCRIPT) ? ((cf.dwEffects & CFE_SUPERSCRIPT) ? 1 : 2) : 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUB_ANY,
+            IDC_UNIFIED_FIND_SUB_ON, IDC_UNIFIED_FIND_SUB_OFF,
+            (cf.dwMask & CFM_SUBSCRIPT) ? ((cf.dwEffects & CFE_SUBSCRIPT) ? 1 : 2) : 0);
         if (pf.dwMask & PFM_ALIGNMENT)
         {
             alignment = pf.wAlignment == PFA_CENTER ? 1 :
@@ -12616,6 +12868,12 @@ static void rwp_unified_copy_selected_format(HWND dlg)
         CheckRadioButton(dlg, IDC_BULK_STRIKE_NONE, IDC_BULK_STRIKE_REMOVE,
             !(cf.dwMask & CFM_STRIKEOUT) ? IDC_BULK_STRIKE_NONE :
             (cf.dwEffects & CFE_STRIKEOUT) ? IDC_BULK_STRIKE_APPLY : IDC_BULK_STRIKE_REMOVE);
+        CheckRadioButton(dlg, IDC_BULK_SUPER_NONE, IDC_BULK_SUPER_REMOVE,
+            !(cf.dwMask & CFM_SUPERSCRIPT) ? IDC_BULK_SUPER_NONE :
+            (cf.dwEffects & CFE_SUPERSCRIPT) ? IDC_BULK_SUPER_APPLY : IDC_BULK_SUPER_REMOVE);
+        CheckRadioButton(dlg, IDC_BULK_SUB_NONE, IDC_BULK_SUB_REMOVE,
+            !(cf.dwMask & CFM_SUBSCRIPT) ? IDC_BULK_SUB_NONE :
+            (cf.dwEffects & CFE_SUBSCRIPT) ? IDC_BULK_SUB_APPLY : IDC_BULK_SUB_REMOVE);
         CheckRadioButton(dlg, IDC_BULK_ALIGN_NONE, IDC_BULK_ALIGN_APPLY,
             (pf.dwMask & PFM_ALIGNMENT) ? IDC_BULK_ALIGN_APPLY : IDC_BULK_ALIGN_NONE);
         if (cf.dwMask & CFM_FACE)
@@ -12956,6 +13214,20 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
         /* Reuse original Format Search initialization, color palettes,
          * group defaults, owner-drawn combos and dark-mode styling. */
         rwp_format_search_dialog_proc(dlg, message, wParam, lParam);
+        /* Separate radio groups remain mutually exclusive even when their
+         * hidden neighboring formatting tab is scrolled or toggled. */
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_BOLD_ANY,
+            IDC_UNIFIED_FIND_BOLD_ON, IDC_UNIFIED_FIND_BOLD_OFF, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_ITALIC_ANY,
+            IDC_UNIFIED_FIND_ITALIC_ON, IDC_UNIFIED_FIND_ITALIC_OFF, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_UNDERLINE_ANY,
+            IDC_UNIFIED_FIND_UNDERLINE_ON, IDC_UNIFIED_FIND_UNDERLINE_OFF, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_STRIKE_ANY,
+            IDC_UNIFIED_FIND_STRIKE_ON, IDC_UNIFIED_FIND_STRIKE_OFF, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUPER_ANY,
+            IDC_UNIFIED_FIND_SUPER_ON, IDC_UNIFIED_FIND_SUPER_OFF, 0);
+        rwp_unified_set_find_boolean(dlg, IDC_UNIFIED_FIND_SUB_ANY,
+            IDC_UNIFIED_FIND_SUB_ON, IDC_UNIFIED_FIND_SUB_OFF, 0);
         SetWindowTextW(dlg, italian ? L"Cerca e sostituisci" : L"Search and Replace");
         if (italian)
         {
@@ -12978,11 +13250,42 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_4, L"Grassetto");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_5, L"Sottolineato");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_13, L"Barrato");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_SUPER, L"Apice");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_SUB, L"Pedice");
+            SetDlgItemTextW(dlg, IDC_BULK_SUPER_LABEL, L"Apice");
+            SetDlgItemTextW(dlg, IDC_BULK_SUB_LABEL, L"Pedice");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_6, L"Corsivo");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_7, L"Allineamento");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_8, L"Proprieta");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_9, L"Azione");
             SetDlgItemTextW(dlg, IDC_UNIFIED_LABEL_10, L"Valore");
+            /* These two formatting rows were added after the original bulk
+             * format translation list and need the same Italian labels. */
+            SetDlgItemTextW(dlg, IDC_BULK_SUPER_NONE, L"Non cambiare");
+            SetDlgItemTextW(dlg, IDC_BULK_SUPER_APPLY, L"Applica");
+            SetDlgItemTextW(dlg, IDC_BULK_SUPER_REMOVE, L"Rimuovi");
+            SetDlgItemTextW(dlg, IDC_BULK_SUB_NONE, L"Non cambiare");
+            SetDlgItemTextW(dlg, IDC_BULK_SUB_APPLY, L"Applica");
+            SetDlgItemTextW(dlg, IDC_BULK_SUB_REMOVE, L"Rimuovi");
+            /* Native radio controls are themed by rwp_bulk_theme_child(). */
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_BOLD_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_BOLD_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_BOLD_OFF, L"Disattivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_ITALIC_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_ITALIC_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_ITALIC_OFF, L"Disattivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_UNDERLINE_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_UNDERLINE_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_UNDERLINE_OFF, L"Disattivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_STRIKE_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_STRIKE_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_STRIKE_OFF, L"Disattivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUPER_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUPER_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUPER_OFF, L"Disattivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUB_ANY, L"Qualsiasi");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUB_ON, L"Attivo");
+            SetDlgItemTextW(dlg, IDC_UNIFIED_FIND_SUB_OFF, L"Disattivo");
         }
         SendDlgItemMessageW(dlg, IDC_UNIFIED_FIND_TEXT, EM_LIMITTEXT, 255, 0);
         SendDlgItemMessageW(dlg, IDC_UNIFIED_REPLACE_TEXT, EM_LIMITTEXT, 255, 0);
@@ -12990,10 +13293,7 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
          * 16 pixels. Expand only this dialog's dropdowns for 14-point Segoe. */
         {
             static const int dropdowns[] = {
-                IDC_BULK_FIND_BOLD_VALUE, IDC_BULK_FIND_UNDERLINE_VALUE,
-                IDC_BULK_FIND_ITALIC_VALUE, IDC_BULK_FIND_STRIKE_VALUE,
-                IDC_BULK_FIND_ALIGN_VALUE,
-                IDC_BULK_ALIGN_VALUE
+                IDC_BULK_FIND_ALIGN_VALUE, IDC_BULK_ALIGN_VALUE
             };
             HDC dc = GetDC(dlg);
             int height = 28;
@@ -13017,6 +13317,8 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
         rwp_unified_theme_checkboxes(dlg);
         rwpUnifiedPage = 0;
         rwpUnifiedCopyTarget = IDC_UNIFIED_FIND_TEXT;
+        rwpUnifiedScrollRows[0] = rwpUnifiedScrollRows[1] = 0;
+        rwpUnifiedAppliedOffset[0] = rwpUnifiedAppliedOffset[1] = 0;
         rwp_unified_layout(dlg);
         SetDlgItemTextW(dlg, IDC_UNIFIED_COPY_FORMAT,
             italian ? L"Copia formato\n(Testo selezionato)"
@@ -13063,6 +13365,57 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
         return rwp_format_search_dialog_proc(dlg, message, wParam, lParam);
     case WM_DRAWITEM:
         return rwp_format_search_dialog_proc(dlg, message, wParam, lParam);
+    case WM_VSCROLL:
+        if ((HWND)lParam == GetDlgItem(dlg, IDC_UNIFIED_FORMAT_SCROLL))
+        {
+            int target = rwpUnifiedScrollRows[rwpUnifiedPage];
+            SCROLLINFO info;
+            switch (LOWORD(wParam))
+            {
+            case SB_LINEUP: --target; break;
+            case SB_LINEDOWN: ++target; break;
+            case SB_PAGEUP: --target; break;
+            case SB_PAGEDOWN: ++target; break;
+            case SB_TOP: target = 0; break;
+            case SB_BOTTOM: target = RWP_UNIFIED_MAX_SCROLL_ROWS; break;
+            case SB_THUMBTRACK:
+            case SB_THUMBPOSITION:
+                ZeroMemory(&info, sizeof(info));
+                info.cbSize = sizeof(info);
+                info.fMask = SIF_TRACKPOS;
+                if (GetScrollInfo((HWND)lParam, SB_CTL, &info))
+                    target = info.nTrackPos;
+                break;
+            default: return TRUE;
+            }
+            rwp_unified_step_scroll(dlg, target);
+            return TRUE;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (IsWindowVisible(GetDlgItem(dlg, IDC_UNIFIED_FORMAT_SCROLL)))
+        {
+            POINT point;
+            RECT formatRegion = {0, 0, 0, 0};
+            point.x = (SHORT)LOWORD(lParam);
+            point.y = (SHORT)HIWORD(lParam);
+            ScreenToClient(dlg, &point);
+            formatRegion.left = 0;
+            formatRegion.top = 133;
+            formatRegion.right = 428;
+            formatRegion.bottom = 290;
+            MapDialogRect(dlg, &formatRegion);
+            if (PtInRect(&formatRegion, point))
+            {
+                int ticks = (SHORT)HIWORD(wParam);
+                if (ticks > 0) rwp_unified_step_scroll(dlg,
+                    rwpUnifiedScrollRows[rwpUnifiedPage] - 1);
+                else if (ticks < 0) rwp_unified_step_scroll(dlg,
+                    rwpUnifiedScrollRows[rwpUnifiedPage] + 1);
+                return TRUE;
+            }
+        }
+        break;
     case WM_CLOSE:
         DestroyWindow(dlg);
         return TRUE;
@@ -16896,11 +17249,28 @@ static void rwp_open_line_spacing_dialog(void)
     SetFocus(hEditorWnd);
 }
 
+/* Format-bar widths include the optional 2x36-pixel icon groups. */
+static void rwp_update_optional_formatbar_width(HWND owner)
+{
+    HWND rebar = GetDlgItem(owner, IDC_REBAR);
+    REBARBANDINFOW band;
+    int index;
+    int extra = (rwpHighlightButtonVisible ? 72 : 0) +
+                (rwpScriptButtonsVisible ? 72 : 0);
+    if (!rebar) return;
+    index = (int)SendMessageW(rebar, RB_IDTOINDEX, BANDID_FORMATBAR, 0);
+    if (index < 0) return;
+    ZeroMemory(&band, sizeof(band));
+    band.cbSize = REBARBANDINFOW_V6_SIZE;
+    band.fMask = RBBIM_SIZE | RBBIM_CHILDSIZE;
+    band.cx = 462 + extra;
+    band.cxMinChild = 426 + extra;
+    SendMessageW(rebar, RB_SETBANDINFOW, index, (LPARAM)&band);
+}
+
 static void rwp_set_highlight_toolbar_visible(HWND owner, BOOL visible)
 {
     HWND rebar, toolbar;
-    REBARBANDINFOW band;
-    int index;
     rwpHighlightButtonVisible = visible;
     if (!owner) return;
     rebar = GetDlgItem(owner, IDC_REBAR);
@@ -16911,16 +17281,52 @@ static void rwp_set_highlight_toolbar_visible(HWND owner, BOOL visible)
     SendMessageW(toolbar, TB_HIDEBUTTON, ID_FORMAT_HIGHLIGHT_PICK,
                  MAKELONG(!visible, 0));
     SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
-    index = (int)SendMessageW(rebar, RB_IDTOINDEX, BANDID_FORMATBAR, 0);
-    if (index >= 0)
+    rwp_update_optional_formatbar_width(owner);
+}
+
+static void rwp_set_script_toolbar_visible(HWND owner, BOOL visible)
+{
+    HWND rebar, toolbar;
+    rwpScriptButtonsVisible = visible;
+    if (!owner) return;
+    rebar = GetDlgItem(owner, IDC_REBAR);
+    toolbar = rebar ? GetDlgItem(rebar, IDC_FORMATBAR) : NULL;
+    if (!toolbar) return;
+    SendMessageW(toolbar, TB_HIDEBUTTON, ID_FORMAT_SUPERSCRIPT,
+                 MAKELONG(!visible, 0));
+    SendMessageW(toolbar, TB_HIDEBUTTON, ID_FORMAT_SUBSCRIPT,
+                 MAKELONG(!visible, 0));
+    SendMessageW(toolbar, TB_AUTOSIZE, 0, 0);
+    rwp_update_optional_formatbar_width(owner);
+}
+
+static void rwp_load_script_visibility(HWND owner)
+{
+    HKEY key;
+    DWORD value = 0, type = 0, size = sizeof(value);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(),
+                      0, KEY_READ, &key) == ERROR_SUCCESS)
     {
-        ZeroMemory(&band, sizeof(band));
-        band.cbSize = REBARBANDINFOW_V6_SIZE;
-        band.fMask = RBBIM_SIZE | RBBIM_CHILDSIZE;
-        /* One additional 36px formatting button: strikethrough. */
-        band.cx = visible ? 534 : 462;
-        band.cxMinChild = visible ? 498 : 426;
-        SendMessageW(rebar, RB_SETBANDINFOW, index, (LPARAM)&band);
+        if (RegQueryValueExW(key, L"ScriptToolbarVisible", NULL, &type,
+                             (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && size == sizeof(value))
+            rwpScriptButtonsVisible = value != 0;
+        RegCloseKey(key);
+    }
+    rwp_set_script_toolbar_visible(owner, rwpScriptButtonsVisible);
+}
+
+static void rwp_save_script_visibility(void)
+{
+    HKEY key;
+    DWORD value = rwpScriptButtonsVisible ? 1 : 0;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(),
+                        0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                        NULL, &key, NULL) == ERROR_SUCCESS)
+    {
+        RegSetValueExW(key, L"ScriptToolbarVisible", 0, REG_DWORD,
+                       (const BYTE *)&value, sizeof(value));
+        RegCloseKey(key);
     }
 }
 
@@ -17060,6 +17466,7 @@ static LRESULT OnCreate( HWND hWnd )
     /* The sprite now includes the crossed-S icon at index 9. */
     rwpFormatImageList = rwp_install_toolbar_icons(hFormatBarWnd, hInstance, IDB_FORMATBAR, 10);
     rwp_append_highlight_icon(hInstance);
+    rwp_append_script_icons(hInstance);
     AddButton(hFormatBarWnd, 0, ID_FORMAT_BOLD);
     AddButton(hFormatBarWnd, 1, ID_FORMAT_ITALIC);
     AddButton(hFormatBarWnd, 2, ID_FORMAT_UNDERLINE);
@@ -17081,6 +17488,8 @@ static LRESULT OnCreate( HWND hWnd )
     AddButton(hFormatBarWnd, 5, ID_ALIGN_CENTER);
     AddButton(hFormatBarWnd, 6, ID_ALIGN_RIGHT);
     AddButton(hFormatBarWnd, 9, ID_FORMAT_STRIKETHROUGH);
+    AddButton(hFormatBarWnd, 11, ID_FORMAT_SUPERSCRIPT);
+    AddButton(hFormatBarWnd, 12, ID_FORMAT_SUBSCRIPT);
     AddButton(hFormatBarWnd, 10, ID_FORMAT_HIGHLIGHT);
     AddButton(hFormatBarWnd, I_IMAGENONE, ID_FORMAT_HIGHLIGHT_PICK);
     {
@@ -17161,6 +17570,7 @@ static LRESULT OnCreate( HWND hWnd )
     registry_read_options();
     rwp_backup_load_preferences();
     rwp_load_highlight_visibility(hWnd);
+    rwp_load_script_visibility(hWnd);
     if (rwpBackupEnabled) SetTimer(hWnd, RWP_BACKUP_TIMER_ID, 1000, NULL);
     /* Unconnected documents have no cloud timer; loading a configured
      * document or enabling periodic saving will arm it on demand. */
@@ -17228,6 +17638,15 @@ static LRESULT OnUser( HWND hWnd )
                  (fmt.dwMask & CFM_STRIKEOUT) && (fmt.dwEffects & CFE_STRIKEOUT));
     SendMessageW(hwndFormatBar, TB_INDETERMINATE, ID_FORMAT_STRIKETHROUGH,
                  !(fmt.dwMask & CFM_STRIKEOUT));
+    /* RichEdit exposes both baseline-shift styles through one shared mask. */
+    SendMessageW(hwndFormatBar, TB_CHECKBUTTON, ID_FORMAT_SUPERSCRIPT,
+                 (fmt.dwMask & CFM_SUPERSCRIPT) && (fmt.dwEffects & CFE_SUPERSCRIPT));
+    SendMessageW(hwndFormatBar, TB_CHECKBUTTON, ID_FORMAT_SUBSCRIPT,
+                 (fmt.dwMask & CFM_SUBSCRIPT) && (fmt.dwEffects & CFE_SUBSCRIPT));
+    SendMessageW(hwndFormatBar, TB_INDETERMINATE, ID_FORMAT_SUPERSCRIPT,
+                 !(fmt.dwMask & CFM_SUPERSCRIPT));
+    SendMessageW(hwndFormatBar, TB_INDETERMINATE, ID_FORMAT_SUBSCRIPT,
+                 !(fmt.dwMask & CFM_SUBSCRIPT));
 
     SendMessageW(hwndEditor, EM_GETPARAFORMAT, 0, (LPARAM)&pf);
     {
@@ -24311,6 +24730,31 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         break;
         }
 
+    case ID_FORMAT_SUPERSCRIPT:
+    case ID_FORMAT_SUBSCRIPT:
+    {
+        CHARFORMAT2W fmt;
+        CHARRANGE selected;
+        DWORD desired = LOWORD(wParam) == ID_FORMAT_SUPERSCRIPT ?
+                        CFE_SUPERSCRIPT : CFE_SUBSCRIPT;
+        ZeroMemory(&fmt, sizeof(fmt));
+        fmt.cbSize = sizeof(fmt);
+        SendMessageW(hwndEditor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        /* CFM_SUPERSCRIPT and CFM_SUBSCRIPT are the same mutually exclusive mask. */
+        fmt.dwEffects = (fmt.dwMask & CFM_SUPERSCRIPT) &&
+                        (fmt.dwEffects & desired) ? 0 : desired;
+        fmt.dwMask = CFM_SUPERSCRIPT;
+        reset_background_history();
+        if (SendMessageW(hwndEditor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt))
+        {
+            SendMessageW(hwndEditor, EM_EXGETSEL, 0, (LPARAM)&selected);
+            if (selected.cpMin != selected.cpMax)
+                rwpRichFormattingChanged = TRUE;
+            SendMessageW(hWnd, WM_USER, 0, 0);
+        }
+        break;
+    }
+
     case ID_FORMAT_HIGHLIGHT:
     {
         CHARFORMAT2W format;
@@ -24646,6 +25090,12 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         break;
         }
 
+    case ID_TOGGLE_SCRIPT_BUTTONS:
+        rwp_set_script_toolbar_visible(hWnd, !rwpScriptButtonsVisible);
+        rwp_save_script_visibility();
+        update_window();
+        break;
+
     case ID_TOGGLE_HIGHLIGHT:
         rwp_set_highlight_toolbar_visible(hWnd, !rwpHighlightButtonVisible);
         rwp_save_highlight_visibility();
@@ -24810,6 +25260,8 @@ static LRESULT OnInitPopupMenu( HWND hWnd, WPARAM wParam )
             MF_CHECKED : MF_UNCHECKED);
     CheckMenuItem(hMenu, ID_TOGGLE_HIGHLIGHT,
                   rwpHighlightButtonVisible ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_TOGGLE_SCRIPT_BUTTONS,
+                  rwpScriptButtonsVisible ? MF_CHECKED : MF_UNCHECKED);
 
     CheckMenuItem(hMenu, ID_TOGGLE_STATUSBAR, IsWindowVisible(hwndStatus) ?
             MF_CHECKED : MF_UNCHECKED);
@@ -25257,6 +25709,10 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                     InsertMenuW(view, j + 1, MF_BYPOSITION | MF_STRING,
                                 ID_TOGGLE_HIGHLIGHT,
                                 italian ? L"Pulsante evidenziatore" : L"Highlight button");
+                    InsertMenuW(view, j + 2, MF_BYPOSITION | MF_STRING,
+                                ID_TOGGLE_SCRIPT_BUTTONS,
+                                italian ? L"Pulsanti Apice / Pedice" :
+                                          L"Superscript / Subscript buttons");
                     break;
                 }
             break;
