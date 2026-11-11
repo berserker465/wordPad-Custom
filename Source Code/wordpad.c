@@ -17201,6 +17201,35 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
     if (pHdr->code == EN_LINK)
     {
         ENLINK *link = (ENLINK *)lParam;
+        BOOL ctrlHeld = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
+        /* Ctrl+click edits the link label instead of following its URL.
+         * RichEdit may treat linked text as an active field rather than
+         * placing the insertion point, so position the caret explicitly
+         * at the mouse coordinates on button-down. This works for both
+         * external URLs and internal bookmark hyperlinks. */
+        if (ctrlHeld && link->msg == WM_LBUTTONDOWN)
+        {
+            POINTL point;
+            CHARRANGE caret;
+            point.x = (SHORT)LOWORD(link->lParam);
+            point.y = (SHORT)HIWORD(link->lParam);
+            caret.cpMin = (LONG)SendMessageW(hwndEditor, EM_CHARFROMPOS,
+                                            0, (LPARAM)&point);
+            caret.cpMax = caret.cpMin;
+            SetFocus(hwndEditor);
+            SendMessageW(hwndEditor, EM_EXSETSEL, 0, (LPARAM)&caret);
+            return 1; /* Do not perform RichEdit's link-click action. */
+        }
+        if (ctrlHeld && link->msg == WM_SETCURSOR)
+        {
+            SetCursor(LoadCursorW(NULL, IDC_IBEAM));
+            return 1;
+        }
+        /* Also consume the release to prevent URL/bookmark navigation. */
+        if (ctrlHeld && link->msg == WM_LBUTTONUP)
+            return 1;
+
         if (link->msg == WM_LBUTTONUP)
         {
             WCHAR url[RWP_LINK_MAX_URL];
