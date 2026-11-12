@@ -65,6 +65,8 @@ IDB_FORMATBAR BITMAP "res/formatbar.bmp"
 IDB_HIGHLIGHT_ICON BITMAP "res/highlight.bmp"
 IDB_SUPERSCRIPT_ICON BITMAP "res/superscript.bmp"
 IDB_SUBSCRIPT_ICON BITMAP "res/subscript.bmp"
+IDB_PASTE_PLAIN_ICON BITMAP "res/paste_plain.bmp"
+IDB_REMOVE_FORMATTING_ICON BITMAP "res/remove_format.bmp"
 
 /* @makedep: wordpad.ico */
 IDI_WORDPAD ICON "res/wordpad.ico"

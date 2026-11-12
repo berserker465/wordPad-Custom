@@ -752,6 +752,8 @@ static LPCWSTR toolbar_tooltip(int command)
     case ID_EDIT_CUT:         return italian ? L"Taglia" : L"Cut";
     case ID_EDIT_COPY:        return italian ? L"Copia" : L"Copy";
     case ID_EDIT_PASTE:       return italian ? L"Incolla" : L"Paste";
+    case ID_EDIT_PASTE_PLAIN: return italian ? L"Incolla senza formattazione" : L"Paste without formatting";
+    case ID_EDIT_REMOVE_FORMATTING: return italian ? L"Rimuovi formattazione" : L"Remove formatting";
     case ID_EDIT_UNDO:        return italian ? L"Annulla" : L"Undo";
     case ID_EDIT_REDO:        return italian ? L"Ripristina" : L"Redo";
     case ID_OVERTYPE:         return italian ? L"Modalità sovrascrittura (Ins)" : L"Overwrite mode (Insert)";
@@ -813,6 +815,22 @@ static void rwp_append_script_icons(HINSTANCE instance)
                             IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
         if (!bitmap) continue;
         ImageList_AddMasked(rwpFormatImageList, bitmap, RGB(192, 192, 192));
+        DeleteObject(bitmap);
+    }
+}
+
+/* Append 24px icon resources without reindexing the original toolbar sprites. */
+static void rwp_append_main_format_icons(HINSTANCE instance)
+{
+    static const UINT icons[] = { IDB_PASTE_PLAIN_ICON, IDB_REMOVE_FORMATTING_ICON };
+    SIZE_T i;
+    if (!rwpMainImageList) return;
+    for (i = 0; i < sizeof(icons) / sizeof(icons[0]); ++i)
+    {
+        HBITMAP bitmap = (HBITMAP)LoadImageW(instance, MAKEINTRESOURCEW(icons[i]),
+                                      IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+        if (!bitmap) continue;
+        ImageList_AddMasked(rwpMainImageList, bitmap, RGB(192, 192, 192));
         DeleteObject(bitmap);
     }
 }
@@ -17408,6 +17426,7 @@ static LRESULT OnCreate( HWND hWnd )
     SendMessageW(hToolBarWnd, TB_SETBUTTONSIZE, 0, MAKELONG(36, 36));
     SendMessageW(hToolBarWnd, TB_SETMAXTEXTROWS, 0, 0);
     rwpMainImageList = rwp_install_toolbar_icons(hToolBarWnd, hInstance, IDB_TOOLBAR, 14);
+    rwp_append_main_format_icons(hInstance);
     AddButton(hToolBarWnd, 0, ID_FILE_NEW);
     AddButton(hToolBarWnd, 1, ID_FILE_OPEN);
     AddButton(hToolBarWnd, 2, ID_FILE_SAVE);
@@ -17419,12 +17438,14 @@ static LRESULT OnCreate( HWND hWnd )
     AddButton(hToolBarWnd, 6, ID_EDIT_CUT);
     AddButton(hToolBarWnd, 7, ID_EDIT_COPY);
     AddButton(hToolBarWnd, 8, ID_EDIT_PASTE);
+    AddButton(hToolBarWnd, 14, ID_EDIT_PASTE_PLAIN);
     AddButton(hToolBarWnd, 9, ID_EDIT_UNDO);
     AddButton(hToolBarWnd, 10, ID_EDIT_REDO);
     AddSeparator(hToolBarWnd);
     AddButton(hToolBarWnd, I_IMAGENONE, ID_CAPSLOCK);
     AddButton(hToolBarWnd, 12, ID_OVERTYPE);
     AddSeparator(hToolBarWnd);
+    AddButton(hToolBarWnd, 15, ID_EDIT_REMOVE_FORMATTING);
     AddButton(hToolBarWnd, 11, ID_DATETIME);
     AddButton(hToolBarWnd, 13, ID_INSERT_TABLE);
 
@@ -17433,7 +17454,7 @@ static LRESULT OnCreate( HWND hWnd )
 
     /* Row 1: independent 36px buttons, 44px rebar child row. */
     rwp_insert_ui_band(hReBarWnd, hToolBarWnd, BANDID_TOOLBAR,
-                       0, 606, 44, TRUE);
+                       0, 678, 44, TRUE);
 
     /* Row 2: enlarged font/size editors and formatting icons. */
     /* Same configured UI font as the dialogs; document formatting is separate. */
@@ -17612,6 +17633,8 @@ static LRESULT OnUser( HWND hWnd )
       (backgroundHistoryActive && bgRedoCount) || SendMessageW(hwndEditor, EM_CANREDO, 0, 0));
     SendMessageW(hwndToolBar, TB_ENABLEBUTTON, ID_EDIT_CUT, from == to ? 0 : 1);
     SendMessageW(hwndToolBar, TB_ENABLEBUTTON, ID_EDIT_COPY, from == to ? 0 : 1);
+    SendMessageW(hwndToolBar, TB_ENABLEBUTTON, ID_EDIT_REMOVE_FORMATTING,
+                 from != to && !(GetWindowLongW(hwndEditor, GWL_STYLE) & ES_READONLY));
     SendMessageW(hwndFormatBar, TB_ENABLEBUTTON, ID_LINE_SPACING, from != to);
     SendMessageW(hwndToolBar, TB_ENABLEBUTTON, ID_INSERT_TABLE,
                  !(GetWindowLongW(hwndEditor, GWL_STYLE) & ES_READONLY));
@@ -24371,6 +24394,342 @@ static BOOL rwp_set_color_format_preserving_combining_sequences(
     return success;
 }
 
+/* Read only the front of Rich Edit's RTF output, so removing formatting does
+ * not allocate or scan a full document containing many embedded objects. */
+#define RWP_FORMAT_HEADER_LIMIT (1024 * 1024)
+typedef struct RWP_FORMAT_HEADER
+{
+    BYTE *data;
+    SIZE_T used;
+    BOOL stoppedAtLimit;
+} RWP_FORMAT_HEADER;
+
+static DWORD CALLBACK rwp_format_header_stream(DWORD_PTR cookie, LPBYTE data,
+                                                LONG cb, LONG *written)
+{
+    RWP_FORMAT_HEADER *header = (RWP_FORMAT_HEADER *)cookie;
+    SIZE_T room = RWP_FORMAT_HEADER_LIMIT - header->used;
+    SIZE_T count = cb > 0 ? (SIZE_T)cb : 0;
+    if (count > room)
+    {
+        count = room;
+        header->stoppedAtLimit = TRUE;
+    }
+    if (count)
+    {
+        memcpy(header->data + header->used, data, count);
+        header->used += count;
+    }
+    *written = (LONG)count;
+    return header->stoppedAtLimit ? 1 : 0; /* Expected early stop on huge files. */
+}
+
+/* Find an RTF header group, not a similarly named control in document text. */
+static SIZE_T rwp_format_find_rtf_group(const BYTE *data, SIZE_T size,
+                                        const char *name)
+{
+    SIZE_T i;
+    SIZE_T nameLength = strlen(name);
+    for (i = 0; i + nameLength + 2 < size; ++i)
+    {
+        if (data[i] == '{' && data[i+1] == '\\' &&
+            !memcmp(data + i + 2, name, nameLength) &&
+            (data[i+2+nameLength] == '{' ||
+             data[i+2+nameLength] == ';' ||
+             data[i+2+nameLength] == ' ' ||
+             data[i+2+nameLength] == '\\' ||
+             data[i+2+nameLength] == '\r' ||
+             data[i+2+nameLength] == '\n'))
+            return i + 2 + nameLength;
+    }
+    return size;
+}
+
+/* Decode the first explicit font face in {\\fonttbl...}. Font-name RTF
+ * control words are skipped; escaped bytes honor the document code page. */
+static BOOL rwp_format_first_font(const BYTE *data, SIZE_T size, WCHAR *face)
+{
+    SIZE_T at = rwp_format_find_rtf_group(data, size, "fonttbl");
+    BYTE encoded[256];
+    SIZE_T encodedLength = 0;
+    SIZE_T i, start;
+    UINT codepage = CP_ACP;
+    int depth = 0;
+    BOOL found = FALSE;
+    face[0] = 0;
+    if (at == size) return FALSE;
+    for (i = 0; i + 8 < at; ++i)
+    {
+        if (data[i] == '\\' && !memcmp(data+i+1, "ansicpg", 7))
+        {
+            char *end;
+            unsigned long cp = strtoul((const char *)data+i+8, &end, 10);
+            if (cp >= 1 && cp <= 65001) codepage = (UINT)cp;
+            break;
+        }
+    }
+    /* Font entries are subgroups beginning with {\\f0, {\\f1, etc. */
+    for (start = at; start + 3 < size && data[start] != '}'; ++start)
+    {
+        if (data[start] == '{' && data[start+1] == '\\' &&
+            data[start+2] == 'f' && data[start+3] >= '0' &&
+            data[start+3] <= '9')
+        {
+            found = TRUE;
+            break;
+        }
+    }
+    if (!found) return FALSE;
+    /* Skip font number and subsequent formatting control words. */
+    for (i = start + 1; i < size; ++i)
+    {
+        BYTE ch = data[i];
+        if (ch == ';' && depth == 0) break;
+        if (ch == '{') { ++depth; continue; }
+        if (ch == '}')
+        {
+            if (!depth) break;
+            --depth;
+            continue;
+        }
+        if (depth) continue;
+        if (ch == '\\' && i + 1 < size)
+        {
+            BYTE following = data[++i];
+            if (following == '\'' && i + 2 < size)
+            {
+                int hi, lo;
+                BYTE a = data[i+1], b = data[i+2];
+                hi = a >= '0' && a <= '9' ? a-'0' :
+                     a >= 'a' && a <= 'f' ? a-'a'+10 :
+                     a >= 'A' && a <= 'F' ? a-'A'+10 : -1;
+                lo = b >= '0' && b <= '9' ? b-'0' :
+                     b >= 'a' && b <= 'f' ? b-'a'+10 :
+                     b >= 'A' && b <= 'F' ? b-'A'+10 : -1;
+                if (hi >= 0 && lo >= 0 && encodedLength < sizeof(encoded))
+                    encoded[encodedLength++] = (BYTE)((hi << 4) | lo);
+                i += 2;
+            }
+            else if (following == 'u' && i + 1 < size &&
+                     (data[i+1] == '-' || (data[i+1] >= '0' && data[i+1] <= '9')))
+            {
+                /* A Unicode-escaped font name cannot be decoded from the
+                 * ANSI buffer below; refuse instead of choosing a wrong face. */
+                return FALSE;
+            }
+            else if ((following >= 'a' && following <= 'z') ||
+                     (following >= 'A' && following <= 'Z'))
+            {
+                while (i + 1 < size &&
+                       ((data[i+1] >= 'a' && data[i+1] <= 'z') ||
+                        (data[i+1] >= 'A' && data[i+1] <= 'Z'))) ++i;
+                if (i+1 < size && (data[i+1] == '-' ||
+                    (data[i+1] >= '0' && data[i+1] <= '9')))
+                {
+                    if (data[i+1] == '-') ++i;
+                    while (i+1 < size && data[i+1] >= '0' && data[i+1] <= '9') ++i;
+                }
+                if (i+1 < size && data[i+1] == ' ') ++i;
+            }
+            else if ((following == '\\' || following == '{' || following == '}') &&
+                     encodedLength < sizeof(encoded))
+                encoded[encodedLength++] = following;
+            continue;
+        }
+        if (encodedLength < sizeof(encoded)) encoded[encodedLength++] = ch;
+    }
+    while (encodedLength && (encoded[encodedLength-1] == ' ' ||
+                             encoded[encodedLength-1] == '\r' ||
+                             encoded[encodedLength-1] == '\n')) --encodedLength;
+    while (encodedLength && (encoded[0] == ' ' ||
+                             encoded[0] == '\r' || encoded[0] == '\n'))
+    {
+        memmove(encoded, encoded + 1, --encodedLength);
+    }
+    if (!encodedLength) return FALSE;
+    /* Decode only the requested face name; never truncate to a different name. */
+    {
+        int needed = MultiByteToWideChar(codepage, 0, (LPCSTR)encoded,
+                                         (int)encodedLength, NULL, 0);
+        if (!needed || needed >= LF_FACESIZE) return FALSE;
+        if (MultiByteToWideChar(codepage, 0, (LPCSTR)encoded,
+                                (int)encodedLength, face, needed) != needed)
+            return FALSE;
+        face[needed] = 0;
+    }
+    return TRUE;
+}
+
+/* Index 0 of an RTF color table is commonly an empty automatic-color slot.
+ * Choose the first actual \\red/\\green/\\blue definition instead. */
+static BOOL rwp_format_first_color(const BYTE *data, SIZE_T size,
+                                   COLORREF *color)
+{
+    SIZE_T at = rwp_format_find_rtf_group(data, size, "colortbl");
+    int red = 0, green = 0, blue = 0;
+    unsigned seen = 0;
+    if (at == size) return FALSE;
+    while (at < size && data[at] != '}')
+    {
+        if (data[at] == ';')
+        {
+            if (seen == 7)
+            {
+                *color = RGB(red, green, blue);
+                return TRUE;
+            }
+            seen = 0;
+        }
+        else if (data[at] == '\\')
+        {
+            static const char *const names[] = { "red", "green", "blue" };
+            int k;
+            for (k = 0; k < 3; ++k)
+            {
+                SIZE_T len = strlen(names[k]);
+                if (at + 1 + len < size &&
+                    !memcmp(data + at + 1, names[k], len) &&
+                    data[at + 1 + len] >= '0' && data[at + 1 + len] <= '9')
+                {
+                    unsigned value = 0;
+                    SIZE_T p = at + 1 + len;
+                    while (p < size && data[p] >= '0' && data[p] <= '9')
+                    {
+                        value = value * 10 + (data[p] - '0');
+                        if (value > 255) return FALSE;
+                        ++p;
+                    }
+                    if (k == 0) red = (int)value;
+                    if (k == 1) green = (int)value;
+                    if (k == 2) blue = (int)value;
+                    seen |= 1U << k;
+                    at = p - 1;
+                    break;
+                }
+            }
+        }
+        ++at;
+    }
+    return FALSE;
+}
+
+/* The current Rich Edit model is authoritative: use the font/color header
+ * generated for this document, including unsaved edits. */
+static BOOL rwp_format_read_document_defaults(HWND editor, CHARFORMAT2W *format)
+{
+    RWP_FORMAT_HEADER header;
+    EDITSTREAM stream;
+    BOOL faceFound, colorFound, colorTableFound;
+    WCHAR firstFace[LF_FACESIZE];
+    COLORREF firstColor;
+    ZeroMemory(&header, sizeof(header));
+    header.data = HeapAlloc(GetProcessHeap(), 0, RWP_FORMAT_HEADER_LIMIT);
+    if (!header.data) return FALSE;
+    ZeroMemory(&stream, sizeof(stream));
+    stream.dwCookie = (DWORD_PTR)&header;
+    stream.pfnCallback = rwp_format_header_stream;
+    SendMessageW(editor, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
+    faceFound = rwp_format_first_font(header.data, header.used, firstFace);
+    if (faceFound)
+    {
+        lstrcpynW(format->szFaceName, firstFace, LF_FACESIZE);
+        format->dwMask |= CFM_FACE;
+    }
+    colorTableFound = rwp_format_find_rtf_group(header.data, header.used,
+                                                 "colortbl") != header.used;
+    colorFound = rwp_format_first_color(header.data, header.used, &firstColor);
+    if (colorFound)
+    {
+        format->crTextColor = firstColor;
+        format->dwEffects &= ~CFE_AUTOCOLOR;
+    }
+    else
+        format->dwEffects |= CFE_AUTOCOLOR;
+    HeapFree(GetProcessHeap(), 0, header.data);
+    /* Never mistake an incomplete color table for automatic text color. */
+    return faceFound && (!stream.dwError || header.stoppedAtLimit) &&
+           !(header.stoppedAtLimit && !colorTableFound);
+}
+
+/* Reset the selected characters and their paragraphs in one undo action.
+ * Avoid touching RTF structural properties such as table cells and fields. */
+static void rwp_remove_selection_formatting(void)
+{
+    CHARRANGE selection;
+    CHARFORMAT2W defaults, character;
+    PARAFORMAT2 paragraph;
+    ITextDocument *undo;
+    BOOL characterOK, paragraphOK;
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    if (!hEditorWnd || (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+        return;
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
+    if (selection.cpMax <= selection.cpMin) return;
+    ZeroMemory(&defaults, sizeof(defaults));
+    defaults.cbSize = sizeof(defaults);
+    SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_DEFAULT, (LPARAM)&defaults);
+    ZeroMemory(&character, sizeof(character));
+    character.cbSize = sizeof(character);
+    character.yHeight = defaults.yHeight > 0 ? defaults.yHeight : 200;
+    character.bCharSet = defaults.bCharSet;
+    character.wWeight = FW_NORMAL;
+    character.dwEffects = CFE_AUTOBACKCOLOR;
+    character.dwMask = CFM_FACE | CFM_SIZE | CFM_COLOR | CFM_BACKCOLOR |
+                       CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE |
+                       CFM_STRIKEOUT | CFM_SUPERSCRIPT | CFM_SMALLCAPS |
+                       CFM_ALLCAPS | CFM_HIDDEN | CFM_OUTLINE | CFM_SHADOW |
+                       CFM_EMBOSS | CFM_IMPRINT | CFM_OFFSET | CFM_SPACING |
+                       CFM_KERNING | CFM_WEIGHT | CFM_UNDERLINETYPE |
+                       CFM_CHARSET;
+    if (!rwp_format_read_document_defaults(hEditorWnd, &character))
+    {
+        MessageBoxW(hMainWnd,
+            italian ? L"Impossibile leggere il primo carattere e colore dell'intestazione RTF. Nessuna modifica apportata."
+                    : L"Could not read the RTF header's first font and color. No changes were made.",
+            wszAppTitle, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    ZeroMemory(&paragraph, sizeof(paragraph));
+    paragraph.cbSize = sizeof(paragraph);
+    paragraph.dwMask = PFM_ALIGNMENT | PFM_NUMBERING | PFM_STARTINDENT |
+                       PFM_RIGHTINDENT | PFM_OFFSET | PFM_LINESPACING |
+                       PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_TABSTOPS;
+    paragraph.wAlignment = PFA_LEFT;
+    paragraph.wNumbering = 0;
+    paragraph.bLineSpacingRule = 0;
+    paragraph.cTabCount = 0;
+    /* Do not create two independent Undo steps for the two format operations. */
+    undo = rwp_begin_table_edit_collection(2);
+    if (!undo)
+    {
+        MessageBoxW(hMainWnd,
+            italian ? L"Impossibile avviare un unico passaggio Annulla. Nessuna modifica apportata."
+                    : L"Unable to start a single Undo action. No changes were made.",
+            wszAppTitle, MB_OK | MB_ICONWARNING);
+        return;
+    }
+    reset_background_history();
+    characterOK = (BOOL)SendMessageW(hEditorWnd, EM_SETCHARFORMAT,
+                                     SCF_SELECTION, (LPARAM)&character);
+    paragraphOK = characterOK && (BOOL)SendMessageW(hEditorWnd,
+                                      EM_SETPARAFORMAT, 0, (LPARAM)&paragraph);
+    rwp_end_table_edit_collection(undo);
+    if (characterOK)
+    {
+        rwpRichFormattingChanged = TRUE;
+        rwpMultiRowAlignmentKnown = FALSE;
+        RedrawWindow(hEditorWnd, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        PostMessageW(hMainWnd, WM_USER, 0, 0);
+    }
+    if (!characterOK || !paragraphOK)
+        MessageBoxW(hMainWnd,
+            italian ? L"Non tutte le formattazioni sono state rimosse. Annulla l'operazione se necessario."
+                    : L"Some formatting could not be removed. Undo the action if necessary.",
+            wszAppTitle, MB_OK | MB_ICONWARNING);
+    SetFocus(hEditorWnd);
+}
+
 static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 {
     HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
@@ -24910,6 +25269,10 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 
     case ID_EDIT_PASTE:
         SendMessageW(get_clipboard_command_target(hWnd, hwndEditor), WM_PASTE, 0, 0);
+        break;
+
+    case ID_EDIT_REMOVE_FORMATTING:
+        rwp_remove_selection_formatting();
         break;
 
     case ID_EDIT_PASTE_PLAIN:
