@@ -273,7 +273,9 @@ typedef struct RWP_TABLECELLPARMS
 
 /* A client-area menu bar avoids undocumented Windows menu-paint messages.
  * It uses the original localized HMENU for every menu item and command. */
-#define RWP_MENU_HEIGHT 34
+/* The extra row is only present when both right-hand header values are on. */
+#define RWP_MENU_ROW_HEIGHT 34
+#define RWP_MENU_HEIGHT 52
 #define RWP_MENU_MAX 16
 static const WCHAR rwpMenuClass[] = L"RWP_DARK_MENU";
 static HMENU rwpMainMenu = NULL;
@@ -284,12 +286,25 @@ static int rwpMenuHover = -1;
 static int rwpMenuActive = -1;
 static BOOL rwpMenuTracking = FALSE;
 #define RWP_MENU_CLOCK_TIMER 1
+#define RWP_MENU_COUNTER_TOOL_ID 1
+static BOOL rwpHeaderDateVisible = TRUE;
+static BOOL rwpHeaderCharactersVisible = TRUE;
+static DWORD rwpHeaderCharacterCount = 0;
+static HWND rwpHeaderCounterTooltip = NULL;
+static void rwp_format_grouped_counter(DWORD value, WCHAR *buffer);
+static void rwp_header_refresh_character_count(void);
+static int rwp_header_height(void)
+{
+    return rwpHeaderDateVisible && rwpHeaderCharactersVisible ?
+           RWP_MENU_HEIGHT : RWP_MENU_ROW_HEIGHT;
+}
 static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
                                                   WPARAM wParam, LPARAM lParam);
 static INT_PTR CALLBACK rwp_counter_dialog_proc(HWND dialog, UINT message,
                                                 WPARAM wParam, LPARAM lParam);
 /* Defined with the document-text helpers, below the counter dialog. */
 static BOOL rwp_get_plain_document(WCHAR **textOut, LONG *lengthOut);
+static DWORD rwp_count_document_tables(void);
 
 HMENU rwp_get_main_menu(HWND window)
 {
@@ -468,7 +483,7 @@ static RWP_CLOUD_DOC rwpCloudDoc = {0};
 static BOOL rwpCloudMetadataUnsafe = FALSE;
 /* Beta 1.6: one UI-thread queue, coalesced by document; network stays asynchronous. */
 static WCHAR rwpCloudAutoStatus[160] = L"";
-static WCHAR rwpStatusSelectionText[128] = L"RichEdit text";
+static WCHAR rwpStatusSelectionText[128] = L"Column: 1, Line: 1";
 /* 16x16 transparent icons with a 10x10 colored square, used in the
  * existing right-aligned status-bar pane. Owned and destroyed by WordPad. */
 static HICON rwpCloudStatusIcons[4] = { NULL, NULL, NULL, NULL };
@@ -1169,6 +1184,85 @@ static void rwp_format_header_datetime(WCHAR *buffer, UINT capacity)
               local.wHour, local.wMinute, local.wSecond, dayOfWeek);
 }
 
+/* RichEdit counts paragraph marks as text characters. Asking for the
+ * length with CR/LF pairs adds one code unit per paragraph break; the
+ * difference reveals exactly how many line breaks to exclude. This avoids
+ * copying or scanning the entire document after each edit, and does not
+ * confuse automatic word wrapping with actual line breaks. Spaces still
+ * count as ordinary characters. */
+static DWORD rwp_count_document_text_characters(void)
+{
+    GETTEXTLENGTHEX query;
+    LRESULT length, lengthWithCrlf;
+
+    if (!hEditorWnd || !IsWindow(hEditorWnd)) return 0;
+    ZeroMemory(&query, sizeof(query));
+    query.flags = GTL_NUMCHARS;
+    query.codepage = 1200;
+    length = SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX, (WPARAM)&query, 0);
+    if (length < 0) return 0;
+
+    query.flags = GTL_NUMCHARS | GTL_USECRLF;
+    lengthWithCrlf = SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX,
+                                  (WPARAM)&query, 0);
+    if (lengthWithCrlf >= length &&
+        (ULONGLONG)lengthWithCrlf <= (ULONGLONG)length * 2)
+        return (DWORD)(length - (lengthWithCrlf - length));
+
+    /* Preserve the original total if the extended query fails. */
+    return (DWORD)length;
+}
+
+static void rwp_header_refresh_character_count(void)
+{
+    DWORD updated = rwp_count_document_text_characters();
+    if (!hEditorWnd || !IsWindow(hEditorWnd)) return;
+    if (updated != rwpHeaderCharacterCount)
+    {
+        rwpHeaderCharacterCount = updated;
+        if (rwpMenuWnd && rwpHeaderCharactersVisible)
+            InvalidateRect(rwpMenuWnd, NULL, FALSE);
+    }
+}
+
+/* Only the drawn character count should show a tooltip. Updating the tool
+ * rectangle avoids accidentally triggering it over the adjacent date. */
+static void rwp_header_update_tooltip(const RECT *area)
+{
+    TOOLINFOW info;
+    if (!rwpHeaderCounterTooltip || !rwpMenuWnd) return;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.hwnd = rwpMenuWnd;
+    info.uId = RWP_MENU_COUNTER_TOOL_ID;
+    if (area) info.rect = *area;
+    SendMessageW(rwpHeaderCounterTooltip, TTM_NEWTOOLRECTW, 0, (LPARAM)&info);
+}
+
+/* Attach a native tooltip to the custom-painted header count. */
+static void rwp_header_create_tooltip(HINSTANCE instance)
+{
+    TOOLINFOW info;
+    static const WCHAR english[] =
+        L"Total characters present in this document, including spaces";
+    static const WCHAR italian[] =
+        L"Numero totale di caratteri presenti nel documento, inclusi gli spazi";
+    rwpHeaderCounterTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW,
+        NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+        rwpMenuWnd, NULL, instance, NULL);
+    if (!rwpHeaderCounterTooltip) return;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.uFlags = TTF_SUBCLASS;
+    info.hwnd = rwpMenuWnd;
+    info.uId = RWP_MENU_COUNTER_TOOL_ID;
+    info.lpszText = (LPWSTR)(PRIMARYLANGID(GetUserDefaultUILanguage()) ==
+        LANG_ITALIAN ? italian : english);
+    SendMessageW(rwpHeaderCounterTooltip, TTM_ADDTOOLW, 0, (LPARAM)&info);
+    SendMessageW(rwpHeaderCounterTooltip, TTM_SETMAXTIPWIDTH, 0, 400);
+}
+
 static void rwp_layout_menu(HWND window)
 {
     int index, left = 7;
@@ -1186,7 +1280,7 @@ static void rwp_layout_menu(HWND window)
         rwpMenuRects[index].left = left;
         rwpMenuRects[index].right = left + size.cx + 24;
         rwpMenuRects[index].top = 2;
-        rwpMenuRects[index].bottom = RWP_MENU_HEIGHT - 2;
+        rwpMenuRects[index].bottom = RWP_MENU_ROW_HEIGHT - 2;
         left = rwpMenuRects[index].right + 2;
     }
     if (dc) { SelectObject(dc, old); ReleaseDC(window, dc); }
@@ -1217,7 +1311,7 @@ static void rwp_open_top_menu(int index)
     rwpTableContextCp = -1;
     rwpInsertContextCp = -1;
     point.x = rwpMenuRects[index].left;
-    point.y = RWP_MENU_HEIGHT;
+    point.y = rwp_header_height();
     ClientToScreen(rwpMenuWnd, &point);
     cmd = TrackPopupMenuEx(popup, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD |
                           TPM_LEFTBUTTON, point.x, point.y, hMainWnd, NULL);
@@ -1275,14 +1369,57 @@ static LRESULT CALLBACK rwp_menu_proc(HWND window, UINT message, WPARAM wp, LPAR
                 DrawTextW(dc, label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
             }
             {
-                WCHAR timestamp[64];
-                RECT clockRect = bounds;
-                rwp_format_header_datetime(timestamp, sizeof(timestamp) / sizeof(timestamp[0]));
-                clockRect.left = (rwpMenuCount > 0 ? rwpMenuRects[rwpMenuCount - 1].right + 12 : 12);
-                clockRect.right -= 12;
-                SetTextColor(dc, RWP_BAR_TEXT);
-                DrawTextW(dc, timestamp, -1, &clockRect,
-                          DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
+                RECT infoRect = bounds, countHit;
+                SetRectEmpty(&countHit);
+                infoRect.left = (rwpMenuCount > 0 ?
+                    rwpMenuRects[rwpMenuCount - 1].right + 12 : 12);
+                infoRect.right -= 12;
+                if (infoRect.right > infoRect.left)
+                {
+                    SetTextColor(dc, RWP_BAR_TEXT);
+                    if (rwpHeaderDateVisible)
+                    {
+                        WCHAR timestamp[64];
+                        RECT dateRect = infoRect;
+                        rwp_format_header_datetime(timestamp,
+                                         sizeof(timestamp) / sizeof(timestamp[0]));
+                        if (rwpHeaderCharactersVisible)
+                        {
+                            dateRect.top = 1;
+                            dateRect.bottom = RWP_MENU_ROW_HEIGHT - 9;
+                        }
+                        DrawTextW(dc, timestamp, -1, &dateRect,
+                                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT |
+                                  DT_END_ELLIPSIS);
+                    }
+                    if (rwpHeaderCharactersVisible)
+                    {
+                        WCHAR grouped[32], total[80];
+                        SIZE size = {0, 0};
+                        RECT countRect = infoRect;
+                        const BOOL italian =
+                            PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+                        rwp_format_grouped_counter(rwpHeaderCharacterCount, grouped);
+                        wsprintfW(total, italian ? L"%s caratteri" : L"%s characters",
+                                  grouped);
+                        if (rwpHeaderDateVisible)
+                        {
+                            countRect.top = RWP_MENU_ROW_HEIGHT - 9;
+                            countRect.bottom = rwp_header_height() - 1;
+                        }
+                        DrawTextW(dc, total, -1, &countRect,
+                                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT |
+                                  DT_END_ELLIPSIS);
+                        if (GetTextExtentPoint32W(dc, total,
+                                                  lstrlenW(total), &size))
+                        {
+                            countHit = countRect;
+                            if (countHit.left < countHit.right - size.cx)
+                                countHit.left = countHit.right - size.cx;
+                        }
+                    }
+                }
+                rwp_header_update_tooltip(&countHit);
             }
             SelectObject(dc, old);
             EndPaint(window, &ps);
@@ -1291,7 +1428,12 @@ static LRESULT CALLBACK rwp_menu_proc(HWND window, UINT message, WPARAM wp, LPAR
         case WM_TIMER:
             if (wp == RWP_MENU_CLOCK_TIMER)
             {
-                InvalidateRect(window, NULL, FALSE);
+                /* EN_CHANGE provides immediate updates; this also catches
+                 * document replacements that bypass change notifications. */
+                if (rwpHeaderCharactersVisible)
+                    rwp_header_refresh_character_count();
+                if (rwpHeaderDateVisible)
+                    InvalidateRect(window, NULL, FALSE);
                 return 0;
             }
             break;
@@ -7661,6 +7803,40 @@ static SIZE_T rwp_count_inline_pictures_in_rtf(const BYTE *buffer, SIZE_T length
     return count;
 }
 
+/* Count displayed inline pictures, including BMP/WMF/DIB as well as PNG/JPEG.
+ * A picture inside an OLE object is only its icon/preview, not an additional
+ * document image. Do not affect the stricter PNG/JPEG image-export mapping. */
+static DWORD rwp_count_document_images_in_rtf(const BYTE *buffer, SIZE_T length)
+{
+    const char *p, *end;
+    DWORD count = 0;
+    if (!buffer || length < 6) return 0;
+    p = (const char *)buffer;
+    end = p + length;
+    while (end - p >= 6)
+    {
+        if (end - p >= 8 && !memcmp(p, "{\\object", 8))
+        {
+            const char *stop = rwp_inline_group_end(p, end);
+            if (!stop) break;
+            p = stop;
+            continue;
+        }
+        if (!memcmp(p, "{\\pict", 6) &&
+            (p + 6 == end || p[6] == '\\' || p[6] == '{' ||
+             p[6] == ' ' || p[6] == '\r' || p[6] == '\n'))
+        {
+            const char *stop = rwp_inline_group_end(p, end);
+            if (!stop) break;
+            ++count;
+            p = stop;
+            continue;
+        }
+        ++p;
+    }
+    return count;
+}
+
 static BOOL rwp_patch_inline_picture_group(RTF_MEMORY *out, const char *group,
                                            const char *stop,
                                            const RWP_ORIGINAL_INLINE_IMAGE *entry)
@@ -9701,6 +9877,36 @@ static void rwp_statusbar_update_selection(void)
     status = GetDlgItem(hMainWnd, IDC_STATUSBAR);
     if (status)
         SendMessageW(status, SB_SETTEXTW, 0, (LPARAM)rwpStatusSelectionText);
+}
+
+/* Show the 1-based column within the current displayed line and the 1-based
+ * line number. Selection information is shown only for a nonempty range.
+ * EM_LINEFROMCHAR / EM_LINEINDEX follow the existing RichEdit wrap layout. */
+static void rwp_statusbar_update_editor_position(void)
+{
+    CHARRANGE selection;
+    LONG line, lineStart, column;
+    const BOOL italian =
+        PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    if (!hEditorWnd || !IsWindow(hEditorWnd)) return;
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
+    line = (LONG)SendMessageW(hEditorWnd, EM_LINEFROMCHAR,
+                              (WPARAM)selection.cpMin, 0);
+    if (line < 0) line = 0;
+    lineStart = (LONG)SendMessageW(hEditorWnd, EM_LINEINDEX, (WPARAM)line, 0);
+    column = lineStart >= 0 ? selection.cpMin - lineStart + 1 : 1;
+    if (column < 1) column = 1;
+    if (selection.cpMax > selection.cpMin)
+        wsprintfW(rwpStatusSelectionText,
+                  italian ? L"Colonna: %ld, Riga: %ld | Selezione: %ld caratteri" :
+                            L"Column: %ld, Line: %ld | Selection: %ld characters",
+                  column, line + 1, selection.cpMax - selection.cpMin);
+    else
+        wsprintfW(rwpStatusSelectionText,
+                  italian ? L"Colonna: %ld, Riga: %ld" :
+                            L"Column: %ld, Line: %ld",
+                  column, line + 1);
+    rwp_statusbar_update_selection();
 }
 
 /* Keep editor selection information on the left and place the cloud
@@ -16806,7 +17012,10 @@ static void rwp_format_document_size_text(SIZE_T bytes, WCHAR *buffer, UINT capa
     wsprintfW(buffer, L"%lu,%02lu %s", whole, fraction, unit);
 }
 
-static BOOL rwp_get_current_document_size(SIZE_T *sizeOut)
+/* Save-size and picture statistics share one stream whenever the document's
+ * active storage format is RTF. For plain text, inspect a separate RTF stream
+ * to detect pasted pictures without changing the reported file size. */
+static BOOL rwp_get_current_document_size(SIZE_T *sizeOut, DWORD *picturesOut)
 {
     WPARAM format = fileFormat;
     RTF_MEMORY memory;
@@ -16815,6 +17024,7 @@ static BOOL rwp_get_current_document_size(SIZE_T *sizeOut)
 
     if (!sizeOut) return FALSE;
     *sizeOut = 0;
+    if (picturesOut) *picturesOut = 0;
     if (format != SF_RTF && (rwpRichFormattingChanged || documentBackgroundPresent))
         format = SF_RTF;
 
@@ -16836,7 +17046,22 @@ static BOOL rwp_get_current_document_size(SIZE_T *sizeOut)
         *sizeOut += 2; /* UTF-16 LE BOM written by DoSaveFile. */
     else if (format == SF_TEXT && rwpTextCodePage == CP_UTF8 && rwpTextUtf8Bom)
         *sizeOut += 3; /* Preserve an existing UTF-8 BOM. */
+    if (picturesOut && format == SF_RTF)
+        *picturesOut = rwp_count_document_images_in_rtf(memory.data, memory.used);
     HeapFree(GetProcessHeap(), 0, memory.data);
+    if (picturesOut && format != SF_RTF)
+    {
+        RTF_MEMORY rtf;
+        EDITSTREAM pictureStream;
+        ZeroMemory(&rtf, sizeof(rtf));
+        ZeroMemory(&pictureStream, sizeof(pictureStream));
+        pictureStream.dwCookie = (DWORD_PTR)&rtf;
+        pictureStream.pfnCallback = stream_out_memory;
+        SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&pictureStream);
+        if (!pictureStream.dwError && !rtf.failed && rtf.data)
+            *picturesOut = rwp_count_document_images_in_rtf(rtf.data, rtf.used);
+        if (rtf.data) HeapFree(GetProcessHeap(), 0, rtf.data);
+    }
     return TRUE;
 }
 
@@ -16862,19 +17087,15 @@ static void rwp_update_counter_dialog(HWND dialog)
     WCHAR *text = NULL;
     LONG length = 0;
     DWORD charsWithoutSpaces = 0, words = 0;
-    DWORD charsWithSpaces = 0;
+    DWORD charsWithSpaces = 0, pictures = 0, tables = 0, lines = 0;
     SIZE_T sizeBytes = 0;
     WCHAR buffer[64];
     WCHAR sizeText[64];
     LONG i;
     BOOL inWord = FALSE;
-    GETTEXTLENGTHEX lengthQuery;
 
-    ZeroMemory(&lengthQuery, sizeof(lengthQuery));
-    lengthQuery.flags = GTL_NUMCHARS;
-    lengthQuery.codepage = 1200;
-    charsWithSpaces = (DWORD)SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX,
-                                          (WPARAM)&lengthQuery, 0);
+    /* Use the same newline-excluding total as the live header counter. */
+    charsWithSpaces = rwp_count_document_text_characters();
 
     if (rwp_get_plain_document(&text, &length))
     {
@@ -16894,8 +17115,10 @@ static void rwp_update_counter_dialog(HWND dialog)
         HeapFree(GetProcessHeap(), 0, text);
     }
 
-    if (!rwp_get_current_document_size(&sizeBytes))
+    if (!rwp_get_current_document_size(&sizeBytes, &pictures))
         sizeBytes = 0;
+    tables = rwp_count_document_tables();
+    lines = (DWORD)SendMessageW(hEditorWnd, EM_GETLINECOUNT, 0, 0);
 
     rwp_format_grouped_counter(charsWithoutSpaces, buffer);
     SetDlgItemTextW(dialog, IDC_COUNTER_CHARS_NOSPACE_VALUE, buffer);
@@ -16905,6 +17128,12 @@ static void rwp_update_counter_dialog(HWND dialog)
     SetDlgItemTextW(dialog, IDC_COUNTER_WORDS_VALUE, buffer);
     rwp_format_document_size_text(sizeBytes, sizeText, sizeof(sizeText) / sizeof(sizeText[0]));
     SetDlgItemTextW(dialog, IDC_COUNTER_SIZE_VALUE, sizeText);
+    rwp_format_grouped_counter(pictures, buffer);
+    SetDlgItemTextW(dialog, IDC_COUNTER_IMAGES_VALUE, buffer);
+    rwp_format_grouped_counter(tables, buffer);
+    SetDlgItemTextW(dialog, IDC_COUNTER_TABLES_VALUE, buffer);
+    rwp_format_grouped_counter(lines, buffer);
+    SetDlgItemTextW(dialog, IDC_COUNTER_LINES_VALUE, buffer);
 }
 
 /* The shortcuts list is resizable, but its close button always occupies a
@@ -16981,17 +17210,21 @@ static void rwp_size_shortcuts_dialog(HWND dialog)
     rwp_layout_shortcuts_dialog(dialog);
 }
 
-/* Position the four counter values immediately after the longest localized
+/* Position the seven counter values immediately after the longest localized
  * label, rather than reserving a wide empty column between label and value. */
 static void rwp_align_counter_values(HWND dialog)
 {
     static const int labelIds[] = {
         IDC_COUNTER_CHARS_NOSPACE_LABEL, IDC_COUNTER_CHARS_LABEL,
-        IDC_COUNTER_WORDS_LABEL, IDC_COUNTER_SIZE_LABEL
+        IDC_COUNTER_WORDS_LABEL, IDC_COUNTER_SIZE_LABEL,
+        IDC_COUNTER_IMAGES_LABEL, IDC_COUNTER_TABLES_LABEL,
+        IDC_COUNTER_LINES_LABEL
     };
     static const int valueIds[] = {
         IDC_COUNTER_CHARS_NOSPACE_VALUE, IDC_COUNTER_CHARS_VALUE,
-        IDC_COUNTER_WORDS_VALUE, IDC_COUNTER_SIZE_VALUE
+        IDC_COUNTER_WORDS_VALUE, IDC_COUNTER_SIZE_VALUE,
+        IDC_COUNTER_IMAGES_VALUE, IDC_COUNTER_TABLES_VALUE,
+        IDC_COUNTER_LINES_VALUE
     };
     HDC dc = GetDC(dialog);
     RECT bounds;
@@ -17000,7 +17233,7 @@ static void rwp_align_counter_values(HWND dialog)
 
     if (!dc) return;
     GetClientRect(dialog, &bounds);
-    for (i = 0; i < 4; ++i)
+    for (i = 0; i < (int)(sizeof(labelIds) / sizeof(labelIds[0])); ++i)
     {
         HWND label = GetDlgItem(dialog, labelIds[i]);
         WCHAR value[128];
@@ -17021,7 +17254,7 @@ static void rwp_align_counter_values(HWND dialog)
     /* Leave at least enough width for values such as "123,45 MB". */
     if (valueX > bounds.right - rwp_shortcuts_scaled_px(dialog, 110))
         valueX = bounds.right - rwp_shortcuts_scaled_px(dialog, 110);
-    for (i = 0; i < 4; ++i)
+    for (i = 0; i < (int)(sizeof(valueIds) / sizeof(valueIds[0])); ++i)
     {
         HWND label = GetDlgItem(dialog, labelIds[i]);
         HWND value = GetDlgItem(dialog, valueIds[i]);
@@ -17171,6 +17404,12 @@ static INT_PTR CALLBACK rwp_counter_dialog_proc(HWND dialog, UINT message,
         SetDlgItemTextW(dialog, IDC_COUNTER_SIZE_LABEL,
                         italian ? L"Dimensione documento:"
                                 : L"Document size:");
+        SetDlgItemTextW(dialog, IDC_COUNTER_IMAGES_LABEL,
+                        italian ? L"Immagini:" : L"Images:");
+        SetDlgItemTextW(dialog, IDC_COUNTER_TABLES_LABEL,
+                        italian ? L"Tabelle:" : L"Tables:");
+        SetDlgItemTextW(dialog, IDC_COUNTER_LINES_LABEL,
+                        italian ? L"Righe:" : L"Lines:");
         SetDlgItemTextW(dialog, IDC_COUNTER_REFRESH,
                         italian ? L"Aggiorna" : L"Refresh");
         SetDlgItemTextW(dialog, IDCANCEL, italian ? L"Chiudi" : L"Close");
@@ -17378,6 +17617,42 @@ static void rwp_save_highlight_visibility(void)
     }
 }
 
+/* Both top-right indicators are enabled on first run; unlike the document's
+ * content, their View-menu state is a per-user application preference. */
+static void rwp_load_header_visibility(void)
+{
+    HKEY key;
+    DWORD value, type, size;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(),
+                      0, KEY_READ, &key) != ERROR_SUCCESS) return;
+    size = sizeof(value);
+    if (RegQueryValueExW(key, L"HeaderDateVisible", NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value))
+        rwpHeaderDateVisible = value != 0;
+    size = sizeof(value);
+    if (RegQueryValueExW(key, L"HeaderCharactersVisible", NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value))
+        rwpHeaderCharactersVisible = value != 0;
+    RegCloseKey(key);
+}
+
+static void rwp_save_header_visibility(void)
+{
+    HKEY key;
+    DWORD date = rwpHeaderDateVisible ? 1 : 0;
+    DWORD characters = rwpHeaderCharactersVisible ? 1 : 0;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(),
+                        0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                        NULL, &key, NULL) != ERROR_SUCCESS) return;
+    RegSetValueExW(key, L"HeaderDateVisible", 0, REG_DWORD,
+                   (const BYTE *)&date, sizeof(date));
+    RegSetValueExW(key, L"HeaderCharactersVisible", 0, REG_DWORD,
+                   (const BYTE *)&characters, sizeof(characters));
+    RegCloseKey(key);
+}
+
 static LRESULT OnCreate( HWND hWnd )
 {
     HWND hToolBarWnd, hFormatBarWnd,  hReBarWnd, hFontListWnd, hSizeListWnd, hRulerWnd;
@@ -17393,6 +17668,7 @@ static LRESULT OnCreate( HWND hWnd )
                                WS_TABSTOP, 0, 0, 100, RWP_MENU_HEIGHT, hWnd,
                                (HMENU)(UINT_PTR)18000, hInstance, NULL);
     if (!rwpMenuWnd) return -1;
+    rwp_header_create_tooltip(hInstance);
     SetTimer(rwpMenuWnd, RWP_MENU_CLOCK_TIMER, 1000, NULL);
 
     hReBarWnd = CreateWindowExW(WS_EX_TOOLWINDOW, REBARCLASSNAMEW, NULL,
@@ -17575,6 +17851,9 @@ static LRESULT OnCreate( HWND hWnd )
     SendMessageW(hEditorWnd, EM_AUTOURLDETECT, FALSE, 0);
     SendMessageW(hEditorWnd, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE | ENM_LINK);
 
+    rwp_header_refresh_character_count();
+    rwp_statusbar_update_editor_position();
+
     set_default_font();
 
     rwp_startup_profile_mark("Font enumeration begin");
@@ -17592,6 +17871,7 @@ static LRESULT OnCreate( HWND hWnd )
     rwp_backup_load_preferences();
     rwp_load_highlight_visibility(hWnd);
     rwp_load_script_visibility(hWnd);
+    rwp_load_header_visibility();
     if (rwpBackupEnabled) SetTimer(hWnd, RWP_BACKUP_TIMER_ID, 1000, NULL);
     /* Unconnected documents have no cloud timer; loading a configured
      * document or enabling periodic saving will arm it on demand. */
@@ -17830,17 +18110,8 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
 
     if (pHdr->code == EN_SELCHANGE)
     {
-        SELCHANGE *pSC = (SELCHANGE *)lParam;
-        char buf[128];
-
         update_font_list();
-
-        sprintf( buf,"selection = %d..%d, line count=%ld",
-                 pSC->chrg.cpMin, pSC->chrg.cpMax,
-                SendMessageW(hwndEditor, EM_GETLINECOUNT, 0, 0));
-        if (MultiByteToWideChar(CP_ACP,0,buf,-1,
-                                rwpStatusSelectionText,128))
-            rwp_statusbar_update_selection();
+        rwp_statusbar_update_editor_position();
         SendMessageW(hWnd, WM_USER, 0, 0);
         return 1;
     }
@@ -18682,6 +18953,32 @@ static BOOL rwp_get_raw_document(WCHAR **textOut, LONG *lengthOut)
     *textOut = buffer;
     *lengthOut = (LONG)copied;
     return TRUE;
+}
+
+/* Table count is derived from RichEdit's structural row markers, not from
+ * occurrences of the word "table" or from the number of individual cells.
+ * Consecutive structural rows belong to the same table. This read-only scan
+ * has no 16,384-row limit (unlike the table-editing helper). */
+static DWORD rwp_count_document_tables(void)
+{
+    WCHAR *raw = NULL;
+    LONG length, i, start = -1, previousEnd = -1;
+    DWORD tables = 0;
+    if (!rwp_get_raw_document(&raw, &length)) return 0;
+    for (i = 0; i + 1 < length; ++i)
+    {
+        if (raw[i] == 0xFFF9 && raw[i + 1] == L'\r')
+            start = i;
+        else if (raw[i] == 0xFFFB && raw[i + 1] == L'\r' && start >= 0)
+        {
+            if (previousEnd < 0 || previousEnd + 2 != start)
+                ++tables;
+            previousEnd = i;
+            start = -1;
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, raw);
+    return tables;
 }
 
 static LONG rwp_raw_text_length(void)
@@ -24742,6 +25039,8 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
             rwpMultiRowAlignmentKnown = FALSE;
             if (!backgroundUpdatingFontColor)
                 reset_background_history();
+            rwp_header_refresh_character_count();
+            rwp_statusbar_update_editor_position();
         }
         return 0;
     }
@@ -25482,6 +25781,21 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         update_window();
         break;
 
+    case ID_TOGGLE_HEADER_DATE:
+        rwpHeaderDateVisible = !rwpHeaderDateVisible;
+        rwp_save_header_visibility();
+        update_window();
+        InvalidateRect(rwpMenuWnd, NULL, FALSE);
+        break;
+
+    case ID_TOGGLE_HEADER_CHARACTERS:
+        rwpHeaderCharactersVisible = !rwpHeaderCharactersVisible;
+        rwp_header_refresh_character_count();
+        rwp_save_header_visibility();
+        update_window();
+        InvalidateRect(rwpMenuWnd, NULL, FALSE);
+        break;
+
     case ID_TOGGLE_RULER:
         set_toolbar_state(BANDID_RULER, !is_bar_visible(BANDID_RULER));
         update_window();
@@ -25629,6 +25943,11 @@ static LRESULT OnInitPopupMenu( HWND hWnd, WPARAM wParam )
     CheckMenuItem(hMenu, ID_TOGGLE_STATUSBAR, IsWindowVisible(hwndStatus) ?
             MF_CHECKED : MF_UNCHECKED);
 
+    CheckMenuItem(hMenu, ID_TOGGLE_HEADER_DATE,
+                  rwpHeaderDateVisible ? MF_CHECKED : MF_UNCHECKED);
+    CheckMenuItem(hMenu, ID_TOGGLE_HEADER_CHARACTERS,
+                  rwpHeaderCharactersVisible ? MF_CHECKED : MF_UNCHECKED);
+
     CheckMenuItem(hMenu, ID_TOGGLE_RULER, is_bar_visible(BANDID_RULER) ? MF_CHECKED : MF_UNCHECKED);
 
     gt.flags = GTL_NUMCHARS;
@@ -25689,7 +26008,7 @@ static LRESULT OnSize( HWND hWnd, WPARAM wParam, LPARAM lParam )
     HWND hwndReBar = GetDlgItem(hWnd, IDC_REBAR);
     HWND hRulerWnd = GetDlgItem(hwndReBar, IDC_RULER);
     int rebarHeight = 0;
-    int menuHeight = (rwpMenuWnd && IsWindowVisible(rwpMenuWnd)) ? RWP_MENU_HEIGHT : 0;
+    int menuHeight = (rwpMenuWnd && IsWindowVisible(rwpMenuWnd)) ? rwp_header_height() : 0;
     int clientWidth, clientHeight, editorHeight;
 
     GetClientRect(hWnd, &rc);
@@ -25723,7 +26042,7 @@ static LRESULT OnSize( HWND hWnd, WPARAM wParam, LPARAM lParam )
         if (rebarHeight != oldHeight)
             MoveWindow(hwndReBar, 0, menuHeight, clientWidth, rebarHeight, TRUE);
     }
-    if (rwpMenuWnd) MoveWindow(rwpMenuWnd, 0, 0, clientWidth, RWP_MENU_HEIGHT, TRUE);
+    if (rwpMenuWnd) MoveWindow(rwpMenuWnd, 0, 0, clientWidth, rwp_header_height(), TRUE);
     if (hwndEditor)
     {
         editorHeight = clientHeight - nStatusSize - menuHeight - rebarHeight;
@@ -26082,6 +26401,34 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
         }
     }
 
+    /* Date and live character count have independent View-menu toggles.
+     * Locate View by command ID to work with every existing language file. */
+    {
+        const BOOL italian =
+            PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+        int i, j;
+        for (i = 0; i < GetMenuItemCount(rwpMainMenu); ++i)
+        {
+            HMENU view = GetSubMenu(rwpMainMenu, i);
+            if (!view || GetMenuState(view, ID_TOGGLE_STATUSBAR,
+                                      MF_BYCOMMAND) == (UINT)-1) continue;
+            for (j = 0; j < GetMenuItemCount(view); ++j)
+                if (GetMenuItemID(view, j) == ID_TOGGLE_STATUSBAR)
+                {
+                    InsertMenuW(view, j + 1, MF_BYPOSITION | MF_STRING,
+                                ID_TOGGLE_HEADER_DATE,
+                                italian ? L"Data e ora nell'intestazione" :
+                                          L"Header date and time");
+                    InsertMenuW(view, j + 2, MF_BYPOSITION | MF_STRING,
+                                ID_TOGGLE_HEADER_CHARACTERS,
+                                italian ? L"Contatore caratteri nell'intestazione" :
+                                          L"Header character count");
+                    break;
+                }
+            break;
+        }
+    }
+
     /* Insert after Paste in whichever translated submenu owns Edit. */
     {
         int i;
@@ -26392,6 +26739,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     SendMessageW(hRulerWnd, WM_USER, (WPARAM)&EditPoint, hPrevRulerProc);
 
     HandleCommandLine(GetCommandLineW());
+    rwp_header_refresh_character_count();
+    rwp_statusbar_update_editor_position();
     rwp_startup_profile_mark("Command-line document loaded; ready");
     rwp_startup_profile_write();
 

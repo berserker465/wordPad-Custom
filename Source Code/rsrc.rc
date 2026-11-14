@@ -220,10 +220,9 @@ BEGIN
     DEFPUSHBUTTON "Close", IDCANCEL, 201, 155, 51, 18
 END
 
-/* Document statistics window; Italian labels are set at runtime. */
-/* Compact width (158 vs 238 units in V3), with the same label/value gap.
- * Runtime rwp_align_counter_values() places each value after the labels. */
-IDD_DOCUMENT_COUNTER DIALOGEX 0, 0, 158, 92
+/* Document statistics window; Italian labels are set at runtime.
+ * All seven values are aligned with their localized labels at runtime. */
+IDD_DOCUMENT_COUNTER DIALOGEX 0, 0, 158, 140
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Document counter"
 FONT RWP_UI_FONT_PT, RWP_UI_FONT_FAMILY
@@ -236,8 +235,14 @@ BEGIN
     LTEXT "0", IDC_COUNTER_WORDS_VALUE, 102, 44, 44, 14
     LTEXT "Document size:", IDC_COUNTER_SIZE_LABEL, 10, 60, 128, 14
     LTEXT "0 KB", IDC_COUNTER_SIZE_VALUE, 102, 60, 44, 14
-    PUSHBUTTON "Refresh", IDC_COUNTER_REFRESH, 44, 74, 48, 16
-    DEFPUSHBUTTON "Close", IDCANCEL, 98, 74, 48, 16
+    LTEXT "Images:", IDC_COUNTER_IMAGES_LABEL, 10, 76, 128, 14
+    LTEXT "0", IDC_COUNTER_IMAGES_VALUE, 102, 76, 44, 14
+    LTEXT "Tables:", IDC_COUNTER_TABLES_LABEL, 10, 92, 128, 14
+    LTEXT "0", IDC_COUNTER_TABLES_VALUE, 102, 92, 44, 14
+    LTEXT "Lines:", IDC_COUNTER_LINES_LABEL, 10, 108, 128, 14
+    LTEXT "0", IDC_COUNTER_LINES_VALUE, 102, 108, 44, 14
+    PUSHBUTTON "Refresh", IDC_COUNTER_REFRESH, 44, 122, 48, 16
+    DEFPUSHBUTTON "Close", IDCANCEL, 98, 122, 48, 16
 END
 
 /* Shared insert-table dialog; Italian labels are set at runtime. */
