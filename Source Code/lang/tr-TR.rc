@@ -104,6 +104,7 @@ BEGIN
             MENUITEM "Dark blue", ID_BG_COLOR_DARK_BLUE
             MENUITEM "Kırmızı", ID_BG_COLOR_RED
             MENUITEM "Orange", ID_BG_COLOR_ORANGE
+            MENUITEM "Pink", ID_BG_COLOR_PINK
             MENUITEM "Gri", ID_BG_COLOR_GRAY
             MENUITEM SEPARATOR
             MENUITEM "Vişne Çürüğü", ID_BG_COLOR_MAROON
@@ -150,6 +151,7 @@ BEGIN
         MENUITEM "Dark blue", ID_COLOR_DARK_BLUE
         MENUITEM "Kırmızı", ID_COLOR_RED
         MENUITEM "Orange", ID_COLOR_ORANGE
+        MENUITEM "Pink", ID_COLOR_PINK
         MENUITEM "Gri", ID_COLOR_GRAY
         MENUITEM SEPARATOR
         MENUITEM "Vişne Çürüğü", ID_COLOR_MAROON

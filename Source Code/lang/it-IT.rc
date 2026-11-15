@@ -103,6 +103,7 @@ BEGIN
             MENUITEM "Blu Scuro", ID_BG_COLOR_DARK_BLUE
             MENUITEM "Rosso", ID_BG_COLOR_RED
             MENUITEM "Arancione", ID_BG_COLOR_ORANGE
+            MENUITEM "Rosa", ID_BG_COLOR_PINK
             MENUITEM "Grigio", ID_BG_COLOR_GRAY
             MENUITEM SEPARATOR
             MENUITEM "Marrone rossiccio", ID_BG_COLOR_MAROON
@@ -149,6 +150,7 @@ BEGIN
         MENUITEM "Blu Scuro", ID_COLOR_DARK_BLUE
         MENUITEM "Rosso", ID_COLOR_RED
         MENUITEM "Arancione", ID_COLOR_ORANGE
+        MENUITEM "Rosa", ID_COLOR_PINK
         MENUITEM "Grigio", ID_COLOR_GRAY
         MENUITEM SEPARATOR
         MENUITEM "Marrone rossiccio", ID_COLOR_MAROON

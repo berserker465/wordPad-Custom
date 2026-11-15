@@ -105,6 +105,7 @@ BEGIN
             MENUITEM "Dark blue", ID_BG_COLOR_DARK_BLUE
             MENUITEM "Червоний", ID_BG_COLOR_RED
             MENUITEM "Orange", ID_BG_COLOR_ORANGE
+            MENUITEM "Pink", ID_BG_COLOR_PINK
             MENUITEM "Сірий", ID_BG_COLOR_GRAY
             MENUITEM SEPARATOR
             MENUITEM "Коричневий", ID_BG_COLOR_MAROON
@@ -151,6 +152,7 @@ BEGIN
         MENUITEM "Dark blue", ID_COLOR_DARK_BLUE
         MENUITEM "Червоний", ID_COLOR_RED
         MENUITEM "Orange", ID_COLOR_ORANGE
+        MENUITEM "Pink", ID_COLOR_PINK
         MENUITEM "Сірий", ID_COLOR_GRAY
         MENUITEM SEPARATOR
         MENUITEM "Коричневий", ID_COLOR_MAROON

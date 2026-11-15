@@ -102,6 +102,7 @@ BEGIN
             MENUITEM "Dark blue", ID_BG_COLOR_DARK_BLUE
             MENUITEM "Rood", ID_BG_COLOR_RED
             MENUITEM "Orange", ID_BG_COLOR_ORANGE
+            MENUITEM "Pink", ID_BG_COLOR_PINK
             MENUITEM "Grijs", ID_BG_COLOR_GRAY
             MENUITEM SEPARATOR
             MENUITEM "Kastanjebruin", ID_BG_COLOR_MAROON
@@ -148,6 +149,7 @@ BEGIN
         MENUITEM "Dark blue", ID_COLOR_DARK_BLUE
         MENUITEM "Rood", ID_COLOR_RED
         MENUITEM "Orange", ID_COLOR_ORANGE
+        MENUITEM "Pink", ID_COLOR_PINK
         MENUITEM "Grijs", ID_COLOR_GRAY
         MENUITEM SEPARATOR
         MENUITEM "Kastanjebruin", ID_COLOR_MAROON

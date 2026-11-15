@@ -105,6 +105,7 @@ BEGIN
             MENUITEM "Dark blue", ID_BG_COLOR_DARK_BLUE
             MENUITEM "紅色", ID_BG_COLOR_RED
             MENUITEM "Orange", ID_BG_COLOR_ORANGE
+            MENUITEM "Pink", ID_BG_COLOR_PINK
             MENUITEM "灰色", ID_BG_COLOR_GRAY
             MENUITEM SEPARATOR
             MENUITEM "褐色", ID_BG_COLOR_MAROON
@@ -151,6 +152,7 @@ BEGIN
         MENUITEM "Dark blue", ID_COLOR_DARK_BLUE
         MENUITEM "紅色", ID_COLOR_RED
         MENUITEM "Orange", ID_COLOR_ORANGE
+        MENUITEM "Pink", ID_COLOR_PINK
         MENUITEM "灰色", ID_COLOR_GRAY
         MENUITEM SEPARATOR
         MENUITEM "褐色", ID_COLOR_MAROON
