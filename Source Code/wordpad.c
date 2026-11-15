@@ -10864,7 +10864,8 @@ static const COLORREF textcolors[]=
     0x00c0c0c0L,0x000000ffL,0x0000ff00L,0x0000ffffL,
     0x00ff0000L,0x00ff00ffL,0x00ffff00L,0x00FFFFFFL,
     /* Index 16 is reserved for Automatic; never read as an RGB color. */
-    0x00000000L, RGB(74,134,232), RGB(17,85,204), RGB(255,153,0)
+    0x00000000L, RGB(74,134,232), RGB(17,85,204), RGB(255,153,0),
+    RGB(255,197,216) /* Pink */
 };
 
 /* Bulk Format Tool: locate matches before making any changes.  Formatting
@@ -19044,6 +19045,38 @@ static BOOL rwp_color_order_valid(const RWP_COLOR_ORDER *order)
     return colors == RWP_COLOR_SWATCH_COUNT;
 }
 
+/* Older custom palette orders predate Pink. Insert it after Orange so a
+ * saved arrangement (including separators) is preserved across the upgrade. */
+static BOOL rwp_upgrade_legacy_color_order(RWP_COLOR_ORDER *order)
+{
+    BOOL seen[RWP_COLOR_SWATCH_COUNT] = {FALSE};
+    UINT row, colors = 0, insertAt = order->count;
+
+    if (order->count < RWP_COLOR_SWATCH_COUNT - 1 ||
+        order->count >= RWP_COLOR_ORDER_CAPACITY)
+        return FALSE;
+    for (row = 0; row < order->count; ++row)
+    {
+        DWORD command = order->entries[row];
+        if (!command) continue;
+        if (command < ID_COLOR_FIRST || command > ID_COLOR_ORANGE ||
+            seen[command - ID_COLOR_FIRST])
+            return FALSE;
+        seen[command - ID_COLOR_FIRST] = TRUE;
+        ++colors;
+        if (command == ID_COLOR_ORANGE) insertAt = row + 1;
+    }
+    if (colors != RWP_COLOR_SWATCH_COUNT - 1 || insertAt > order->count ||
+        !seen[ID_COLOR_ORANGE - ID_COLOR_FIRST])
+        return FALSE;
+
+    memmove(order->entries + insertAt + 1, order->entries + insertAt,
+            (order->count - insertAt) * sizeof(order->entries[0]));
+    order->entries[insertAt] = ID_COLOR_PINK;
+    ++order->count;
+    return TRUE;
+}
+
 static BOOL rwp_color_orders_equal(const RWP_COLOR_ORDER *first,
                                    const RWP_COLOR_ORDER *second)
 {
@@ -19112,7 +19145,9 @@ static void rwp_load_color_order(void)
         size % sizeof(saved.entries[0]) != 0)
         return;
     saved.count = size / sizeof(saved.entries[0]);
-    if (!rwp_color_order_valid(&saved)) return;
+    if (!rwp_color_order_valid(&saved) &&
+        (!rwp_upgrade_legacy_color_order(&saved) || !rwp_color_order_valid(&saved)))
+        return;
     ordered = rwp_create_ordered_color_menu(&saved);
     if (!ordered) return;
     DestroyMenu(hColorPopupMenu);
