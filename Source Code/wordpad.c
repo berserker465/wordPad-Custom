@@ -147,6 +147,11 @@ static void rwp_startup_profile_write(void)
 #define CB_SETMINVISIBLE 0x1701
 #endif
 
+/* RosBE 2.2.1 headers omit MapVirtualKey's extended scan-code mode. */
+#ifndef MAPVK_VK_TO_VSC_EX
+#define MAPVK_VK_TO_VSC_EX 4
+#endif
+
 /* A tall font list with the same readable text as the toolbar selector. */
 #define RWP_FONT_LIST_VISIBLE_ROWS 18
 
@@ -335,9 +340,39 @@ static HWND hMainWnd;
 static HWND hEditorWnd;
 static HWND hFindWnd;
 static HWND rwpShortcutsWnd;
+static HWND rwpViewOptionsWnd;
+static HWND rwpShortcutSettingsWnd;
+static BOOL rwpShortcutStatusInUse;
+static HWND rwpColorOrderWnd;
 static HWND rwpCounterWnd;
 static BOOL rwpOleInitialized;
 static HMENU hColorPopupMenu;
+
+/* The fixed accelerators stay in MAINACCELTABLE. These slots are optional
+ * assignments scoped to the document editor. */
+enum
+{
+    RWP_MOUSE_BUTTON_4,
+    RWP_MOUSE_BUTTON_5,
+    RWP_MOUSE_WHEEL_CLICK,
+    RWP_MOUSE_SHORTCUT_COUNT
+};
+enum
+{
+    RWP_SHORTCUT_SHIFT = 1,
+    RWP_SHORTCUT_CONTROL = 2,
+    RWP_SHORTCUT_ALT = 4,
+    RWP_SHORTCUT_MODIFIER_COUNT = 8,
+    RWP_SHORTCUT_KEY_COUNT = 256
+};
+typedef struct
+{
+    DWORD mouse[RWP_MOUSE_SHORTCUT_COUNT];
+    DWORD keys[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT];
+} RWP_SHORTCUT_ASSIGNMENTS;
+static RWP_SHORTCUT_ASSIGNMENTS rwpShortcutCommands;
+static void rwp_execute_editor_shortcut(HWND editor, UINT command,
+                                        const POINTL *point);
 /* Per-document history. Opening a palette alone never assigns a color.
  * Only a successful formatting command updates the last applied value. */
 static BOOL rwpLastTextColorValid = FALSE;
@@ -1322,11 +1357,10 @@ static void rwp_open_top_menu(int index)
     if (hEditorWnd) SetFocus(hEditorWnd);
 }
 
-static BOOL rwp_open_menu_mnemonic(WCHAR key)
+static int rwp_find_menu_mnemonic(WCHAR key)
 {
-    int i, j;
-    if (!rwpMenuWnd || !IsWindowVisible(rwpMenuWnd)) return FALSE;
-    for (i = 0; i < rwpMenuCount; ++i)
+    int i, j, count = rwpMainMenu ? GetMenuItemCount(rwpMainMenu) : 0;
+    for (i = 0; i < count && i < RWP_MENU_MAX; ++i)
     {
         WCHAR label[128];
         rwp_menu_label(i, label, 128, FALSE);
@@ -1336,11 +1370,21 @@ static BOOL rwp_open_menu_mnemonic(WCHAR key)
                 WCHAR found = label[j+1], requested = key;
                 if (found >= L'a' && found <= L'z') found -= 32;
                 if (requested >= L'a' && requested <= L'z') requested -= 32;
-                if (found == requested) { rwp_open_top_menu(i); return TRUE; }
+                if (found == requested) return i;
                 break;
             }
     }
-    return FALSE;
+    return -1;
+}
+
+static BOOL rwp_open_menu_mnemonic(WCHAR key)
+{
+    int menu;
+    if (!rwpMenuWnd || !IsWindowVisible(rwpMenuWnd)) return FALSE;
+    menu = rwp_find_menu_mnemonic(key);
+    if (menu < 0) return FALSE;
+    rwp_open_top_menu(menu);
+    return TRUE;
 }
 
 static LRESULT CALLBACK rwp_menu_proc(HWND window, UINT message, WPARAM wp, LPARAM lp)
@@ -2054,9 +2098,14 @@ static LRESULT CALLBACK rwp_dialog_window_subclass(HWND window, UINT message,
         BOOL field = message == WM_CTLCOLOREDIT ||
                      message == WM_CTLCOLORLISTBOX;
         HDC dc = (HDC)wParam;
+        COLORREF text = IsWindowEnabled((HWND)lParam) ?
+                        RWP_BAR_TEXT : RGB(145, 151, 160);
+        if (message == WM_CTLCOLORSTATIC && rwpShortcutStatusInUse &&
+            window == rwpShortcutSettingsWnd &&
+            GetDlgCtrlID((HWND)lParam) == IDC_SHORTCUT_KEY_STATUS)
+            text = RGB(255, 108, 108);
         SetBkColor(dc, field ? RGB(32, 35, 40) : RWP_BAR_BG);
-        SetTextColor(dc, IsWindowEnabled((HWND)lParam) ?
-                         RWP_BAR_TEXT : RGB(145, 151, 160));
+        SetTextColor(dc, text);
         return (LRESULT)(field && rwpDialogFieldBrush ?
                          rwpDialogFieldBrush : rwpBarBrush);
     }
@@ -2697,6 +2746,33 @@ static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
 
     if (message == WM_CONTEXTMENU)
         return rwp_show_editor_context_menu(window, lParam);
+
+    /* Consume a mapped mouse button's down and up messages so Rich Edit
+     * does not also start wheel-button scrolling or send a browser command.
+     * A double-click's second press is delivered as a DBLCLK message. */
+    if ((message >= WM_MBUTTONDOWN && message <= WM_MBUTTONDBLCLK) ||
+        (message >= WM_XBUTTONDOWN && message <= WM_XBUTTONDBLCLK))
+    {
+        BOOL extended = message >= WM_XBUTTONDOWN;
+        UINT slot = RWP_MOUSE_WHEEL_CLICK;
+        if (extended)
+        {
+            UINT button = HIWORD(wParam);
+            slot = button == XBUTTON1 ? RWP_MOUSE_BUTTON_4 :
+                   button == XBUTTON2 ? RWP_MOUSE_BUTTON_5 :
+                                        RWP_MOUSE_SHORTCUT_COUNT;
+        }
+        if (slot < RWP_MOUSE_SHORTCUT_COUNT && rwpShortcutCommands.mouse[slot])
+        {
+            if (message != WM_MBUTTONUP && message != WM_XBUTTONUP)
+            {
+                POINTL point = {(SHORT)LOWORD(lParam), (SHORT)HIWORD(lParam)};
+                rwp_execute_editor_shortcut(window, rwpShortcutCommands.mouse[slot],
+                                            &point);
+            }
+            return extended;
+        }
+    }
 
     /* Route Ctrl+C through WM_COPY so a native multi-cell selection can
      * receive our structured grid format AFTER Rich Edit has populated its
@@ -3355,16 +3431,14 @@ void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp)
 
 /* Copy only the decoded external destination, not its RTF-quoted form.
  * A separate TOM range preserves the current selection and caret. */
-static void rwp_copy_context_hyperlink(void)
+static void rwp_copy_hyperlink_at(LONG cp)
 {
-    LONG cp = rwpLinkContextCp;
     RWP_TEXT_RANGE2 *range;
     WCHAR url[RWP_LINK_MAX_URL + 1];
     HGLOBAL textMemory = NULL;
     WCHAR *text;
     SIZE_T length, bytes;
 
-    rwpLinkContextCp = -1;
     if (cp < 0 || !hEditorWnd) return;
     range = rwp_hyperlink_range_at(cp);
     if (!range) return;
@@ -3391,6 +3465,33 @@ static void rwp_copy_context_hyperlink(void)
 done:
     if (textMemory) GlobalFree(textMemory);
     ((IUnknown *)range)->lpVtbl->Release((IUnknown *)range);
+}
+
+static void rwp_execute_editor_shortcut(HWND editor, UINT command,
+                                        const POINTL *point)
+{
+    if (command == ID_COPY_LINK)
+    {
+        LONG cp;
+        if (point)
+            cp = (LONG)SendMessageW(editor, EM_CHARFROMPOS, 0, (LPARAM)point);
+        else
+        {
+            CHARRANGE selection = {0, 0};
+            SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&selection);
+            cp = selection.cpMin;
+        }
+        rwp_copy_hyperlink_at(cp);
+        return;
+    }
+
+    if (command != ID_EDIT_COPY && command != ID_EDIT_SELECTALL &&
+        (SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+        return;
+    if (GetFocus() != editor) SetFocus(editor);
+    /* Accelerator semantics also make Reapply Color a no-op until a color
+     * has been applied in this document, just like Alt+Q. */
+    SendMessageW(hMainWnd, WM_COMMAND, MAKEWPARAM(command, 1), 0);
 }
 
 /* SetURL(NULL) unlinks the full friendly-name hyperlink even if the range
@@ -9424,6 +9525,43 @@ static LPCWSTR rwp_backup_registry_key(void)
     return L"Software\\Microsoft\\Windows\\CurrentVersion\\Applets\\Wordpad\\Options";
 }
 
+/* Store each configurable preference as one registry value so readers
+ * always see a complete assignment table or palette order. */
+static BOOL rwp_read_binary_option(LPCWSTR name, void *data, DWORD *size)
+{
+    HKEY key;
+    DWORD type;
+    LONG result;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(), 0,
+                      KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return FALSE;
+    result = RegQueryValueExW(key, name, NULL, &type, (BYTE *)data, size);
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS && type == REG_BINARY;
+}
+
+static BOOL rwp_write_binary_option(LPCWSTR name, const void *data, DWORD size)
+{
+    HKEY key;
+    LONG result;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(), 0,
+                       NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                       NULL, &key, NULL) != ERROR_SUCCESS)
+        return FALSE;
+    result = RegSetValueExW(key, name, 0, REG_BINARY, (const BYTE *)data, size);
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS;
+}
+
+static void rwp_report_settings_save_error(HWND dialog)
+{
+    BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    MessageBoxW(dialog,
+        italian ? L"Impossibile salvare le impostazioni." :
+                  L"Could not save the settings.",
+        wszAppTitle, MB_OK | MB_ICONERROR);
+}
+
 static void rwp_backup_load_preferences(void)
 {
     HKEY key;
@@ -10416,150 +10554,253 @@ static void dialog_about(void)
     ShellAboutW(hMainWnd, wszAppTitle, NULL, icon);
 }
 
-static INT_PTR CALLBACK formatopts_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+typedef struct
 {
-    switch(message)
+    int format;
+    DWORD originalWrap;
+    DWORD originalBars;
+} RWP_VIEW_OPTIONS_PAGE;
+
+static RWP_VIEW_OPTIONS_PAGE rwpViewOptionsPages[2];
+static BOOL rwpViewOptionsChanged;
+static const struct { int control; DWORD mask; } rwpViewOptionsBars[] =
+{
+    {IDC_PAGEFMT_TB, 1 << BANDID_TOOLBAR},
+    {IDC_PAGEFMT_FB, 1 << BANDID_FORMATBAR},
+    {IDC_PAGEFMT_RU, 1 << BANDID_RULER},
+    {IDC_PAGEFMT_SB, 1 << BANDID_STATUSBAR}
+};
+static const DWORD rwpViewOptionsWrap[] =
+{
+    ID_WORDWRAP_NONE, ID_WORDWRAP_WINDOW, ID_WORDWRAP_MARGIN
+};
+
+/* Keep the localized Text and Rich Text pages. Since the owner remains
+ * usable, apply only controls edited in the sheet and leave simultaneous
+ * changes from the main View menu in place. */
+static INT_PTR CALLBACK formatopts_proc(HWND page, UINT message,
+                                        WPARAM wParam, LPARAM lParam)
+{
+    RWP_VIEW_OPTIONS_PAGE *state =
+        (RWP_VIEW_OPTIONS_PAGE *)GetWindowLongPtrW(page, DWLP_USER);
+    size_t i;
+    int command = LOWORD(wParam);
+
+    switch (message)
     {
-        case WM_INITDIALOG:
-            rwp_theme_dialog(hWnd);
-            rwp_theme_dialog(GetParent(hWnd)); /* Property sheet frame */
+    case WM_INITDIALOG:
+        state = (RWP_VIEW_OPTIONS_PAGE *)((LPPROPSHEETPAGEW)lParam)->lParam;
+        SetWindowLongPtrW(page, DWLP_USER, (LONG_PTR)state);
+        state->originalWrap = wordWrap[state->format];
+        state->originalBars = barState[state->format];
+        rwp_theme_dialog(page);
+        for (i = 0; i < sizeof(rwpViewOptionsWrap) / sizeof(rwpViewOptionsWrap[0]); ++i)
+            if (state->originalWrap == rwpViewOptionsWrap[i])
+                CheckRadioButton(page, IDC_PAGEFMT_WN, IDC_PAGEFMT_WM,
+                                 IDC_PAGEFMT_WN + (int)i);
+        for (i = 0; i < sizeof(rwpViewOptionsBars) / sizeof(rwpViewOptionsBars[0]); ++i)
+            CheckDlgButton(page, rwpViewOptionsBars[i].control,
+                (state->originalBars & rwpViewOptionsBars[i].mask) ?
+                BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+
+    case WM_COMMAND:
+        if (HIWORD(wParam) != BN_CLICKED) break;
+        if (command >= IDC_PAGEFMT_WN && command <= IDC_PAGEFMT_WM)
+        {
+            CheckRadioButton(page, IDC_PAGEFMT_WN, IDC_PAGEFMT_WM, command);
+            return TRUE;
+        }
+        for (i = 0; i < sizeof(rwpViewOptionsBars) / sizeof(rwpViewOptionsBars[0]); ++i)
+            if (command == rwpViewOptionsBars[i].control)
             {
-                LPPROPSHEETPAGEW ps = (LPPROPSHEETPAGEW)lParam;
-                int wrap = -1;
-                char id[4];
-                HWND hIdWnd = GetDlgItem(hWnd, IDC_PAGEFMT_ID);
-
-                sprintf(id, "%d\n", (int)ps->lParam);
-                SetWindowTextA(hIdWnd, id);
-                if(wordWrap[ps->lParam] == ID_WORDWRAP_NONE)
-                    wrap = IDC_PAGEFMT_WN;
-                else if(wordWrap[ps->lParam] == ID_WORDWRAP_WINDOW)
-                    wrap = IDC_PAGEFMT_WW;
-                else if(wordWrap[ps->lParam] == ID_WORDWRAP_MARGIN)
-                    wrap = IDC_PAGEFMT_WM;
-
-                if(wrap != -1)
-                    CheckRadioButton(hWnd, IDC_PAGEFMT_WN,
-                                     IDC_PAGEFMT_WM, wrap);
-
-                if(barState[ps->lParam] & (1 << BANDID_TOOLBAR))
-                    CheckDlgButton(hWnd, IDC_PAGEFMT_TB, TRUE);
-                if(barState[ps->lParam] & (1 << BANDID_FORMATBAR))
-                    CheckDlgButton(hWnd, IDC_PAGEFMT_FB, TRUE);
-                if(barState[ps->lParam] & (1 << BANDID_RULER))
-                    CheckDlgButton(hWnd, IDC_PAGEFMT_RU, TRUE);
-                if(barState[ps->lParam] & (1 << BANDID_STATUSBAR))
-                    CheckDlgButton(hWnd, IDC_PAGEFMT_SB, TRUE);
+                CheckDlgButton(page, command,
+                    IsDlgButtonChecked(page, command) == BST_CHECKED ?
+                    BST_UNCHECKED : BST_CHECKED);
+                return TRUE;
             }
-            break;
+        break;
 
-        case WM_COMMAND:
-            switch(LOWORD(wParam))
+    case WM_NOTIFY:
+        if (!state || ((NMHDR *)lParam)->code != PSN_APPLY) break;
+        for (i = 0; i < sizeof(rwpViewOptionsWrap) / sizeof(rwpViewOptionsWrap[0]); ++i)
+            if (rwpViewOptionsWrap[i] != state->originalWrap &&
+                IsDlgButtonChecked(page, IDC_PAGEFMT_WN + (int)i) == BST_CHECKED)
             {
-                case IDC_PAGEFMT_WN:
-                case IDC_PAGEFMT_WW:
-                case IDC_PAGEFMT_WM:
-                    CheckRadioButton(hWnd, IDC_PAGEFMT_WN, IDC_PAGEFMT_WM,
-                                     LOWORD(wParam));
-                    break;
-
-                case IDC_PAGEFMT_TB:
-                case IDC_PAGEFMT_FB:
-                case IDC_PAGEFMT_RU:
-                case IDC_PAGEFMT_SB:
-                    CheckDlgButton(hWnd, LOWORD(wParam),
-                                   !IsDlgButtonChecked(hWnd, LOWORD(wParam)));
-                    break;
+                wordWrap[state->format] = rwpViewOptionsWrap[i];
+                rwpViewOptionsChanged = TRUE;
+                break;
             }
-            break;
-        case WM_NOTIFY:
-            {
-                LPNMHDR header = (LPNMHDR)lParam;
-                if(header->code == PSN_APPLY)
-                {
-                    HWND hIdWnd = GetDlgItem(hWnd, IDC_PAGEFMT_ID);
-                    char sid[4];
-                    int id;
-
-                    GetWindowTextA(hIdWnd, sid, 4);
-                    id = atoi(sid);
-                    if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_WN))
-                        wordWrap[id] = ID_WORDWRAP_NONE;
-                    else if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_WW))
-                        wordWrap[id] = ID_WORDWRAP_WINDOW;
-                    else if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_WM))
-                        wordWrap[id] = ID_WORDWRAP_MARGIN;
-
-                    if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_TB))
-                        barState[id] |= (1 << BANDID_TOOLBAR);
-                    else
-                        barState[id] &= ~(1 << BANDID_TOOLBAR);
-
-                    if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_FB))
-                        barState[id] |= (1 << BANDID_FORMATBAR);
-                    else
-                        barState[id] &= ~(1 << BANDID_FORMATBAR);
-
-                    if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_RU))
-                        barState[id] |= (1 << BANDID_RULER);
-                    else
-                        barState[id] &= ~(1 << BANDID_RULER);
-
-                    if(IsDlgButtonChecked(hWnd, IDC_PAGEFMT_SB))
-                        barState[id] |= (1 << BANDID_STATUSBAR);
-                    else
-                        barState[id] &= ~(1 << BANDID_STATUSBAR);
-                }
-            }
-            break;
+        for (i = 0; i < sizeof(rwpViewOptionsBars) / sizeof(rwpViewOptionsBars[0]); ++i)
+        {
+            DWORD mask = rwpViewOptionsBars[i].mask;
+            BOOL checked =
+                IsDlgButtonChecked(page, rwpViewOptionsBars[i].control) == BST_CHECKED;
+            if (checked == ((state->originalBars & mask) != 0)) continue;
+            if (checked) barState[state->format] |= mask;
+            else barState[state->format] &= ~mask;
+            rwpViewOptionsChanged = TRUE;
+        }
+        SetWindowLongPtrW(page, DWLP_MSGRESULT, PSNRET_NOERROR);
+        return TRUE;
     }
     return FALSE;
 }
 
+/* Paint the whole native tab surface so the strip and the page frame match
+ * the rest of the dark dialog. Keep native tab focus and keyboard handling. */
+static void rwp_paint_options_tabs(HWND tabs, HDC dc)
+{
+    RECT area, frame, rect;
+    HFONT font = (HFONT)SendMessageW(tabs, WM_GETFONT, 0, 0);
+    int i, count = TabCtrl_GetItemCount(tabs);
+    int selected = TabCtrl_GetCurSel(tabs);
+    int saved = SaveDC(dc);
+
+    GetClientRect(tabs, &area);
+    FillRect(dc, &area, rwpBarBrush);
+    frame = area;
+    TabCtrl_AdjustRect(tabs, FALSE, &frame);
+    InflateRect(&frame, 2, 2);
+    if (rwpDialogEdgeBrush) FrameRect(dc, &frame, rwpDialogEdgeBrush);
+    if (font) SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RWP_BAR_TEXT);
+    for (i = 0; i < count; ++i)
+    {
+        WCHAR title[128] = {0};
+        TCITEMW item;
+        if (!TabCtrl_GetItemRect(tabs, i, &rect)) continue;
+        ZeroMemory(&item, sizeof(item));
+        item.mask = TCIF_TEXT;
+        item.pszText = title;
+        item.cchTextMax = sizeof(title) / sizeof(title[0]);
+        SendMessageW(tabs, TCM_GETITEMW, i, (LPARAM)&item);
+        FillRect(dc, &rect, i == selected ? rwpBarActiveBrush : rwpBarBrush);
+        if (rwpDialogEdgeBrush) FrameRect(dc, &rect, rwpDialogEdgeBrush);
+        InflateRect(&rect, -3, -2);
+        DrawTextW(dc, title, -1, &rect,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (GetFocus() == tabs && i == TabCtrl_GetCurFocus(tabs))
+            DrawFocusRect(dc, &rect);
+    }
+    RestoreDC(dc, saved);
+}
+
+static LRESULT CALLBACK rwp_options_tabs_proc(HWND tabs, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR data)
+{
+    (void)id; (void)data;
+    switch (message)
+    {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(tabs, &paint);
+        rwp_paint_options_tabs(tabs, dc);
+        EndPaint(tabs, &paint);
+        return 0;
+    }
+    case WM_PRINTCLIENT:
+        rwp_paint_options_tabs(tabs, (HDC)wParam);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case TCM_SETCURSEL:
+    case TCM_SETCURFOCUS:
+    case WM_LBUTTONDOWN:
+    case WM_KEYDOWN:
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+    {
+        LRESULT result = DefSubclassProc(tabs, message, wParam, lParam);
+        InvalidateRect(tabs, NULL, FALSE);
+        return result;
+    }
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(tabs, rwp_options_tabs_proc, 1);
+        break;
+    }
+    return DefSubclassProc(tabs, message, wParam, lParam);
+}
+
+static int CALLBACK rwp_options_sheet_callback(HWND dialog, UINT message, LPARAM data)
+{
+    (void)data;
+    if (message == PSCB_INITIALIZED)
+    {
+        HWND tabs = PropSheet_GetTabControl(dialog);
+        rwp_theme_dialog(dialog);
+        if (tabs && rwpBarBrush)
+        {
+            rwp_disable_native_theme(tabs);
+            SetWindowSubclass(tabs, rwp_options_tabs_proc, 1, 0);
+            InvalidateRect(tabs, NULL, FALSE);
+        }
+    }
+    return 0;
+}
+
 static void dialog_viewproperties(void)
 {
-    PROPSHEETPAGEW psp[2];
-    PROPSHEETHEADERW psh;
+    PROPSHEETPAGEW pages[2];
+    PROPSHEETHEADERW sheet;
+    INT_PTR result;
     size_t i;
-    HINSTANCE hInstance = GetModuleHandleW(0);
-    LPCPROPSHEETPAGEW ppsp = (LPCPROPSHEETPAGEW)&psp;
+    HINSTANCE instance = GetModuleHandleW(NULL);
 
-    psp[0].dwSize = sizeof(PROPSHEETPAGEW);
-    psp[0].dwFlags = PSP_USETITLE;
-    U(psp[0]).pszTemplate = MAKEINTRESOURCEW(IDD_FORMATOPTS);
-    psp[0].pfnDlgProc = formatopts_proc;
-    psp[0].hInstance = hInstance;
-    psp[0].lParam = reg_formatindex(SF_TEXT);
-    psp[0].pfnCallback = NULL;
-    psp[0].pszTitle = MAKEINTRESOURCEW(STRING_VIEWPROPS_TEXT);
-    for(i = 1; i < sizeof(psp)/sizeof(psp[0]); i++)
+    if (rwpViewOptionsWnd && IsWindow(rwpViewOptionsWnd))
     {
-        psp[i].dwSize = psp[0].dwSize;
-        psp[i].dwFlags = psp[0].dwFlags;
-        U(psp[i]).pszTemplate = U(psp[0]).pszTemplate;
-        psp[i].pfnDlgProc = psp[0].pfnDlgProc;
-        psp[i].hInstance = psp[0].hInstance;
-        psp[i].lParam = reg_formatindex(SF_RTF);
-        psp[i].pfnCallback = psp[0].pfnCallback;
-        psp[i].pszTitle = MAKEINTRESOURCEW(STRING_VIEWPROPS_RICHTEXT);
+        ShowWindow(rwpViewOptionsWnd, SW_RESTORE);
+        SetForegroundWindow(rwpViewOptionsWnd);
+        return;
     }
 
-    psh.dwSize = sizeof(psh);
-    psh.dwFlags = PSH_USEICONID | PSH_PROPSHEETPAGE | PSH_NOAPPLYNOW;
-    psh.hwndParent = hMainWnd;
-    psh.hInstance = hInstance;
-    psh.pszCaption = MAKEINTRESOURCEW(STRING_VIEWPROPS_TITLE);
-    psh.nPages = sizeof(psp)/sizeof(psp[0]);
-    U3(psh).ppsp = ppsp;
-    U(psh).pszIcon = MAKEINTRESOURCEW(IDI_WORDPAD);
+    rwpViewOptionsChanged = FALSE;
+    ZeroMemory(pages, sizeof(pages));
+    for (i = 0; i < sizeof(pages) / sizeof(pages[0]); ++i)
+    {
+        rwpViewOptionsPages[i].format = reg_formatindex(i == 0 ? SF_TEXT : SF_RTF);
+        pages[i].dwSize = sizeof(pages[i]);
+        pages[i].dwFlags = PSP_USETITLE;
+        U(pages[i]).pszTemplate = MAKEINTRESOURCEW(IDD_FORMATOPTS);
+        pages[i].pfnDlgProc = formatopts_proc;
+        pages[i].hInstance = instance;
+        pages[i].lParam = (LPARAM)&rwpViewOptionsPages[i];
+        pages[i].pszTitle = MAKEINTRESOURCEW(i == 0 ?
+            STRING_VIEWPROPS_TEXT : STRING_VIEWPROPS_RICHTEXT);
+    }
 
-    if(fileFormat & SF_RTF)
-        U2(psh).nStartPage = 1;
-    else
-        U2(psh).nStartPage = 0;
-    PropertySheetW(&psh);
-    set_bar_states();
-    target_device(hMainWnd, wordWrap[reg_formatindex(fileFormat)]);
+    ZeroMemory(&sheet, sizeof(sheet));
+    sheet.dwSize = sizeof(sheet);
+    sheet.dwFlags = PSH_USEICONID | PSH_PROPSHEETPAGE | PSH_NOAPPLYNOW |
+                    PSH_MODELESS | PSH_USECALLBACK | PSH_NOCONTEXTHELP;
+    sheet.hwndParent = hMainWnd;
+    sheet.hInstance = instance;
+    sheet.pszCaption = MAKEINTRESOURCEW(STRING_VIEWPROPS_TITLE);
+    sheet.nPages = sizeof(pages) / sizeof(pages[0]);
+    U3(sheet).ppsp = pages;
+    U(sheet).pszIcon = MAKEINTRESOURCEW(IDI_WORDPAD);
+    U2(sheet).nStartPage = (fileFormat & SF_RTF) ? 1 : 0;
+    sheet.pfnCallback = rwp_options_sheet_callback;
+    result = PropertySheetW(&sheet);
+    rwpViewOptionsWnd = result > 0 ? (HWND)result : NULL;
+}
+
+/* A modeless property sheet signals completion by dropping its current page.
+ * Destroy it after the dialog manager has returned from OK or Cancel. */
+static void rwp_finish_view_options(void)
+{
+    HWND dialog = rwpViewOptionsWnd;
+    if (!dialog || (IsWindow(dialog) && PropSheet_GetCurrentPageHwnd(dialog)))
+        return;
+    rwpViewOptionsWnd = NULL;
+    if (IsWindow(dialog)) DestroyWindow(dialog);
+    if (rwpViewOptionsChanged)
+    {
+        set_bar_states();
+        target_device(hMainWnd, wordWrap[reg_formatindex(fileFormat)]);
+    }
 }
 
 static void HandleCommandLine(LPWSTR cmdline)
@@ -17380,6 +17621,550 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
     return FALSE;
 }
 
+static const struct
+{
+    UINT command;
+    LPCWSTR english;
+    LPCWSTR italian;
+} rwpShortcutActions[] =
+{
+    {0, L"Unassigned", L"Non assegnato"},
+    {ID_FORMAT_COLOR, L"Reapply last text color", L"Applica l'ultimo colore del testo"},
+    {ID_FORMAT_BOLD, L"Toggle bold", L"Attiva/disattiva grassetto"},
+    {ID_FORMAT_ITALIC, L"Toggle italic", L"Attiva/disattiva corsivo"},
+    {ID_FORMAT_UNDERLINE, L"Toggle underline", L"Attiva/disattiva sottolineato"},
+    {ID_FORMAT_STRIKETHROUGH, L"Toggle strikethrough", L"Attiva/disattiva barrato"},
+    {ID_FORMAT_HIGHLIGHT, L"Apply last highlight", L"Applica l'ultima evidenziazione"},
+    {ID_FORMAT_SUPERSCRIPT, L"Toggle superscript", L"Attiva/disattiva apice"},
+    {ID_FORMAT_SUBSCRIPT, L"Toggle subscript", L"Attiva/disattiva pedice"},
+    {ID_COPY_LINK, L"Copy link", L"Copia collegamento"},
+    {ID_EDIT_COPY, L"Copy selection", L"Copia selezione"},
+    {ID_EDIT_CUT, L"Cut selection", L"Taglia selezione"},
+    {ID_EDIT_PASTE, L"Paste", L"Incolla"},
+    {ID_EDIT_PASTE_PLAIN, L"Paste without formatting", L"Incolla senza formattazione"},
+    {ID_EDIT_REMOVE_FORMATTING, L"Remove formatting", L"Rimuovi formattazione"},
+    {ID_EDIT_SELECTALL, L"Select all", L"Seleziona tutto"},
+    {ID_EDIT_UNDO, L"Undo", L"Annulla modifica"},
+    {ID_EDIT_REDO, L"Redo", L"Ripristina modifica"}
+};
+
+static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
+{
+    IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
+};
+static const WCHAR rwpShortcutOption[] = L"EditorShortcutBindings";
+static RWP_SHORTCUT_ASSIGNMENTS rwpShortcutDraft;
+static UINT rwpShortcutDraftChord;
+static HFONT rwpShortcutStatusBoldFont;
+static ACCEL *rwpBuiltInAccelerators;
+static int rwpBuiltInAcceleratorCount;
+
+/* Stable command IDs preserve assignments across changes to the action list. */
+static int rwp_shortcut_action_index(DWORD command)
+{
+    size_t i;
+    for (i = 0; i < sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0]); ++i)
+        if (rwpShortcutActions[i].command == command) return (int)i;
+    return 0;
+}
+
+static BOOL rwp_shortcut_key_supported(UINT key, UINT modifiers)
+{
+    if (key < VK_BACK || key >= RWP_SHORTCUT_KEY_COUNT ||
+        modifiers >= RWP_SHORTCUT_MODIFIER_COUNT ||
+        (key >= VK_LSHIFT && key <= VK_RMENU) ||
+        key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+        key == VK_LWIN || key == VK_RWIN || key == VK_APPS ||
+        key == VK_CAPITAL || key == VK_NUMLOCK || key == VK_SCROLL ||
+        key == VK_PROCESSKEY || key == VK_PACKET)
+        return FALSE;
+    return (modifiers & (RWP_SHORTCUT_CONTROL | RWP_SHORTCUT_ALT)) ||
+           (key >= VK_F1 && key <= VK_F24);
+}
+
+/* Protect the app's accelerator table, menu access keys, and Rich Edit's
+ * native editing commands. WordPad already suppresses native Ctrl+R. */
+static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
+{
+    UINT accelFlags = 0;
+    BOOL alt = (modifiers & RWP_SHORTCUT_ALT) != 0;
+    BOOL control = (modifiers & RWP_SHORTCUT_CONTROL) != 0;
+    BOOL shift = (modifiers & RWP_SHORTCUT_SHIFT) != 0;
+    int i;
+
+    if (alt) accelFlags |= FALT;
+    if (control) accelFlags |= FCONTROL;
+    if (shift) accelFlags |= FSHIFT;
+    for (i = 0; i < rwpBuiltInAcceleratorCount; ++i)
+    {
+        const ACCEL *entry = &rwpBuiltInAccelerators[i];
+        if ((entry->fVirt & FVIRTKEY) && entry->key == key &&
+            (entry->fVirt & (FALT | FCONTROL | FSHIFT)) == accelFlags)
+            return TRUE;
+    }
+
+    if ((key == VK_F10 && !alt) ||
+        (key == VK_F16 && !alt) ||
+        (key == VK_INSERT && shift))
+        return TRUE;
+
+    if (alt)
+    {
+        if (key == VK_TAB || key == VK_ESCAPE || key == VK_SPACE ||
+            key == VK_F4 || (key >= VK_NUMPAD0 && key <= VK_NUMPAD9))
+            return TRUE;
+        if (control)
+            return key == VK_DELETE || (key == VK_F12 && shift);
+        return key == 'X' || key == VK_BACK ||
+            rwp_find_menu_mnemonic((WCHAR)MapVirtualKeyW(key, MAPVK_VK_TO_CHAR)) >= 0;
+    }
+
+    if (control)
+    {
+        static const WCHAR richEditPunctuation[] = L"+='`~;,";
+        SHORT apostrophe;
+        if (key == VK_BACK || key == VK_DELETE || key == VK_INSERT ||
+            key == VK_TAB || key == VK_ESCAPE || key == VK_CLEAR ||
+            key == VK_NUMPAD5 || (key >= VK_PRIOR && key <= VK_DOWN) ||
+            key == 'C' || key == 'V' || key == 'X')
+            return TRUE;
+        if (!shift && (key == 'J' || key == 'L' ||
+                       key == '1' || key == '2' || key == '5'))
+            return TRUE;
+        if (shift && (key == 'A' || key == 'L'))
+            return TRUE;
+        for (i = 0; richEditPunctuation[i]; ++i)
+        {
+            SHORT mapped = VkKeyScanW(richEditPunctuation[i]);
+            /* VkKeyScan's shift, control and alt bits match the index above. */
+            if (mapped != -1 && LOBYTE(mapped) == key &&
+                modifiers == (RWP_SHORTCUT_CONTROL | HIBYTE(mapped)))
+                return TRUE;
+        }
+        apostrophe = VkKeyScanW(L'\'');
+        if (shift && apostrophe != -1 && LOBYTE(apostrophe) == key)
+            return TRUE;
+        /* Ctrl+Shift+6 is the documented caret-accent chord on US layouts. */
+        if (shift && key == '6' && VkKeyScanW(L'^') == MAKEWORD('6', 1))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void rwp_load_shortcut_assignments(HACCEL table)
+{
+    RWP_SHORTCUT_ASSIGNMENTS saved;
+    DWORD legacy[RWP_MOUSE_SHORTCUT_COUNT + VK_F9 - VK_F1 + 1];
+    DWORD size = sizeof(saved);
+    UINT slot, modifiers, key;
+    int count = CopyAcceleratorTableW(table, NULL, 0);
+
+    if (count > 0)
+    {
+        rwpBuiltInAccelerators = HeapAlloc(GetProcessHeap(), 0, count * sizeof(ACCEL));
+        if (rwpBuiltInAccelerators)
+            rwpBuiltInAcceleratorCount =
+                CopyAcceleratorTableW(table, rwpBuiltInAccelerators, count);
+    }
+    if (rwp_read_binary_option(rwpShortcutOption, &saved, &size) && size == sizeof(saved))
+    {
+        for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
+            if (rwp_shortcut_action_index(saved.mouse[slot]))
+                rwpShortcutCommands.mouse[slot] = saved.mouse[slot];
+        for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+            for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+            {
+                DWORD action = saved.keys[modifiers][key];
+                if (rwp_shortcut_action_index(action) &&
+                    rwp_shortcut_key_supported(key, modifiers) &&
+                    !rwp_shortcut_key_in_use(key, modifiers))
+                    rwpShortcutCommands.keys[modifiers][key] = action;
+            }
+        return;
+    }
+
+    /* Load the previous release's three mouse slots and Ctrl+Shift+F1–F9. */
+    size = sizeof(legacy);
+    if (!rwp_read_binary_option(L"EditorShortcutAssignments", legacy, &size) ||
+        size % sizeof(legacy[0]) != 0)
+        return;
+    for (slot = 0; slot < size / sizeof(legacy[0]); ++slot)
+    {
+        if (!rwp_shortcut_action_index(legacy[slot])) continue;
+        if (slot < RWP_MOUSE_SHORTCUT_COUNT)
+            rwpShortcutCommands.mouse[slot] = legacy[slot];
+        else
+            rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL | RWP_SHORTCUT_SHIFT]
+                [VK_F1 + slot - RWP_MOUSE_SHORTCUT_COUNT] = legacy[slot];
+    }
+}
+
+static UINT rwp_shortcut_chord_from_message(const MSG *message)
+{
+    UINT modifiers = 0;
+    if (message->message != WM_KEYDOWN && message->message != WM_SYSKEYDOWN)
+        return 0;
+    if (GetKeyState(VK_CONTROL) & 0x8000) modifiers |= RWP_SHORTCUT_CONTROL;
+    if (GetKeyState(VK_MENU) & 0x8000) modifiers |= RWP_SHORTCUT_ALT;
+    if (GetKeyState(VK_SHIFT) & 0x8000) modifiers |= RWP_SHORTCUT_SHIFT;
+    if (!rwp_shortcut_key_supported((UINT)message->wParam, modifiers)) return 0;
+    if ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))
+        return 0;
+    /* AltGr generates right Alt plus Ctrl while entering printable text. */
+    if ((modifiers & (RWP_SHORTCUT_CONTROL | RWP_SHORTCUT_ALT)) ==
+        (RWP_SHORTCUT_CONTROL | RWP_SHORTCUT_ALT) &&
+        (GetKeyState(VK_RMENU) & 0x8000))
+        return 0;
+    return MAKELONG(message->wParam, modifiers);
+}
+
+/* Handle a custom chord before TranslateMessage can queue WM_CHAR or
+ * WM_SYSCHAR. The existing accelerator table is given first chance. */
+static BOOL rwp_dispatch_shortcut_key(const MSG *message)
+{
+    UINT chord, action;
+    if (message->hwnd != hEditorWnd) return FALSE;
+    chord = rwp_shortcut_chord_from_message(message);
+    if (!chord) return FALSE;
+    action = rwpShortcutCommands.keys[HIWORD(chord)][LOWORD(chord)];
+    if (!action || rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
+        return FALSE;
+    if (!(message->lParam & (1UL << 30)))
+        rwp_execute_editor_shortcut(hEditorWnd, action, NULL);
+    return TRUE;
+}
+
+static void rwp_fill_shortcut_actions(HWND combo, BOOL italian)
+{
+    size_t i;
+    int height = rwp_dialog_input_height(combo);
+    if (height > 0)
+    {
+        SendMessageW(combo, CB_SETITEMHEIGHT, 0, height);
+        SendMessageW(combo, CB_SETITEMHEIGHT, (WPARAM)-1, height);
+    }
+    for (i = 0; i < sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0]); ++i)
+    {
+        LRESULT row = SendMessageW(combo, CB_ADDSTRING, 0,
+            (LPARAM)(italian ? rwpShortcutActions[i].italian :
+                               rwpShortcutActions[i].english));
+        if (row >= 0)
+            SendMessageW(combo, CB_SETITEMDATA, row, rwpShortcutActions[i].command);
+    }
+}
+
+static void rwp_select_shortcut_action(HWND dialog, int control, DWORD command)
+{
+    HWND combo = GetDlgItem(dialog, control);
+    LRESULT row, count = SendMessageW(combo, CB_GETCOUNT, 0, 0);
+    for (row = 0; row < count; ++row)
+        if ((DWORD)SendMessageW(combo, CB_GETITEMDATA, row, 0) == command)
+        {
+            SendMessageW(combo, CB_SETCURSEL, row, 0);
+            return;
+        }
+    SendMessageW(combo, CB_SETCURSEL, 0, 0);
+}
+
+static DWORD rwp_selected_shortcut_action(HWND dialog, int control)
+{
+    HWND combo = GetDlgItem(dialog, control);
+    LRESULT row = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    DWORD command = 0;
+    if (row >= 0)
+        command = (DWORD)SendMessageW(combo, CB_GETITEMDATA, row, 0);
+    return rwpShortcutActions[rwp_shortcut_action_index(command)].command;
+}
+
+static void rwp_format_shortcut_chord(UINT chord, WCHAR *label)
+{
+    UINT key = LOWORD(chord), modifiers = HIWORD(chord);
+    WCHAR name[40] = {0};
+    if ((key >= '0' && key <= '9') || (key >= 'A' && key <= 'Z'))
+        name[0] = (WCHAR)key;
+    else if (key >= VK_F1 && key <= VK_F24)
+        wsprintfW(name, L"F%u", key - VK_F1 + 1);
+    else if (key >= VK_NUMPAD0 && key <= VK_NUMPAD9)
+        wsprintfW(name, L"Numpad %u", key - VK_NUMPAD0);
+    else
+    {
+        UINT scan = MapVirtualKeyW(key, MAPVK_VK_TO_VSC_EX);
+        LONG info = (scan & 0xff) << 16;
+        if (scan & 0xff00) info |= 1L << 24;
+        if (!GetKeyNameTextW(info, name, sizeof(name) / sizeof(name[0])))
+            wsprintfW(name, L"0x%02X", key);
+    }
+    wsprintfW(label, L"%s%s%s%s",
+              (modifiers & RWP_SHORTCUT_CONTROL) ? L"Ctrl+" : L"",
+              (modifiers & RWP_SHORTCUT_ALT) ? L"Alt+" : L"",
+              (modifiers & RWP_SHORTCUT_SHIFT) ? L"Shift+" : L"", name);
+}
+
+static void rwp_select_shortcut_list_row(HWND dialog)
+{
+    HWND list = GetDlgItem(dialog, IDC_SHORTCUT_KEY_LIST);
+    LRESULT row, count = SendMessageW(list, LB_GETCOUNT, 0, 0);
+    for (row = 0; rwpShortcutDraftChord && row < count; ++row)
+        if ((UINT)SendMessageW(list, LB_GETITEMDATA, row, 0) == rwpShortcutDraftChord)
+        {
+            SendMessageW(list, LB_SETCURSEL, row, 0);
+            return;
+        }
+    SendMessageW(list, LB_SETCURSEL, (WPARAM)-1, 0);
+}
+
+static void rwp_fill_shortcut_list(HWND dialog)
+{
+    HWND list = GetDlgItem(dialog, IDC_SHORTCUT_KEY_LIST);
+    BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    UINT modifiers, key;
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+        {
+            DWORD action = rwpShortcutDraft.keys[modifiers][key];
+            if (action)
+            {
+                UINT chord = MAKELONG(key, modifiers);
+                int index = rwp_shortcut_action_index(action);
+                WCHAR label[64], rowText[192];
+                LRESULT row;
+                rwp_format_shortcut_chord(chord, label);
+                wsprintfW(rowText, L"%s   %s", label, italian ?
+                    rwpShortcutActions[index].italian : rwpShortcutActions[index].english);
+                row = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)rowText);
+                if (row >= 0) SendMessageW(list, LB_SETITEMDATA, row, chord);
+            }
+        }
+    rwp_select_shortcut_list_row(dialog);
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, NULL, TRUE);
+}
+
+static void rwp_update_shortcut_buttons(HWND dialog)
+{
+    UINT chord = rwpShortcutDraftChord;
+    DWORD oldAction = chord ? rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] : 0;
+    DWORD action = rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION);
+    EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ACTION), chord != 0);
+    EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ASSIGN), chord && action != oldAction);
+    EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_REMOVE), oldAction != 0);
+}
+
+static void rwp_show_shortcut_chord(HWND dialog, UINT chord)
+{
+    BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    BOOL inUse = chord && rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord));
+    LPCWSTR status;
+    WCHAR label[64];
+
+    rwpShortcutDraftChord = inUse ? 0 : chord;
+    if (chord)
+    {
+        rwp_format_shortcut_chord(chord, label);
+        SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY, label);
+    }
+    else
+        SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY,
+            italian ? L"Premi i tasti qui" : L"Press keys here");
+
+    if (!chord)
+        status = italian ? L"Usa Ctrl, Alt o un tasto funzione." :
+                           L"Use Ctrl, Alt, or a function key.";
+    else if (inUse)
+        status = italian ? L"Combinazione già in uso. Scegline un'altra." :
+                           L"This shortcut is already in use. Choose another.";
+    else
+        status = italian ? L"Scegli un'azione e fai clic su Assegna." :
+                           L"Choose an action and click Assign.";
+    if (rwpShortcutStatusInUse != inUse)
+    {
+        HFONT font = inUse && rwpShortcutStatusBoldFont ? rwpShortcutStatusBoldFont :
+                     (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0);
+        rwpShortcutStatusInUse = inUse;
+        SendDlgItemMessageW(dialog, IDC_SHORTCUT_KEY_STATUS, WM_SETFONT,
+                            (WPARAM)font, TRUE);
+    }
+    SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY_STATUS, status);
+    rwp_select_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION, rwpShortcutDraftChord ?
+        rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] : 0);
+    rwp_select_shortcut_list_row(dialog);
+    rwp_update_shortcut_buttons(dialog);
+}
+
+static BOOL rwp_capture_shortcut_key(HWND dialog, const MSG *message)
+{
+    UINT chord;
+    if (message->hwnd != GetDlgItem(dialog, IDC_SHORTCUT_KEY)) return FALSE;
+    chord = rwp_shortcut_chord_from_message(message);
+    if (!chord) return FALSE;
+    if (!(message->lParam & (1UL << 30)))
+        rwp_show_shortcut_chord(dialog, chord);
+    return TRUE;
+}
+
+static void rwp_store_shortcut_key_action(HWND dialog)
+{
+    UINT chord = rwpShortcutDraftChord;
+    if (chord && !rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
+        rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] =
+            rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION);
+}
+
+static void rwp_refresh_shortcut_choices(HWND dialog)
+{
+    unsigned slot;
+    for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
+        rwp_select_shortcut_action(dialog, rwpShortcutMouseControls[slot],
+                                    rwpShortcutDraft.mouse[slot]);
+    rwp_show_shortcut_chord(dialog, 0);
+    rwp_fill_shortcut_list(dialog);
+}
+
+static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
+                                                   WPARAM wParam, LPARAM lParam)
+{
+    unsigned slot;
+    int command = LOWORD(wParam);
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+        HFONT font = (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0);
+        LOGFONTW description;
+        rwp_theme_dialog(dialog);
+        if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        if (GetObjectW(font, sizeof(description), &description))
+        {
+            description.lfWeight = FW_BOLD;
+            rwpShortcutStatusBoldFont = CreateFontIndirectW(&description);
+        }
+        if (italian)
+        {
+            SetWindowTextW(dialog, L"Configura comandi rapidi");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_MOUSE4_LABEL, L"Pulsante mouse 4");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_MOUSE5_LABEL, L"Pulsante mouse 5");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_WHEEL_LABEL, L"Clic rotellina");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY_GROUP, L"Comandi rapidi aggiuntivi");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY_ASSIGN, L"Assegna");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_KEY_REMOVE, L"Rimuovi");
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_RESET, L"Ripristina valori");
+            SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
+        }
+        rwpShortcutDraft = rwpShortcutCommands;
+        for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
+            rwp_fill_shortcut_actions(GetDlgItem(dialog, rwpShortcutMouseControls[slot]),
+                                      italian);
+        rwp_fill_shortcut_actions(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ACTION), italian);
+        rwp_refresh_shortcut_choices(dialog);
+        return TRUE;
+    }
+    case WM_MEASUREITEM:
+        if (((MEASUREITEMSTRUCT *)lParam)->CtlType == ODT_COMBOBOX)
+        {
+            ((MEASUREITEMSTRUCT *)lParam)->itemHeight = 24;
+            return TRUE;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT *)lParam)->CtlType == ODT_COMBOBOX)
+            return rwp_bulk_draw_combo((DRAWITEMSTRUCT *)lParam,
+                rwpDialogFieldBrush ? rwpDialogFieldBrush : rwpBarBrush);
+        break;
+    case WM_COMMAND:
+        if (command == IDC_SHORTCUT_KEY_ACTION &&
+            (HIWORD(wParam) == CBN_SELCHANGE || HIWORD(wParam) == CBN_CLOSEUP))
+        {
+            rwp_update_shortcut_buttons(dialog);
+            return TRUE;
+        }
+        if (command == IDC_SHORTCUT_KEY_LIST && HIWORD(wParam) == LBN_SELCHANGE)
+        {
+            HWND list = GetDlgItem(dialog, IDC_SHORTCUT_KEY_LIST);
+            LRESULT row = SendMessageW(list, LB_GETCURSEL, 0, 0);
+            if (row >= 0)
+            {
+                LRESULT chord = SendMessageW(list, LB_GETITEMDATA, row, 0);
+                if (chord != LB_ERR) rwp_show_shortcut_chord(dialog, (UINT)chord);
+            }
+            return TRUE;
+        }
+        if (command == IDC_SHORTCUT_KEY_ASSIGN)
+        {
+            rwp_store_shortcut_key_action(dialog);
+            rwp_fill_shortcut_list(dialog);
+            rwp_update_shortcut_buttons(dialog);
+            return TRUE;
+        }
+        if (command == IDC_SHORTCUT_KEY_REMOVE && rwpShortcutDraftChord)
+        {
+            UINT chord = rwpShortcutDraftChord;
+            rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] = 0;
+            rwp_show_shortcut_chord(dialog, chord);
+            rwp_fill_shortcut_list(dialog);
+            return TRUE;
+        }
+        if (command == IDC_SHORTCUT_RESET)
+        {
+            ZeroMemory(&rwpShortcutDraft, sizeof(rwpShortcutDraft));
+            rwp_refresh_shortcut_choices(dialog);
+            return TRUE;
+        }
+        if (command == IDOK)
+        {
+            for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
+                rwpShortcutDraft.mouse[slot] =
+                    rwp_selected_shortcut_action(dialog, rwpShortcutMouseControls[slot]);
+            rwp_store_shortcut_key_action(dialog);
+            if (memcmp(&rwpShortcutDraft, &rwpShortcutCommands, sizeof(rwpShortcutDraft)))
+            {
+                if (!rwp_write_binary_option(rwpShortcutOption, &rwpShortcutDraft,
+                                              sizeof(rwpShortcutDraft)))
+                {
+                    rwp_report_settings_save_error(dialog);
+                    return TRUE;
+                }
+                rwpShortcutCommands = rwpShortcutDraft;
+            }
+            DestroyWindow(dialog);
+            return TRUE;
+        }
+        if (command == IDCANCEL)
+        {
+            DestroyWindow(dialog);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(dialog);
+        return TRUE;
+    case WM_NCDESTROY:
+        if (rwpShortcutSettingsWnd == dialog) rwpShortcutSettingsWnd = NULL;
+        if (rwpShortcutStatusBoldFont)
+        {
+            DeleteObject(rwpShortcutStatusBoldFont);
+            rwpShortcutStatusBoldFont = NULL;
+        }
+        rwpShortcutStatusInUse = FALSE;
+        break;
+    }
+    return FALSE;
+}
+
+static void rwp_show_settings_window(HWND *window, UINT resource, DLGPROC procedure)
+{
+    if (!*window || !IsWindow(*window))
+        *window = CreateDialogParamW(GetModuleHandleW(NULL),
+            MAKEINTRESOURCEW(resource), hMainWnd, procedure, 0);
+    if (*window)
+    {
+        ShowWindow(*window, SW_RESTORE);
+        SetForegroundWindow(*window);
+    }
+}
+
 static INT_PTR CALLBACK rwp_counter_dialog_proc(HWND dialog, UINT message,
                                                 WPARAM wParam, LPARAM lParam)
 {
@@ -18225,6 +19010,337 @@ static void decorate_color_menu(HMENU hMenu)
     }
 }
 
+#define RWP_COLOR_ORDER_CAPACITY 128
+typedef struct
+{
+    UINT count;
+    DWORD entries[RWP_COLOR_ORDER_CAPACITY]; /* A zero entry is a separator. */
+} RWP_COLOR_ORDER;
+
+static const WCHAR rwpColorOrderOption[] = L"ColorPickerOrder";
+static RWP_COLOR_ORDER rwpDefaultColorOrder;
+static RWP_COLOR_ORDER rwpColorOrder;
+static RWP_COLOR_ORDER rwpColorOrderDraft;
+
+/* A saved order changes layout only. Every original color command must
+ * appear exactly once, including Default Color. */
+static BOOL rwp_color_order_valid(const RWP_COLOR_ORDER *order)
+{
+    BOOL seen[RWP_COLOR_SWATCH_COUNT] = {FALSE};
+    UINT row, colors = 0;
+    if (order->count < RWP_COLOR_SWATCH_COUNT ||
+        order->count > RWP_COLOR_ORDER_CAPACITY)
+        return FALSE;
+    for (row = 0; row < order->count; ++row)
+    {
+        DWORD command = order->entries[row];
+        if (!command) continue;
+        if (command < ID_COLOR_FIRST || command > ID_COLOR_LAST ||
+            seen[command - ID_COLOR_FIRST])
+            return FALSE;
+        seen[command - ID_COLOR_FIRST] = TRUE;
+        ++colors;
+    }
+    return colors == RWP_COLOR_SWATCH_COUNT;
+}
+
+static BOOL rwp_color_orders_equal(const RWP_COLOR_ORDER *first,
+                                   const RWP_COLOR_ORDER *second)
+{
+    return first->count == second->count &&
+        !memcmp(first->entries, second->entries,
+                first->count * sizeof(first->entries[0]));
+}
+
+/* Construct a new popup before swapping handles. Read localized labels
+ * from the active menu and keep the original Win32 command IDs. */
+static HMENU rwp_create_ordered_color_menu(const RWP_COLOR_ORDER *order)
+{
+    HMENU source = GetSubMenu(hColorPopupMenu, 0);
+    HMENU menu = CreateMenu();
+    HMENU popup = CreatePopupMenu();
+    UINT row;
+    if (!source || !menu || !popup) goto failed;
+    for (row = 0; row < order->count; ++row)
+    {
+        UINT command = order->entries[row];
+        if (command)
+        {
+            WCHAR label[128];
+            UINT state = GetMenuState(source, command, MF_BYCOMMAND);
+            if (state == (UINT)-1 ||
+                !GetMenuStringW(source, command, label,
+                    sizeof(label) / sizeof(label[0]), MF_BYCOMMAND) ||
+                !AppendMenuW(popup, MF_STRING |
+                    (state & (MF_CHECKED | MF_GRAYED | MF_DISABLED)), command, label))
+                goto failed;
+        }
+        else if (!AppendMenuW(popup, MF_SEPARATOR, 0, NULL))
+            goto failed;
+    }
+    if (AppendMenuW(menu, MF_POPUP, (UINT_PTR)popup, L"")) return menu;
+
+failed:
+    if (popup) DestroyMenu(popup);
+    if (menu) DestroyMenu(menu);
+    return NULL;
+}
+
+static void rwp_load_color_order(void)
+{
+    HMENU popup = GetSubMenu(hColorPopupMenu, 0);
+    HMENU ordered;
+    RWP_COLOR_ORDER saved = {0};
+    DWORD size = sizeof(saved.entries);
+    int row, count = GetMenuItemCount(popup);
+    if (count < 0 || count > RWP_COLOR_ORDER_CAPACITY) return;
+    for (row = 0; row < count; ++row)
+    {
+        UINT state = GetMenuState(popup, row, MF_BYPOSITION);
+        if (state == (UINT)-1) return;
+        rwpDefaultColorOrder.entries[row] = (state & MF_SEPARATOR) ? 0 :
+            GetMenuItemID(popup, row);
+    }
+    rwpDefaultColorOrder.count = (UINT)count;
+    if (!rwp_color_order_valid(&rwpDefaultColorOrder))
+    {
+        rwpDefaultColorOrder.count = 0;
+        return;
+    }
+    rwpColorOrder = rwpDefaultColorOrder;
+    if (!rwp_read_binary_option(rwpColorOrderOption, saved.entries, &size) ||
+        size % sizeof(saved.entries[0]) != 0)
+        return;
+    saved.count = size / sizeof(saved.entries[0]);
+    if (!rwp_color_order_valid(&saved)) return;
+    ordered = rwp_create_ordered_color_menu(&saved);
+    if (!ordered) return;
+    DestroyMenu(hColorPopupMenu);
+    hColorPopupMenu = ordered;
+    rwpColorOrder = saved;
+}
+
+static void rwp_color_order_update_buttons(HWND dialog)
+{
+    int row = (int)SendDlgItemMessageW(dialog, IDC_COLOR_ORDER_LIST,
+                                      LB_GETCURSEL, 0, 0);
+    BOOL selected = row >= 0 && (UINT)row < rwpColorOrderDraft.count;
+    EnableWindow(GetDlgItem(dialog, IDC_COLOR_ORDER_UP), selected && row > 0);
+    EnableWindow(GetDlgItem(dialog, IDC_COLOR_ORDER_DOWN),
+                 selected && (UINT)(row + 1) < rwpColorOrderDraft.count);
+    EnableWindow(GetDlgItem(dialog, IDC_COLOR_ORDER_ADD_SEPARATOR),
+                 rwpColorOrderDraft.count < RWP_COLOR_ORDER_CAPACITY);
+    EnableWindow(GetDlgItem(dialog, IDC_COLOR_ORDER_REMOVE_SEPARATOR),
+                 selected && !rwpColorOrderDraft.entries[row]);
+}
+
+static void rwp_color_order_fill_list(HWND dialog, int selection)
+{
+    BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    HWND list = GetDlgItem(dialog, IDC_COLOR_ORDER_LIST);
+    HMENU palette = GetSubMenu(hColorPopupMenu, 0);
+    LRESULT top = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
+    UINT row;
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    for (row = 0; row < rwpColorOrderDraft.count; ++row)
+    {
+        WCHAR label[128] = {0};
+        UINT command = rwpColorOrderDraft.entries[row];
+        if (command)
+            GetMenuStringW(palette, command, label,
+                           sizeof(label) / sizeof(label[0]), MF_BYCOMMAND);
+        else
+            lstrcpyW(label, italian ? L"Separatore" : L"Separator");
+        if (SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)label) < 0) break;
+    }
+    if (top >= 0) SendMessageW(list, LB_SETTOPINDEX, top, 0);
+    SendMessageW(list, LB_SETCURSEL, selection, 0);
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, NULL, TRUE);
+    rwp_color_order_update_buttons(dialog);
+}
+
+static void rwp_color_order_draw_row(const DRAWITEMSTRUCT *item)
+{
+    HDC dc = item->hDC;
+    RECT text = item->rcItem;
+    int saved = SaveDC(dc);
+    HBRUSH brush = rwpDialogFieldBrush ? rwpDialogFieldBrush : rwpBarBrush;
+    FillRect(dc, &text, (item->itemState & ODS_SELECTED) ?
+                        rwpBarActiveBrush : brush);
+    if (item->itemID < rwpColorOrderDraft.count)
+    {
+        WCHAR label[128] = {0};
+        UINT command = rwpColorOrderDraft.entries[item->itemID];
+        int height = text.bottom - text.top;
+        int swatch = min(height - 6, 22);
+        HFONT font = (HFONT)SendMessageW(item->hwndItem, WM_GETFONT, 0, 0);
+        if (font) SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RWP_BAR_TEXT);
+        if (command && command != ID_COLOR_AUTOMATIC && swatch > 0)
+        {
+            RECT box = {text.left + 5, text.top + (height - swatch) / 2,
+                        text.left + 5 + swatch, text.top + (height + swatch) / 2};
+            SetDCBrushColor(dc, textcolors[command - ID_COLOR_FIRST]);
+            FillRect(dc, &box, (HBRUSH)GetStockObject(DC_BRUSH));
+            FrameRect(dc, &box, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        }
+        text.left += max(swatch, 12) + 12;
+        SendMessageW(item->hwndItem, LB_GETTEXT, item->itemID, (LPARAM)label);
+        DrawTextW(dc, label, -1, &text,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if (!command)
+        {
+            SIZE name = {0, 0};
+            GetTextExtentPoint32W(dc, label, lstrlenW(label), &name);
+            text.left += name.cx + 10;
+            text.right -= 6;
+            text.top += height / 2;
+            text.bottom = text.top + 1;
+            if (text.right > text.left && rwpDialogEdgeBrush)
+                FillRect(dc, &text, rwpDialogEdgeBrush);
+        }
+    }
+    if (item->itemState & ODS_FOCUS)
+        DrawFocusRect(dc, &item->rcItem);
+    RestoreDC(dc, saved);
+}
+
+static int rwp_move_color_order_entry(RWP_COLOR_ORDER *order, int row, UINT action)
+{
+    BOOL selected = row >= 0 && (UINT)row < order->count;
+    if (action == IDC_COLOR_ORDER_ADD_SEPARATOR &&
+        order->count < RWP_COLOR_ORDER_CAPACITY)
+    {
+        row = selected ? row + 1 : (int)order->count;
+        memmove(order->entries + row + 1, order->entries + row,
+                (order->count - row) * sizeof(order->entries[0]));
+        order->entries[row] = 0;
+        ++order->count;
+    }
+    else if (selected && action == IDC_COLOR_ORDER_REMOVE_SEPARATOR &&
+             !order->entries[row])
+    {
+        --order->count;
+        memmove(order->entries + row, order->entries + row + 1,
+                (order->count - row) * sizeof(order->entries[0]));
+        if ((UINT)row == order->count) --row;
+    }
+    else if (selected && (action == IDC_COLOR_ORDER_UP || action == IDC_COLOR_ORDER_DOWN))
+    {
+        int destination = row + (action == IDC_COLOR_ORDER_UP ? -1 : 1);
+        if (destination >= 0 && (UINT)destination < order->count)
+        {
+            DWORD command = order->entries[row];
+            order->entries[row] = order->entries[destination];
+            order->entries[destination] = command;
+            row = destination;
+        }
+    }
+    return row;
+}
+
+static INT_PTR CALLBACK rwp_color_order_dialog_proc(HWND dialog, UINT message,
+                                                     WPARAM wParam, LPARAM lParam)
+{
+    int command = LOWORD(wParam);
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        HWND list = GetDlgItem(dialog, IDC_COLOR_ORDER_LIST);
+        int height = rwp_dialog_input_height(list);
+        rwp_theme_dialog(dialog);
+        if (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN)
+        {
+            SetWindowTextW(dialog, L"Configura ordine dei colori");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_HINT,
+                L"Sposta la riga selezionata o aggiungi un separatore sotto.");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_UP, L"Sposta su");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_DOWN, L"Sposta giù");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_ADD_SEPARATOR, L"Aggiungi separatore");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_REMOVE_SEPARATOR, L"Rimuovi separatore");
+            SetDlgItemTextW(dialog, IDC_COLOR_ORDER_RESET, L"Ripristina ordine");
+            SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
+        }
+        if (height > 0) SendMessageW(list, LB_SETITEMHEIGHT, 0, height);
+        rwpColorOrderDraft = rwpColorOrder;
+        rwp_color_order_fill_list(dialog, 0);
+        return TRUE;
+    }
+    case WM_MEASUREITEM:
+        if (wParam == IDC_COLOR_ORDER_LIST)
+        {
+            ((MEASUREITEMSTRUCT *)lParam)->itemHeight = 24;
+            return TRUE;
+        }
+        break;
+    case WM_DRAWITEM:
+        if (wParam == IDC_COLOR_ORDER_LIST)
+        {
+            rwp_color_order_draw_row((const DRAWITEMSTRUCT *)lParam);
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (command == IDC_COLOR_ORDER_LIST && HIWORD(wParam) == LBN_SELCHANGE)
+        {
+            rwp_color_order_update_buttons(dialog);
+            return TRUE;
+        }
+        if (command == IDC_COLOR_ORDER_RESET)
+        {
+            rwpColorOrderDraft = rwpDefaultColorOrder;
+            rwp_color_order_fill_list(dialog, 0);
+            return TRUE;
+        }
+        if (command >= IDC_COLOR_ORDER_UP && command <= IDC_COLOR_ORDER_REMOVE_SEPARATOR)
+        {
+            int row = (int)SendDlgItemMessageW(dialog, IDC_COLOR_ORDER_LIST,
+                                              LB_GETCURSEL, 0, 0);
+            row = rwp_move_color_order_entry(&rwpColorOrderDraft, row, command);
+            rwp_color_order_fill_list(dialog, row);
+            return TRUE;
+        }
+        if (command == IDOK)
+        {
+            if (!rwp_color_orders_equal(&rwpColorOrderDraft, &rwpColorOrder))
+            {
+                HMENU updated = rwp_create_ordered_color_menu(&rwpColorOrderDraft);
+                DWORD size = rwp_color_orders_equal(&rwpColorOrderDraft, &rwpDefaultColorOrder) ?
+                    0 : rwpColorOrderDraft.count * sizeof(rwpColorOrderDraft.entries[0]);
+                if (!updated ||
+                    !rwp_write_binary_option(rwpColorOrderOption, rwpColorOrderDraft.entries, size))
+                {
+                    if (updated) DestroyMenu(updated);
+                    rwp_report_settings_save_error(dialog);
+                    return TRUE;
+                }
+                DestroyMenu(hColorPopupMenu);
+                hColorPopupMenu = updated;
+                rwpColorOrder = rwpColorOrderDraft;
+            }
+            DestroyWindow(dialog);
+            return TRUE;
+        }
+        if (command == IDCANCEL)
+        {
+            DestroyWindow(dialog);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(dialog);
+        return TRUE;
+    case WM_NCDESTROY:
+        if (rwpColorOrderWnd == dialog) rwpColorOrderWnd = NULL;
+        break;
+    }
+    return FALSE;
+}
+
 /* Use the main font-color palette. Default is a real selectable formatting
  * attribute (CFE_AUTOCOLOR), not an RGB color. The popup menu is shared with
  * border-color pickers, so preserve its previous enabled/disabled state. */
@@ -18259,8 +19375,7 @@ static BOOL rwp_bulk_pick_palette_color(HWND dlg, int buttonId,
 }
 
 /* Temporarily repurpose the shared text-color palette for highlighting.
- * The header is intentionally conspicuous; other uses of the palette are
- * unchanged after the popup closes. The final command removes highlighting. */
+ * The Default Color entry removes highlighting in this picker. */
 static int rwp_track_highlight_palette(HWND owner, int x, int y, BOOL allowAny)
 {
     HMENU popup = hColorPopupMenu ? GetSubMenu(hColorPopupMenu, 0) : NULL;
@@ -25806,8 +26921,12 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         break;
 
     case ID_COPY_LINK:
-        rwp_copy_context_hyperlink();
+    {
+        LONG cp = rwpLinkContextCp;
+        rwpLinkContextCp = -1;
+        rwp_copy_hyperlink_at(cp);
         break;
+    }
 
     case ID_REMOVE_LINK:
         rwp_remove_context_hyperlink();
@@ -25831,6 +26950,17 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 
     case ID_SHOW_SHORTCUTS:
         rwp_open_shortcuts_dialog();
+        break;
+
+    case ID_CONFIGURE_SHORTCUTS:
+        rwp_show_settings_window(&rwpShortcutSettingsWnd, IDD_CONFIGURE_SHORTCUTS,
+                                  rwp_shortcut_settings_proc);
+        break;
+
+    case ID_CONFIGURE_COLOR_ORDER:
+        if (rwpDefaultColorOrder.count)
+            rwp_show_settings_window(&rwpColorOrderWnd, IDD_CONFIGURE_COLOR_ORDER,
+                                      rwp_color_order_dialog_proc);
         break;
 
     case ID_DOCUMENT_COUNTER:
@@ -26376,6 +27506,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
         }
     }
     if (!rwpMainMenu) return 1;
+    rwp_load_shortcut_assignments(hAccel);
     /* The View menu is found by a stable command, not by its translated name. */
     {
         const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
@@ -26559,7 +27690,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
         }
     }
 
-    /* Add bookmark-link recovery under Help across all 27 menu languages. */
+    /* Add configuration and recovery commands to every localized Help menu. */
     {
         int i;
         const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
@@ -26573,10 +27704,18 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                     italian ? L"Mostra tutti i comandi rapidi..." :
                               L"Show all shortcut commands...");
                 InsertMenuW(submenu, 1, MF_BYPOSITION | MF_STRING,
+                    ID_CONFIGURE_SHORTCUTS,
+                    italian ? L"Configura comandi rapidi..." :
+                              L"Configure shortcuts...");
+                InsertMenuW(submenu, 2, MF_BYPOSITION | MF_STRING,
+                    ID_CONFIGURE_COLOR_ORDER,
+                    italian ? L"Configura ordine dei colori..." :
+                              L"Configure color order...");
+                InsertMenuW(submenu, 3, MF_BYPOSITION | MF_STRING,
                     ID_BOOKMARK_RECOVER,
                     italian ? L"Recupera collegamenti a segnalibri..." :
                               L"Recover Bookmark Links...");
-                InsertMenuW(submenu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                InsertMenuW(submenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
                 break;
             }
         }
@@ -26728,6 +27867,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     set_bar_states();
     set_fileformat(SF_RTF);
     hColorPopupMenu = LoadMenuW(hInstance, MAKEINTRESOURCEW(IDM_COLOR_POPUP));
+    rwp_load_color_order();
     /* Printer metadata is now fetched on demand only when page-margin
      * wrapping or a print command actually requires it. */
     target_device(hMainWnd, wordWrap[reg_formatindex(fileFormat)]);
@@ -26746,6 +27886,20 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
 
     while(GetMessageW(&msg,0,0,0))
     {
+        BOOL optionsMessage = rwpViewOptionsWnd &&
+            (msg.hwnd == rwpViewOptionsWnd || IsChild(rwpViewOptionsWnd, msg.hwnd));
+        if (optionsMessage && PropSheet_IsDialogMessage(rwpViewOptionsWnd, &msg))
+        {
+            rwp_finish_view_options();
+            continue;
+        }
+        if (rwpShortcutSettingsWnd && IsWindow(rwpShortcutSettingsWnd) &&
+            (rwp_capture_shortcut_key(rwpShortcutSettingsWnd, &msg) ||
+             IsDialogMessageW(rwpShortcutSettingsWnd, &msg)))
+            continue;
+        if (rwpColorOrderWnd && IsWindow(rwpColorOrderWnd) &&
+            IsDialogMessageW(rwpColorOrderWnd, &msg))
+            continue;
         if (rwpCloudSettingsWnd && IsWindow(rwpCloudSettingsWnd) &&
             IsDialogMessageW(rwpCloudSettingsWnd, &msg))
             continue;
@@ -26801,8 +27955,11 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
 
         if (TranslateAcceleratorW(hMainWnd, hAccel, &msg))
             continue;
+        if (rwp_dispatch_shortcut_key(&msg))
+            continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+        if (optionsMessage) rwp_finish_view_options();
         if (!PeekMessageW(&msg, 0, 0, 0, PM_NOREMOVE))
             SendMessageW(hMainWnd, WM_USER, 0, 0);
     }
@@ -26811,6 +27968,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
         DestroyMenu(hColorPopupMenu);
     destroy_color_swatches();
     if (rwpMainMenu) DestroyMenu(rwpMainMenu);
+    if (rwpBuiltInAccelerators) HeapFree(GetProcessHeap(), 0, rwpBuiltInAccelerators);
     if (rwpOleInitialized) OleUninitialize();
     return 0;
 }
