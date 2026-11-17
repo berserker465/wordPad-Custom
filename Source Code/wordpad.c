@@ -348,8 +348,8 @@ static HWND rwpCounterWnd;
 static BOOL rwpOleInitialized;
 static HMENU hColorPopupMenu;
 
-/* The fixed accelerators stay in MAINACCELTABLE. These slots are optional
- * assignments scoped to the document editor. */
+/* Fixed accelerators stay in MAINACCELTABLE. Configurable shortcuts, including
+ * the former Alt+A insert-@ command, are dispatched only in the editor. */
 enum
 {
     RWP_MOUSE_BUTTON_4,
@@ -17554,7 +17554,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+W = Allinea al centro\r\n"
             L"Ctrl+E = Allinea a destra\r\n"
             L"Alt+Q = Applica l'ultimo colore del testo\r\n"
-            L"Alt+A = Inserisci @"
+            L"Alt+A = Inserisci testo (predefinito: @; configurabile)"
             :
             L"Ctrl+N = New\r\n"
             L"Ctrl+O = Open\r\n"
@@ -17580,7 +17580,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+W = Align center\r\n"
             L"Ctrl+E = Align right\r\n"
             L"Alt+Q = Apply last text color\r\n"
-            L"Alt+A = Insert @");
+            L"Alt+A = Insert text (default: @; configurable)");
         SendDlgItemMessageW(dialog, IDC_SHORTCUTS_TEXT, EM_SETSEL, 0, 0);
         SendDlgItemMessageW(dialog, IDC_SHORTCUTS_TEXT, EM_SCROLL, SB_TOP, 0);
         rwp_size_shortcuts_dialog(dialog);
@@ -17630,6 +17630,7 @@ static const struct
 } rwpShortcutActions[] =
 {
     {0, L"Unassigned", L"Non assegnato"},
+    {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
     {ID_FORMAT_COLOR, L"Reapply last text color", L"Applica l'ultimo colore del testo"},
     {ID_FORMAT_BOLD, L"Toggle bold", L"Attiva/disattiva grassetto"},
     {ID_FORMAT_ITALIC, L"Toggle italic", L"Attiva/disattiva corsivo"},
@@ -17653,8 +17654,107 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
+/* Version 2 saves the original assignment table and the Unicode text for
+ * only the Insert text chords. The original registry value is still read for
+ * migration, without changing its serialized structure. */
+#define RWP_SHORTCUT_TEXT_MAX 512
+#define RWP_SHORTCUT_BLOB_MAGIC 0x32535752UL /* RWS2 */
+typedef struct
+{
+    DWORD magic;
+    DWORD textCount;
+    RWP_SHORTCUT_ASSIGNMENTS assignments;
+} RWP_SHORTCUT_BLOB_HEADER;
+typedef struct
+{
+    DWORD chord;
+    DWORD length; /* UTF-16 code units excluding the terminator. */
+} RWP_SHORTCUT_BLOB_TEXT;
 static const WCHAR rwpShortcutOption[] = L"EditorShortcutBindings";
+static const WCHAR rwpShortcutOptionV2[] = L"EditorShortcutBindingsV2";
+static WCHAR *rwpShortcutText[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT];
+static WCHAR *rwpShortcutDraftText[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT];
 static RWP_SHORTCUT_ASSIGNMENTS rwpShortcutDraft;
+
+/* Each chord owns its text independently; assigning an ordinary command
+ * drops its text, and cancelling the dialog discards draft allocations. */
+static void rwp_clear_shortcut_texts(
+    WCHAR *texts[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT])
+{
+    UINT modifiers, key;
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+        {
+            if (texts[modifiers][key])
+                HeapFree(GetProcessHeap(), 0, texts[modifiers][key]);
+            texts[modifiers][key] = NULL;
+        }
+}
+
+static BOOL rwp_set_shortcut_text(
+    WCHAR *texts[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT],
+    UINT modifiers, UINT key, LPCWSTR value)
+{
+    WCHAR *copy = NULL;
+    UINT length;
+    if (modifiers >= RWP_SHORTCUT_MODIFIER_COUNT || key >= RWP_SHORTCUT_KEY_COUNT)
+        return FALSE;
+    length = value ? (UINT)lstrlenW(value) : 0;
+    if (length > RWP_SHORTCUT_TEXT_MAX) return FALSE;
+    if (length)
+    {
+        copy = HeapAlloc(GetProcessHeap(), 0, (length + 1) * sizeof(WCHAR));
+        if (!copy) return FALSE;
+        memcpy(copy, value, (length + 1) * sizeof(WCHAR));
+    }
+    if (texts[modifiers][key])
+        HeapFree(GetProcessHeap(), 0, texts[modifiers][key]);
+    texts[modifiers][key] = copy;
+    return TRUE;
+}
+
+static BOOL rwp_copy_shortcut_texts(
+    WCHAR *destination[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT],
+    WCHAR *source[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT])
+{
+    UINT modifiers, key;
+    rwp_clear_shortcut_texts(destination);
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+            if (source[modifiers][key] &&
+                !rwp_set_shortcut_text(destination, modifiers, key,
+                                       source[modifiers][key]))
+            {
+                rwp_clear_shortcut_texts(destination);
+                return FALSE;
+            }
+    return TRUE;
+}
+
+static BOOL rwp_default_shortcut_assignments(
+    RWP_SHORTCUT_ASSIGNMENTS *bindings,
+    WCHAR *texts[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT])
+{
+    ZeroMemory(bindings, sizeof(*bindings));
+    rwp_clear_shortcut_texts(texts);
+    bindings->keys[RWP_SHORTCUT_ALT]['A'] = ID_INSERT_TEXT;
+    return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
+}
+
+static BOOL rwp_shortcut_texts_equal(void)
+{
+    UINT modifiers, key;
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+        {
+            LPCWSTR oldText = rwpShortcutText[modifiers][key];
+            LPCWSTR newText = rwpShortcutDraftText[modifiers][key];
+            if (lstrcmpW(oldText ? oldText : L"", newText ? newText : L""))
+                return FALSE;
+        }
+    return TRUE;
+}
+
 static UINT rwpShortcutDraftChord;
 static HFONT rwpShortcutStatusBoldFont;
 static ACCEL *rwpBuiltInAccelerators;
@@ -17716,8 +17816,11 @@ static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
             return TRUE;
         if (control)
             return key == VK_DELETE || (key == VK_F12 && shift);
+        /* Alt+A was a built-in accelerator before it became configurable.
+         * Keep it available even in translations with an Alt+A menu label. */
         return key == 'X' || key == VK_BACK ||
-            rwp_find_menu_mnemonic((WCHAR)MapVirtualKeyW(key, MAPVK_VK_TO_CHAR)) >= 0;
+            ((key != 'A' || shift) &&
+             rwp_find_menu_mnemonic((WCHAR)MapVirtualKeyW(key, MAPVK_VK_TO_CHAR)) >= 0);
     }
 
     if (control)
@@ -17752,12 +17855,167 @@ static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
     return FALSE;
 }
 
+/* Keep conflicting assignments out of both legacy and v2 settings. */
+static void rwp_apply_shortcut_bindings(const RWP_SHORTCUT_ASSIGNMENTS *saved)
+{
+    UINT slot, modifiers, key;
+    for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
+        if (rwp_shortcut_action_index(saved->mouse[slot]) &&
+            saved->mouse[slot] != ID_INSERT_TEXT)
+            rwpShortcutCommands.mouse[slot] = saved->mouse[slot];
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+        {
+            DWORD action = saved->keys[modifiers][key];
+            if (rwp_shortcut_action_index(action) &&
+                rwp_shortcut_key_supported(key, modifiers) &&
+                !rwp_shortcut_key_in_use(key, modifiers))
+                rwpShortcutCommands.keys[modifiers][key] = action;
+        }
+}
+
+/* Validate the whole versioned blob before accepting it. An invalid or
+ * incomplete value falls back to existing saved shortcuts and Alt+A=@. */
+static BOOL rwp_load_shortcut_assignments_v2(void)
+{
+    BYTE *buffer;
+    RWP_SHORTCUT_BLOB_HEADER header;
+    DWORD size = 0, readSize, recordIndex;
+    size_t offset;
+    BOOL valid = FALSE;
+    if (!rwp_read_binary_option(rwpShortcutOptionV2, NULL, &size) ||
+        size < sizeof(header) || size > 2 * 1024 * 1024)
+        return FALSE;
+    buffer = HeapAlloc(GetProcessHeap(), 0, size);
+    if (!buffer) return FALSE;
+    readSize = size;
+    if (!rwp_read_binary_option(rwpShortcutOptionV2, buffer, &readSize) ||
+        readSize != size)
+        goto done;
+    memcpy(&header, buffer, sizeof(header));
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC ||
+        header.textCount > RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT)
+        goto done;
+    offset = sizeof(header);
+    for (recordIndex = 0; recordIndex < header.textCount; ++recordIndex)
+    {
+        RWP_SHORTCUT_BLOB_TEXT record;
+        const WCHAR *value;
+        UINT modifiers, key, character;
+        if (size - offset < sizeof(record)) goto done;
+        memcpy(&record, buffer + offset, sizeof(record));
+        offset += sizeof(record);
+        modifiers = HIWORD(record.chord);
+        key = LOWORD(record.chord);
+        if (record.length == 0 || record.length > RWP_SHORTCUT_TEXT_MAX ||
+            modifiers >= RWP_SHORTCUT_MODIFIER_COUNT ||
+            key >= RWP_SHORTCUT_KEY_COUNT ||
+            header.assignments.keys[modifiers][key] != ID_INSERT_TEXT ||
+            size - offset < (record.length + 1) * sizeof(WCHAR))
+            goto done;
+        value = (const WCHAR *)(buffer + offset);
+        if (value[record.length] != 0) goto done;
+        for (character = 0; character < record.length; ++character)
+            if (value[character] == 0) goto done;
+        offset += (record.length + 1) * sizeof(WCHAR);
+    }
+    if (offset != size) goto done;
+    ZeroMemory(&rwpShortcutCommands, sizeof(rwpShortcutCommands));
+    rwp_clear_shortcut_texts(rwpShortcutText);
+    rwp_apply_shortcut_bindings(&header.assignments);
+    offset = sizeof(header);
+    for (recordIndex = 0; recordIndex < header.textCount; ++recordIndex)
+    {
+        RWP_SHORTCUT_BLOB_TEXT record;
+        UINT modifiers, key;
+        memcpy(&record, buffer + offset, sizeof(record));
+        offset += sizeof(record);
+        modifiers = HIWORD(record.chord);
+        key = LOWORD(record.chord);
+        if (rwpShortcutCommands.keys[modifiers][key] == ID_INSERT_TEXT &&
+            !rwp_set_shortcut_text(rwpShortcutText, modifiers, key,
+                                   (const WCHAR *)(buffer + offset)))
+        {
+            rwp_clear_shortcut_texts(rwpShortcutText);
+            goto done;
+        }
+        offset += (record.length + 1) * sizeof(WCHAR);
+    }
+    /* A damaged v2 value must not leave insertion commands without text. */
+    for (recordIndex = 0; recordIndex < RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT;
+         ++recordIndex)
+    {
+        UINT modifiers = recordIndex / RWP_SHORTCUT_KEY_COUNT;
+        UINT key = recordIndex % RWP_SHORTCUT_KEY_COUNT;
+        if (rwpShortcutCommands.keys[modifiers][key] == ID_INSERT_TEXT &&
+            !rwpShortcutText[modifiers][key])
+            goto done;
+    }
+    valid = TRUE;
+done:
+    if (!valid)
+    {
+        rwp_clear_shortcut_texts(rwpShortcutText);
+        ZeroMemory(&rwpShortcutCommands, sizeof(rwpShortcutCommands));
+    }
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return valid;
+}
+
+/* Serialize a single registry value, so the binding and its Unicode text
+ * are never saved as separate, potentially inconsistent preferences. */
+static BOOL rwp_save_shortcut_assignments_v2(void)
+{
+    size_t size = sizeof(RWP_SHORTCUT_BLOB_HEADER), offset;
+    DWORD count = 0;
+    UINT modifiers, key;
+    BYTE *buffer;
+    RWP_SHORTCUT_BLOB_HEADER header;
+    BOOL saved;
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+            if (rwpShortcutDraft.keys[modifiers][key] == ID_INSERT_TEXT)
+            {
+                LPCWSTR value = rwpShortcutDraftText[modifiers][key];
+                if (!value || !*value) return FALSE;
+                size += sizeof(RWP_SHORTCUT_BLOB_TEXT) +
+                        ((size_t)lstrlenW(value) + 1) * sizeof(WCHAR);
+                ++count;
+            }
+    if (size > 2 * 1024 * 1024) return FALSE;
+    buffer = HeapAlloc(GetProcessHeap(), 0, size);
+    if (!buffer) return FALSE;
+    header.magic = RWP_SHORTCUT_BLOB_MAGIC;
+    header.textCount = count;
+    header.assignments = rwpShortcutDraft;
+    memcpy(buffer, &header, sizeof(header));
+    offset = sizeof(header);
+    for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+            if (rwpShortcutDraft.keys[modifiers][key] == ID_INSERT_TEXT)
+            {
+                LPCWSTR value = rwpShortcutDraftText[modifiers][key];
+                RWP_SHORTCUT_BLOB_TEXT record;
+                size_t bytes;
+                record.chord = MAKELONG(key, modifiers);
+                record.length = lstrlenW(value);
+                bytes = (record.length + 1) * sizeof(WCHAR);
+                memcpy(buffer + offset, &record, sizeof(record));
+                offset += sizeof(record);
+                memcpy(buffer + offset, value, bytes);
+                offset += bytes;
+            }
+    saved = rwp_write_binary_option(rwpShortcutOptionV2, buffer, (DWORD)size);
+    HeapFree(GetProcessHeap(), 0, buffer);
+    return saved;
+}
+
 static void rwp_load_shortcut_assignments(HACCEL table)
 {
     RWP_SHORTCUT_ASSIGNMENTS saved;
     DWORD legacy[RWP_MOUSE_SHORTCUT_COUNT + VK_F9 - VK_F1 + 1];
     DWORD size = sizeof(saved);
-    UINT slot, modifiers, key;
+    UINT slot;
     int count = CopyAcceleratorTableW(table, NULL, 0);
 
     if (count > 0)
@@ -17767,20 +18025,11 @@ static void rwp_load_shortcut_assignments(HACCEL table)
             rwpBuiltInAcceleratorCount =
                 CopyAcceleratorTableW(table, rwpBuiltInAccelerators, count);
     }
+    if (rwp_load_shortcut_assignments_v2()) return;
+    rwp_default_shortcut_assignments(&rwpShortcutCommands, rwpShortcutText);
     if (rwp_read_binary_option(rwpShortcutOption, &saved, &size) && size == sizeof(saved))
     {
-        for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
-            if (rwp_shortcut_action_index(saved.mouse[slot]))
-                rwpShortcutCommands.mouse[slot] = saved.mouse[slot];
-        for (modifiers = 0; modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
-            for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
-            {
-                DWORD action = saved.keys[modifiers][key];
-                if (rwp_shortcut_action_index(action) &&
-                    rwp_shortcut_key_supported(key, modifiers) &&
-                    !rwp_shortcut_key_in_use(key, modifiers))
-                    rwpShortcutCommands.keys[modifiers][key] = action;
-            }
+        rwp_apply_shortcut_bindings(&saved);
         return;
     }
 
@@ -17831,11 +18080,23 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
     if (!action || rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
         return FALSE;
     if (!(message->lParam & (1UL << 30)))
-        rwp_execute_editor_shortcut(hEditorWnd, action, NULL);
+    {
+        if (action == ID_INSERT_TEXT)
+        {
+            LPCWSTR value = rwpShortcutText[HIWORD(chord)][LOWORD(chord)];
+            /* Rich Edit uses the current insertion format and creates a
+             * normal undo entry, even when selected text is replaced. */
+            if (value && *value &&
+                !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+                SendMessageW(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)value);
+        }
+        else
+            rwp_execute_editor_shortcut(hEditorWnd, action, NULL);
+    }
     return TRUE;
 }
 
-static void rwp_fill_shortcut_actions(HWND combo, BOOL italian)
+static void rwp_fill_shortcut_actions(HWND combo, BOOL italian, BOOL keyboard)
 {
     size_t i;
     int height = rwp_dialog_input_height(combo);
@@ -17846,7 +18107,11 @@ static void rwp_fill_shortcut_actions(HWND combo, BOOL italian)
     }
     for (i = 0; i < sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0]); ++i)
     {
-        LRESULT row = SendMessageW(combo, CB_ADDSTRING, 0,
+        LRESULT row;
+        /* Insertion text is associated with individual keyboard chords. */
+        if (!keyboard && rwpShortcutActions[i].command == ID_INSERT_TEXT)
+            continue;
+        row = SendMessageW(combo, CB_ADDSTRING, 0,
             (LPARAM)(italian ? rwpShortcutActions[i].italian :
                                rwpShortcutActions[i].english));
         if (row >= 0)
@@ -17932,8 +18197,18 @@ static void rwp_fill_shortcut_list(HWND dialog)
                 WCHAR label[64], rowText[192];
                 LRESULT row;
                 rwp_format_shortcut_chord(chord, label);
-                wsprintfW(rowText, L"%s   %s", label, italian ?
-                    rwpShortcutActions[index].italian : rwpShortcutActions[index].english);
+                if (action == ID_INSERT_TEXT && rwpShortcutDraftText[modifiers][key])
+                {
+                    WCHAR preview[33];
+                    lstrcpynW(preview, rwpShortcutDraftText[modifiers][key],
+                              sizeof(preview) / sizeof(preview[0]));
+                    wsprintfW(rowText, L"%s   %s: %s", label,
+                        italian ? rwpShortcutActions[index].italian :
+                                  rwpShortcutActions[index].english, preview);
+                }
+                else
+                    wsprintfW(rowText, L"%s   %s", label, italian ?
+                        rwpShortcutActions[index].italian : rwpShortcutActions[index].english);
                 row = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)rowText);
                 if (row >= 0) SendMessageW(list, LB_SETITEMDATA, row, chord);
             }
@@ -17943,13 +18218,89 @@ static void rwp_fill_shortcut_list(HWND dialog)
     InvalidateRect(list, NULL, TRUE);
 }
 
+/* The text payload is edited in a separate modal window so the shortcut
+ * settings layout stays fixed, regardless of the selected command. */
+typedef struct
+{
+    UINT chord;
+    WCHAR value[RWP_SHORTCUT_TEXT_MAX + 1];
+} RWP_SHORTCUT_TEXT_INPUT;
+
+static INT_PTR CALLBACK rwp_shortcut_insert_text_proc(HWND dialog, UINT message,
+                                                     WPARAM wParam, LPARAM lParam)
+{
+    RWP_SHORTCUT_TEXT_INPUT *input =
+        (RWP_SHORTCUT_TEXT_INPUT *)GetWindowLongPtrW(dialog, DWLP_USER);
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        WCHAR chordLabel[64], title[128];
+        input = (RWP_SHORTCUT_TEXT_INPUT *)lParam;
+        SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+        rwp_theme_dialog(dialog);
+        if (italian)
+        {
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_INSERT_TEXT_LABEL, L"Testo da inserire:");
+            SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
+        }
+        if (input)
+        {
+            rwp_format_shortcut_chord(input->chord, chordLabel);
+            wsprintfW(title, L"%s - %s",
+                italian ? L"Inserisci testo" : L"Insert text", chordLabel);
+            SetWindowTextW(dialog, title);
+            SetDlgItemTextW(dialog, IDC_SHORTCUT_INSERT_TEXT, input->value);
+        }
+        SendDlgItemMessageW(dialog, IDC_SHORTCUT_INSERT_TEXT, EM_LIMITTEXT,
+                            RWP_SHORTCUT_TEXT_MAX, 0);
+        SetFocus(GetDlgItem(dialog, IDC_SHORTCUT_INSERT_TEXT));
+        SendDlgItemMessageW(dialog, IDC_SHORTCUT_INSERT_TEXT, EM_SETSEL, 0, -1);
+        return FALSE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK && input)
+        {
+            WCHAR value[RWP_SHORTCUT_TEXT_MAX + 1];
+            GetDlgItemTextW(dialog, IDC_SHORTCUT_INSERT_TEXT, value,
+                            sizeof(value) / sizeof(value[0]));
+            if (!value[0])
+            {
+                MessageBoxW(dialog,
+                    italian ? L"Inserisci il testo da associare alla combinazione." :
+                              L"Enter the text to associate with this shortcut.",
+                    wszAppTitle, MB_OK | MB_ICONINFORMATION);
+                SetFocus(GetDlgItem(dialog, IDC_SHORTCUT_INSERT_TEXT));
+                return TRUE;
+            }
+            lstrcpyW(input->value, value);
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        EndDialog(dialog, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
 static void rwp_update_shortcut_buttons(HWND dialog)
 {
     UINT chord = rwpShortcutDraftChord;
     DWORD oldAction = chord ? rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] : 0;
     DWORD action = rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION);
     EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ACTION), chord != 0);
-    EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ASSIGN), chord && action != oldAction);
+    /* Allow reopening the text dialog even when Insert text is already bound. */
+    EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ASSIGN),
+                 chord && (action == ID_INSERT_TEXT || action != oldAction));
     EnableWindow(GetDlgItem(dialog, IDC_SHORTCUT_KEY_REMOVE), oldAction != 0);
 }
 
@@ -18005,12 +18356,42 @@ static BOOL rwp_capture_shortcut_key(HWND dialog, const MSG *message)
     return TRUE;
 }
 
-static void rwp_store_shortcut_key_action(HWND dialog)
+static BOOL rwp_store_shortcut_key_action(HWND dialog)
 {
     UINT chord = rwpShortcutDraftChord;
-    if (chord && !rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
-        rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] =
-            rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION);
+    DWORD action;
+    if (!chord || rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
+        return TRUE;
+    action = rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION);
+    if (action == ID_INSERT_TEXT)
+    {
+        RWP_SHORTCUT_TEXT_INPUT input;
+        LPCWSTR oldText = rwpShortcutDraftText[HIWORD(chord)][LOWORD(chord)];
+        INT_PTR result;
+        input.chord = chord;
+        lstrcpynW(input.value, oldText ? oldText : L"",
+                  sizeof(input.value) / sizeof(input.value[0]));
+        result = DialogBoxParamW(GetModuleHandleW(NULL),
+            MAKEINTRESOURCEW(IDD_SHORTCUT_INSERT_TEXT), dialog,
+            rwp_shortcut_insert_text_proc, (LPARAM)&input);
+        if (result != IDOK)
+        {
+            if (result == -1)
+                rwp_report_settings_save_error(dialog);
+            return FALSE; /* Cancel keeps the current assignment intact. */
+        }
+        if (!rwp_set_shortcut_text(rwpShortcutDraftText,
+                                   HIWORD(chord), LOWORD(chord), input.value))
+        {
+            rwp_report_settings_save_error(dialog);
+            return FALSE;
+        }
+    }
+    else
+        rwp_set_shortcut_text(rwpShortcutDraftText,
+                              HIWORD(chord), LOWORD(chord), NULL);
+    rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] = action;
+    return TRUE;
 }
 
 static void rwp_refresh_shortcut_choices(HWND dialog)
@@ -18055,10 +18436,18 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
             SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
         }
         rwpShortcutDraft = rwpShortcutCommands;
+        rwpShortcutDraftChord = 0;
+        if (!rwp_copy_shortcut_texts(rwpShortcutDraftText, rwpShortcutText))
+        {
+            rwp_report_settings_save_error(dialog);
+            DestroyWindow(dialog);
+            return TRUE;
+        }
         for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
             rwp_fill_shortcut_actions(GetDlgItem(dialog, rwpShortcutMouseControls[slot]),
-                                      italian);
-        rwp_fill_shortcut_actions(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ACTION), italian);
+                                      italian, FALSE);
+        rwp_fill_shortcut_actions(GetDlgItem(dialog, IDC_SHORTCUT_KEY_ACTION),
+                                  italian, TRUE);
         rwp_refresh_shortcut_choices(dialog);
         return TRUE;
     }
@@ -18094,7 +18483,7 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
         }
         if (command == IDC_SHORTCUT_KEY_ASSIGN)
         {
-            rwp_store_shortcut_key_action(dialog);
+            if (!rwp_store_shortcut_key_action(dialog)) return TRUE;
             rwp_fill_shortcut_list(dialog);
             rwp_update_shortcut_buttons(dialog);
             return TRUE;
@@ -18103,13 +18492,17 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
         {
             UINT chord = rwpShortcutDraftChord;
             rwpShortcutDraft.keys[HIWORD(chord)][LOWORD(chord)] = 0;
+            rwp_set_shortcut_text(rwpShortcutDraftText,
+                                  HIWORD(chord), LOWORD(chord), NULL);
             rwp_show_shortcut_chord(dialog, chord);
             rwp_fill_shortcut_list(dialog);
             return TRUE;
         }
         if (command == IDC_SHORTCUT_RESET)
         {
-            ZeroMemory(&rwpShortcutDraft, sizeof(rwpShortcutDraft));
+            if (!rwp_default_shortcut_assignments(&rwpShortcutDraft,
+                                                   rwpShortcutDraftText))
+                rwp_report_settings_save_error(dialog);
             rwp_refresh_shortcut_choices(dialog);
             return TRUE;
         }
@@ -18118,16 +18511,25 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
             for (slot = 0; slot < RWP_MOUSE_SHORTCUT_COUNT; ++slot)
                 rwpShortcutDraft.mouse[slot] =
                     rwp_selected_shortcut_action(dialog, rwpShortcutMouseControls[slot]);
-            rwp_store_shortcut_key_action(dialog);
-            if (memcmp(&rwpShortcutDraft, &rwpShortcutCommands, sizeof(rwpShortcutDraft)))
+            /* Already-assigned Insert text chords must not reopen a dialog
+             * merely because the user confirms the settings window. */
+            if (rwpShortcutDraftChord &&
+                rwpShortcutDraft.keys[HIWORD(rwpShortcutDraftChord)]
+                                     [LOWORD(rwpShortcutDraftChord)] !=
+                    rwp_selected_shortcut_action(dialog, IDC_SHORTCUT_KEY_ACTION) &&
+                !rwp_store_shortcut_key_action(dialog)) return TRUE;
+            if (memcmp(&rwpShortcutDraft, &rwpShortcutCommands, sizeof(rwpShortcutDraft)) ||
+                !rwp_shortcut_texts_equal())
             {
-                if (!rwp_write_binary_option(rwpShortcutOption, &rwpShortcutDraft,
-                                              sizeof(rwpShortcutDraft)))
+                if (!rwp_save_shortcut_assignments_v2())
                 {
                     rwp_report_settings_save_error(dialog);
                     return TRUE;
                 }
                 rwpShortcutCommands = rwpShortcutDraft;
+                rwp_clear_shortcut_texts(rwpShortcutText);
+                memcpy(rwpShortcutText, rwpShortcutDraftText, sizeof(rwpShortcutText));
+                ZeroMemory(rwpShortcutDraftText, sizeof(rwpShortcutDraftText));
             }
             DestroyWindow(dialog);
             return TRUE;
@@ -18142,6 +18544,7 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
         DestroyWindow(dialog);
         return TRUE;
     case WM_NCDESTROY:
+        rwp_clear_shortcut_texts(rwpShortcutDraftText);
         if (rwpShortcutSettingsWnd == dialog) rwpShortcutSettingsWnd = NULL;
         if (rwpShortcutStatusBoldFont)
         {
@@ -26363,15 +26766,6 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         rwp_open_general_font_resizer();
         break;
 
-    case ID_INSERT_AT_SIGN:
-        /* Alt+A: type a literal '@' in the editor, using the current
-         * insertion format and preserving the normal Rich Edit undo action.
-         * Do not insert into the document while a toolbar input has focus. */
-        if (hEditorWnd && GetFocus() == hEditorWnd &&
-            !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
-            SendMessageW(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)L"@");
-        break;
-
     case ID_INSERT_SYMBOL:
         rwp_open_symbols_dialog();
         break;
@@ -28004,6 +28398,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     destroy_color_swatches();
     if (rwpMainMenu) DestroyMenu(rwpMainMenu);
     if (rwpBuiltInAccelerators) HeapFree(GetProcessHeap(), 0, rwpBuiltInAccelerators);
+    rwp_clear_shortcut_texts(rwpShortcutText);
     if (rwpOleInitialized) OleUninitialize();
     return 0;
 }
