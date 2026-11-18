@@ -17554,6 +17554,8 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+W = Allinea al centro\r\n"
             L"Ctrl+E = Allinea a destra\r\n"
             L"Alt+Q = Applica l'ultimo colore del testo\r\n"
+            L"Alt+W = Apri selezione colore del testo (predefinito; configurabile)\r\n"
+            L"Selezione colori: Su/Destra = su; Giù/Sinistra = giù; Invio = applica; Esc = annulla\r\n"
             L"Alt+A = Inserisci testo (predefinito: @; configurabile)"
             :
             L"Ctrl+N = New\r\n"
@@ -17580,6 +17582,8 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+W = Align center\r\n"
             L"Ctrl+E = Align right\r\n"
             L"Alt+Q = Apply last text color\r\n"
+            L"Alt+W = Open text color picker (default; configurable)\r\n"
+            L"Color picker: Up/Right = up; Down/Left = down; Enter = apply; Esc = cancel\r\n"
             L"Alt+A = Insert text (default: @; configurable)");
         SendDlgItemMessageW(dialog, IDC_SHORTCUTS_TEXT, EM_SETSEL, 0, 0);
         SendDlgItemMessageW(dialog, IDC_SHORTCUTS_TEXT, EM_SCROLL, SB_TOP, 0);
@@ -17632,6 +17636,28 @@ static const struct
     {0, L"Unassigned", L"Non assegnato"},
     {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
     {ID_FORMAT_COLOR, L"Reapply last text color", L"Applica l'ultimo colore del testo"},
+    {ID_FORMAT_COLOR_PICK, L"Open text color picker", L"Apri selezione colore del testo"},
+    {ID_COLOR_WHITE, L"Text color: White", L"Colore del testo: Bianco"},
+    {ID_COLOR_BLACK, L"Text color: Black", L"Colore del testo: Nero"},
+    {ID_COLOR_LIME, L"Text color: Green", L"Colore del testo: Verde"},
+    {ID_COLOR_YELLOW, L"Text color: Yellow", L"Colore del testo: Giallo"},
+    {ID_COLOR_AQUA, L"Text color: Cyan", L"Colore del testo: Ciano"},
+    {ID_COLOR_FUCHSIA, L"Text color: Magenta", L"Colore del testo: Magenta"},
+    {ID_COLOR_BLUE, L"Text color: Blue", L"Colore del testo: Blu"},
+    {ID_COLOR_LIGHT_BLUE, L"Text color: Light blue", L"Colore del testo: Azzurro"},
+    {ID_COLOR_DARK_BLUE, L"Text color: Dark blue", L"Colore del testo: Blu scuro"},
+    {ID_COLOR_RED, L"Text color: Red", L"Colore del testo: Rosso"},
+    {ID_COLOR_ORANGE, L"Text color: Orange", L"Colore del testo: Arancione"},
+    {ID_COLOR_PINK, L"Text color: Pink", L"Colore del testo: Rosa"},
+    {ID_COLOR_GRAY, L"Text color: Gray", L"Colore del testo: Grigio"},
+    {ID_COLOR_MAROON, L"Text color: Maroon", L"Colore del testo: Bordeaux"},
+    {ID_COLOR_GREEN, L"Text color: Dark green", L"Colore del testo: Verde scuro"},
+    {ID_COLOR_OLIVE, L"Text color: Olive", L"Colore del testo: Verde oliva"},
+    {ID_COLOR_NAVY, L"Text color: Navy", L"Colore del testo: Blu navy"},
+    {ID_COLOR_PURPLE, L"Text color: Purple", L"Colore del testo: Viola"},
+    {ID_COLOR_TEAL, L"Text color: Teal", L"Colore del testo: Verde acqua"},
+    {ID_COLOR_SILVER, L"Text color: Silver", L"Colore del testo: Argento"},
+    {ID_COLOR_AUTOMATIC, L"Text color: Default Color", L"Colore del testo: Colore predefinito"},
     {ID_FORMAT_BOLD, L"Toggle bold", L"Attiva/disattiva grassetto"},
     {ID_FORMAT_ITALIC, L"Toggle italic", L"Attiva/disattiva corsivo"},
     {ID_FORMAT_UNDERLINE, L"Toggle underline", L"Attiva/disattiva sottolineato"},
@@ -17654,11 +17680,12 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
-/* Version 2 saves the original assignment table and the Unicode text for
- * only the Insert text chords. The original registry value is still read for
- * migration, without changing its serialized structure. */
+/* Version 3 retains version 2's assignment table and Insert text payloads.
+ * Its magic also records that the Alt+W default has been considered, so an
+ * explicitly removed shortcut stays removed after restarting the editor. */
 #define RWP_SHORTCUT_TEXT_MAX 512
-#define RWP_SHORTCUT_BLOB_MAGIC 0x32535752UL /* RWS2 */
+#define RWP_SHORTCUT_BLOB_MAGIC_V2 0x32535752UL /* RWS2 */
+#define RWP_SHORTCUT_BLOB_MAGIC 0x33535752UL /* RWS3 */
 typedef struct
 {
     DWORD magic;
@@ -17738,6 +17765,7 @@ static BOOL rwp_default_shortcut_assignments(
     ZeroMemory(bindings, sizeof(*bindings));
     rwp_clear_shortcut_texts(texts);
     bindings->keys[RWP_SHORTCUT_ALT]['A'] = ID_INSERT_TEXT;
+    bindings->keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
     return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
 }
 
@@ -17874,8 +17902,8 @@ static void rwp_apply_shortcut_bindings(const RWP_SHORTCUT_ASSIGNMENTS *saved)
         }
 }
 
-/* Validate the whole versioned blob before accepting it. An invalid or
- * incomplete value falls back to existing saved shortcuts and Alt+A=@. */
+/* Validate the whole versioned blob before accepting it. Older blobs acquire
+ * Alt+W only when it is free; existing bindings and insertion text survive. */
 static BOOL rwp_load_shortcut_assignments_v2(void)
 {
     BYTE *buffer;
@@ -17893,7 +17921,8 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         readSize != size)
         goto done;
     memcpy(&header, buffer, sizeof(header));
-    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC ||
+    if ((header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V2) ||
         header.textCount > RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT)
         goto done;
     offset = sizeof(header);
@@ -17941,7 +17970,7 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         }
         offset += (record.length + 1) * sizeof(WCHAR);
     }
-    /* A damaged v2 value must not leave insertion commands without text. */
+    /* A damaged versioned value must not leave insertion commands without text. */
     for (recordIndex = 0; recordIndex < RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT;
          ++recordIndex)
     {
@@ -17951,6 +17980,10 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
             !rwpShortcutText[modifiers][key])
             goto done;
     }
+    if (header.magic == RWP_SHORTCUT_BLOB_MAGIC_V2 &&
+        !rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] &&
+        !rwp_shortcut_key_in_use('W', RWP_SHORTCUT_ALT))
+        rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
     valid = TRUE;
 done:
     if (!valid)
@@ -19412,6 +19445,56 @@ static void decorate_color_menu(HMENU hMenu)
         item.hbmpItem = hColorSwatches[index];
         SetMenuItemInfoW(hMenu, (UINT)i, TRUE, &item);
     }
+}
+
+/* A color palette is one vertical list: horizontal arrows share the same
+ * previous/next actions as Up/Down. Install this filter only while this
+ * text-color popup is running; other menus retain their native key handling. */
+static LRESULT CALLBACK rwp_text_color_menu_filter(int code, WPARAM wParam,
+                                                  LPARAM lParam)
+{
+    if (code == MSGF_MENU)
+    {
+        MSG *message = (MSG *)lParam;
+        if (message->message == WM_KEYDOWN || message->message == WM_SYSKEYDOWN)
+        {
+            if (message->wParam == VK_RIGHT) message->wParam = VK_UP;
+            else if (message->wParam == VK_LEFT) message->wParam = VK_DOWN;
+        }
+    }
+    return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
+/* Reuse the existing palette and its configured order. Native menu tracking
+ * keeps the editor selection intact and supplies Enter/Escape behavior. */
+static UINT rwp_track_text_color_palette(HWND owner, int x, int y, BOOL keyboard)
+{
+    HMENU popup = GetSubMenu(hColorPopupMenu, 0);
+    HHOOK filter;
+    UINT command;
+    if (!popup) return 0;
+    decorate_color_menu(popup);
+    filter = SetWindowsHookExW(WH_MSGFILTER, rwp_text_color_menu_filter,
+                               NULL, GetCurrentThreadId());
+    if (!filter)
+    {
+        const BOOL italian =
+            PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+        MessageBoxW(owner,
+            italian ? L"Impossibile inizializzare la navigazione da tastiera dei colori."
+                    : L"Could not initialize color-picker keyboard navigation.",
+            wszAppTitle, MB_OK | MB_ICONERROR);
+        return 0;
+    }
+    /* Queue the initial selection for the popup's modal loop, not the main
+     * editor loop. Home selects the first item even if the mouse is over
+     * another row, and native menu tracking skips separators. */
+    if (keyboard) PostMessageW(owner, WM_KEYDOWN, VK_HOME, 0);
+    command = TrackPopupMenu(popup, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON |
+                                    TPM_RETURNCMD | TPM_NONOTIFY,
+                            x, y, 0, owner, NULL);
+    UnhookWindowsHookEx(filter);
+    return command;
 }
 
 #define RWP_COLOR_ORDER_CAPACITY 128
@@ -26580,6 +26663,39 @@ static void rwp_remove_selection_formatting(void)
     SetFocus(hEditorWnd);
 }
 
+/* Fixed-color shortcuts and the picker share the exact same color operation,
+ * including Default Color, the last-color cache, and native formatting undo. */
+static void rwp_apply_palette_text_color(HWND editor, UINT command)
+{
+    CHARFORMAT2W format;
+    if (!editor || command < ID_COLOR_FIRST || command > ID_COLOR_LAST ||
+        (SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+        return;
+    ZeroMemory(&format, sizeof(format));
+    format.cbSize = sizeof(format);
+    format.dwMask = CFM_COLOR;
+    if (command == ID_COLOR_AUTOMATIC)
+    {
+        format.dwEffects = CFE_AUTOCOLOR;
+        rwpLastPickedTextColorValid = FALSE;
+    }
+    else
+    {
+        format.crTextColor = textcolors[command - ID_COLOR_FIRST];
+        rwpLastPickedTextColor = format.crTextColor;
+        rwpLastPickedTextColorValid = TRUE;
+    }
+    reset_background_history();
+    if (rwp_set_color_format_preserving_combining_sequences(editor, &format))
+    {
+        RedrawWindow(editor, NULL, NULL,
+                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        rwpRichFormattingChanged = TRUE;
+        rwp_record_selected_text_color(format.crTextColor,
+                                      command == ID_COLOR_AUTOMATIC);
+    }
+}
+
 static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 {
     HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
@@ -26595,6 +26711,14 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
             rwp_header_refresh_character_count();
             rwp_statusbar_update_editor_position();
         }
+        return 0;
+    }
+
+    /* Palette command IDs are stable, so saved fixed-color shortcuts keep
+     * their meaning even when the palette's display order is changed. */
+    if (LOWORD(wParam) >= ID_COLOR_FIRST && LOWORD(wParam) <= ID_COLOR_LAST)
+    {
+        rwp_apply_palette_text_color(hwndEditor, LOWORD(wParam));
         return 0;
     }
 
@@ -27047,58 +27171,30 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
     {
         HWND hReBarWnd = GetDlgItem(hWnd, IDC_REBAR);
         HWND hFormatBarWnd = GetDlgItem(hReBarWnd, IDC_FORMATBAR);
-        HMENU hPop;
         RECT itemrc;
         POINT pt;
         int mid;
-        int itemidx = SendMessageW(hFormatBarWnd, TB_COMMANDTOINDEX,
-                                   ID_FORMAT_COLOR_PICK, 0);
+        int itemidx = hFormatBarWnd ?
+            (int)SendMessageW(hFormatBarWnd, TB_COMMANDTOINDEX,
+                              ID_FORMAT_COLOR_PICK, 0) : -1;
 
-        if (itemidx < 0) break;
-        SendMessageW(hFormatBarWnd, TB_GETITEMRECT, itemidx, (LPARAM)&itemrc);
-        pt.x = itemrc.left;
-        pt.y = itemrc.bottom;
-        ClientToScreen(hFormatBarWnd, &pt);
-        hPop = GetSubMenu(hColorPopupMenu, 0);
-        decorate_color_menu(hPop);
-        mid = TrackPopupMenu(hPop, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON |
-                                  TPM_RETURNCMD | TPM_NONOTIFY,
-                             pt.x, pt.y, 0, hWnd, 0);
-        if (mid >= ID_COLOR_FIRST && mid <= ID_COLOR_LAST)
+        if (hFormatBarWnd && IsWindowVisible(hFormatBarWnd) && itemidx >= 0 &&
+            SendMessageW(hFormatBarWnd, TB_GETITEMRECT, itemidx, (LPARAM)&itemrc))
         {
-            CHARFORMAT2W fmt;
-            /* Supply only the property being changed. The original format
-             * is not needed: CFM_COLOR is the only requested edit and
-             * explicitly clearing CFE_AUTOCOLOR is essential. */
-            ZeroMemory(&fmt, sizeof(fmt));
-            fmt.cbSize = sizeof(fmt);
-            fmt.dwMask = CFM_COLOR;
-            if (mid != ID_COLOR_AUTOMATIC)
-            {
-                fmt.crTextColor = textcolors[mid - ID_COLOR_FIRST];
-                fmt.dwEffects = 0;
-                rwpLastPickedTextColor = fmt.crTextColor;
-                rwpLastPickedTextColorValid = TRUE;
-            }
-            else
-            {
-                fmt.dwEffects = CFE_AUTOCOLOR;
-                rwpLastPickedTextColorValid = FALSE;
-            }
-            reset_background_history();
-            if (rwp_set_color_format_preserving_combining_sequences(hwndEditor, &fmt))
-            {
-                /* On some Rich Edit builds the stored formatting changes
-                 * (and streams out as \cfN) while the cached display does
-                 * not repaint. Explicitly invalidate the editor after the
-                 * selection's new color is committed. */
-                RedrawWindow(hwndEditor, NULL, NULL,
-                             RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-                rwpRichFormattingChanged = TRUE;
-                rwp_record_selected_text_color(fmt.crTextColor,
-                                              mid == ID_COLOR_AUTOMATIC);
-            }
+            pt.x = itemrc.left;
+            pt.y = itemrc.bottom;
+            ClientToScreen(hFormatBarWnd, &pt);
         }
+        else
+        {
+            /* A keyboard command also works when the format bar is hidden. */
+            pt.x = pt.y = 8;
+            if (GetFocus() == hwndEditor) GetCaretPos(&pt);
+            ClientToScreen(hwndEditor, &pt);
+        }
+        mid = rwp_track_text_color_palette(hWnd, pt.x, pt.y, HIWORD(wParam) == 1);
+        rwp_apply_palette_text_color(hwndEditor, mid);
+        SetFocus(hwndEditor);
         break;
     }
 
