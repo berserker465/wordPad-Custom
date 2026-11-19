@@ -144,18 +144,22 @@ BEGIN
     PUSHBUTTON "Recover Bookmarks...", IDC_BOOKMARK_OPEN_RECOVERY, 225, 54, 97, 23
 END
 
-/* Recovery diagnoses unresolved internal URLs and changes all their links. */
-IDD_BOOKMARK_RECOVER DIALOGEX 0, 0, 350, 230
+/* Both bookmark tools share one dialog; imported RTF inspection is on demand. */
+IDD_BOOKMARK_RECOVER DIALOGEX 0, 0, 330, 243
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Recover Broken Bookmark Links"
+CAPTION "Bookmark Tools"
 FONT RWP_UI_FONT_PT, RWP_UI_FONT_FAMILY
 BEGIN
-    LTEXT "Unresolved bookmark targets (with link counts):", IDC_BOOKMARK_RECOVER_DESC, 9, 8, 332, 16
-    LISTBOX IDC_BOOKMARK_DEAD_LIST, 9, 26, 332, 103, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
-    LTEXT "Reassign selected target to an existing bookmark:", IDC_BOOKMARK_RECOVER_LABEL, 9, 137, 332, 18
-    COMBOBOX IDC_BOOKMARK_RECOVER_TO, 9, 156, 332, 112, CBS_DROPDOWN | CBS_SORT | WS_VSCROLL | WS_TABSTOP
-    DEFPUSHBUTTON "Reassign All Links", IDOK, 166, 198, 109, 21
-    PUSHBUTTON "Close", IDCANCEL, 283, 198, 58, 21
+    GROUPBOX "Recover Broken Bookmark Links", IDC_BOOKMARK_RECOVER_GROUP, 7, 6, 316, 163
+    LTEXT "Unresolved bookmark targets (with link counts):", IDC_BOOKMARK_RECOVER_DESC, 16, 19, 298, 13
+    LISTBOX IDC_BOOKMARK_DEAD_LIST, 16, 33, 298, 96, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
+    LTEXT "Reassign selected target to an existing bookmark:", IDC_BOOKMARK_RECOVER_LABEL, 16, 131, 298, 12
+    COMBOBOX IDC_BOOKMARK_RECOVER_TO, 16, 145, 181, 95, CBS_DROPDOWN | CBS_SORT | WS_VSCROLL | WS_TABSTOP
+    DEFPUSHBUTTON "Reassign Links", IDOK, 205, 144, 109, 20
+    GROUPBOX "Repair Imported RTF Bookmarks", IDC_BOOKMARK_REPAIR_GROUP, 7, 173, 316, 43
+    LTEXT "Converts incompatible imported bookmarks and their internal links. Scans only when requested.", IDC_BOOKMARK_REPAIR_DESC, 16, 184, 173, 27
+    PUSHBUTTON "Repair Imported Bookmarks...", IDC_BOOKMARK_REPAIR_RUN, 197, 185, 117, 21, WS_TABSTOP
+    PUSHBUTTON "Close", IDCANCEL, 256, 219, 58, 19
 END
 
 /* Bookmark dialogs; labels switch to Italian in code. */

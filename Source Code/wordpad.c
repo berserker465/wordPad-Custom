@@ -7437,10 +7437,17 @@ done:
     return changed;
 }
 
+/* The imported RTF repair runs only when its button is pressed. */
+static void rwp_bookmark_repair_imported_show(HWND owner);
+
 static void rwp_bookmark_recovery_fill(HWND dialog, RWP_BOOKMARK_RECOVERY *state)
 {
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     int i;
+    BOOL canRecover = state->count > 0 && rwpBookmarkCount > 0 &&
+        !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY);
     SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST, LB_RESETCONTENT, 0, 0);
+    SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_RESETCONTENT, 0, 0);
     for (i = 0; i < state->count; ++i)
     {
         WCHAR line[128];
@@ -7450,6 +7457,19 @@ static void rwp_bookmark_recovery_fill(HWND dialog, RWP_BOOKMARK_RECOVERY *state
     }
     if (state->count)
         SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST, LB_SETCURSEL, 0, 0);
+    for (i = 0; i < rwpBookmarkCount; ++i)
+        SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_ADDSTRING,
+                            0, (LPARAM)rwpBookmarks[i].name);
+    if (rwpBookmarkCount)
+        SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_SETCURSEL, 0, 0);
+    SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_DESC,
+        state->count ?
+            (italian ? L"Destinazioni non trovate (numero di collegamenti):" :
+                       L"Unresolved bookmark targets (with link counts):") :
+            (italian ? L"Nessun collegamento a segnalibri mancanti." :
+                       L"No unresolved bookmark links found."));
+    EnableWindow(GetDlgItem(dialog, IDC_BOOKMARK_RECOVER_TO), canRecover);
+    EnableWindow(GetDlgItem(dialog, IDOK), canRecover);
 }
 
 static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
@@ -7460,33 +7480,52 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
                                    GetWindowLongPtrW(dialog, DWLP_USER);
     if (message == WM_INITDIALOG)
     {
-        int i;
         state = (RWP_BOOKMARK_RECOVERY *)lParam;
         SetWindowLongPtrW(dialog, DWLP_USER, (LONG_PTR)state);
         rwp_theme_dialog(dialog);
         if (italian)
         {
-            SetWindowTextW(dialog, L"Recupera collegamenti a segnalibri");
-            SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_DESC,
-                L"Segnalibri non trovati (numero di collegamenti):");
+            SetWindowTextW(dialog, L"Strumenti segnalibri");
+            SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_GROUP,
+                L"Recupera collegamenti a segnalibri mancanti");
             SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_LABEL,
                 L"Riassegna a un segnalibro esistente:");
-            SetDlgItemTextW(dialog, IDOK, L"Riassegna tutti i collegamenti");
+            SetDlgItemTextW(dialog, IDOK, L"Riassegna collegamenti");
+            SetDlgItemTextW(dialog, IDC_BOOKMARK_REPAIR_GROUP,
+                L"Ripara segnalibri RTF importati");
+            SetDlgItemTextW(dialog, IDC_BOOKMARK_REPAIR_DESC,
+                L"Converte segnalibri importati incompatibili e relativi collegamenti. "
+                L"Il controllo viene eseguito solo su richiesta.");
+            SetDlgItemTextW(dialog, IDC_BOOKMARK_REPAIR_RUN,
+                L"Ripara segnalibri importati...");
             SetDlgItemTextW(dialog, IDCANCEL, L"Chiudi");
         }
         rwp_bookmark_recovery_fill(dialog, state);
-        for (i = 0; i < rwpBookmarkCount; ++i)
-            SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_ADDSTRING,
-                                0, (LPARAM)rwpBookmarks[i].name);
-        if (rwpBookmarkCount)
-            SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_SETCURSEL, 0, 0);
-        EnableWindow(GetDlgItem(dialog, IDOK), rwpBookmarkCount != 0 &&
-            !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY));
         return TRUE;
     }
     if (message == WM_COMMAND)
     {
         if (LOWORD(wParam) == IDCANCEL) { EndDialog(dialog, 0); return TRUE; }
+        if (LOWORD(wParam) == IDC_BOOKMARK_REPAIR_RUN && HIWORD(wParam) == BN_CLICKED)
+        {
+            RWP_BOOKMARK_RECOVERY refreshed;
+            /* No imported-bookmark scan occurs until the user chooses this.
+             * Keep the shared tools window open and refresh the orphaned-link
+             * list after the repair reloads the document. */
+            rwp_bookmark_repair_imported_show(dialog);
+            rwp_bookmarks_prune_deleted();
+            if (rwp_bookmark_collect_dead(&refreshed))
+            {
+                *state = refreshed;
+                rwp_bookmark_recovery_fill(dialog, state);
+            }
+            else
+                MessageBoxW(dialog, italian ?
+                    L"Impossibile aggiornare l'elenco dei collegamenti." :
+                    L"Unable to refresh the bookmark-link list.",
+                    L"Bookmark", MB_OK | MB_ICONWARNING);
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDOK)
         {
             int selected = (int)SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST,
@@ -7530,11 +7569,11 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
             *state = fresh;
             if (!state->count)
             {
+                rwp_bookmark_recovery_fill(dialog, state);
                 MessageBoxW(dialog, italian ?
                     L"Tutti i collegamenti ai segnalibri ora hanno una destinazione valida." :
                     L"All bookmark links now have valid destinations.",
                     L"Bookmark", MB_OK | MB_ICONINFORMATION);
-                EndDialog(dialog, 1);
             }
             else
             {
@@ -7566,14 +7605,425 @@ static void rwp_bookmark_recovery_show(void)
     if (!rwp_bookmark_collect_dead(state))
         MessageBoxW(hMainWnd, italian ? L"Impossibile esaminare i collegamenti RTF." :
             L"Could not scan the RTF hyperlinks.", L"Bookmark", MB_OK | MB_ICONWARNING);
-    else if (!state->count)
-        MessageBoxW(hMainWnd, italian ? L"Non ci sono collegamenti a segnalibri mancanti." :
-            L"No broken bookmark links were found.", L"Bookmark", MB_OK | MB_ICONINFORMATION);
     else
         DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_BOOKMARK_RECOVER),
                         hMainWnd, rwp_bookmark_recovery_proc, (LPARAM)state);
     HeapFree(GetProcessHeap(), 0, state);
     SetFocus(hEditorWnd);
+}
+
+/* -------------------------------------------------------------------------
+ * Repair imported bookmark conventions (on demand only).
+ *
+ * This deliberately does not change the native RTF scanner, bookmark-name
+ * validator or hyperlink navigation. The user invokes it from Bookmark Tools.
+ * It reads the unmodified RTF from disk and converts Google Docs' id.*
+ * identifiers to ordinary WordPad names in native bookmark groups AND their
+ * matching internal fldinst HYPERLINK destinations. The saved RTF then uses
+ * only WordPad's existing bookmark conventions.
+ * ------------------------------------------------------------------------- */
+/* The existing cloud metadata filter is defined later in this file. */
+static BOOL rwp_cloud_read_strip(BYTE *rtf, SIZE_T *length,
+                                 RWP_CLOUD_DOC *settings, BOOL *found);
+
+typedef struct RWP_BOOKMARK_REPAIR_ENTRY
+{
+    char oldName[RWP_BOOKMARK_NAME_LIMIT + 1];
+    char newName[RWP_BOOKMARK_NAME_LIMIT + 1];
+    int starts, ends;
+    SIZE_T links;
+} RWP_BOOKMARK_REPAIR_ENTRY;
+
+static BOOL rwp_bookmark_repair_google_name(const char *name)
+{
+    SIZE_T i, n;
+    if (!name || name[0] != 'i' || name[1] != 'd' || name[2] != '.')
+        return FALSE;
+    n = strlen(name);
+    if (n < 4 || n > RWP_BOOKMARK_NAME_LIMIT) return FALSE;
+    for (i = 3; i < n; ++i)
+        if (!((name[i] >= 'A' && name[i] <= 'Z') ||
+              (name[i] >= 'a' && name[i] <= 'z') ||
+              (name[i] >= '0' && name[i] <= '9') || name[i] == '_'))
+            return FALSE;
+    return TRUE;
+}
+
+/* Accept a complete, unescaped native marker group only. No document text is
+ * searched or changed. Returned name starts at the first identifier byte. */
+static BOOL rwp_bookmark_repair_marker(const BYTE *rtf, SIZE_T n, SIZE_T at,
+                                      BOOL start, char *name, SIZE_T *nameAt)
+{
+    static const char startPrefix[] = "{\\*\\bkmkstart ";
+    static const char endPrefix[] = "{\\*\\bkmkend ";
+    const char *prefix = start ? startPrefix : endPrefix;
+    SIZE_T length = strlen(prefix), cursor, used = 0;
+    if (at > n || n - at <= length || memcmp(rtf + at, prefix, length))
+        return FALSE;
+    cursor = at + length;
+    while (cursor < n && used < RWP_BOOKMARK_NAME_LIMIT &&
+           ((rtf[cursor] >= 'A' && rtf[cursor] <= 'Z') ||
+            (rtf[cursor] >= 'a' && rtf[cursor] <= 'z') ||
+            (rtf[cursor] >= '0' && rtf[cursor] <= '9') ||
+             rtf[cursor] == '_' || rtf[cursor] == '.'))
+        name[used++] = (char)rtf[cursor++];
+    name[used] = 0;
+    if (cursor >= n || rtf[cursor] != '}' || !used) return FALSE;
+    *nameAt = at + length;
+    return TRUE;
+}
+
+/* There must never be an ambiguous replacement or a name collision. Because
+ * only the third byte changes, RTF size/offsets and all unrelated data stay
+ * identical. The WordPad registry's own name validation is left untouched. */
+static BOOL rwp_bookmark_repair_choose_names(RWP_BOOKMARK_REPAIR_ENTRY *entries,
+                                              int count)
+{
+    static const char choices[] = "_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    int i, j;
+    for (i = 0; i < count; ++i)
+    {
+        SIZE_T k;
+        BOOL unique = FALSE;
+        for (k = 0; k < sizeof(choices) - 1; ++k)
+        {
+            WCHAR wide[RWP_BOOKMARK_NAME_LIMIT + 1];
+            SIZE_T pos;
+            BOOL collision = FALSE;
+            strcpy(entries[i].newName, entries[i].oldName);
+            entries[i].newName[2] = choices[k];
+            for (pos = 0; entries[i].newName[pos]; ++pos)
+                wide[pos] = (WCHAR)(unsigned char)entries[i].newName[pos];
+            wide[pos] = 0;
+            if (rwp_bookmark_index(wide) >= 0) collision = TRUE;
+            for (j = 0; j < i && !collision; ++j)
+                if (!_stricmp(entries[j].newName, entries[i].newName))
+                    collision = TRUE;
+            if (!collision) { unique = TRUE; break; }
+        }
+        if (!unique) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Build the candidate list without loading any alternative bookmark rules
+ * into the standard parser. All required pairs must exist exactly once. */
+static int rwp_bookmark_repair_collect(const BYTE *rtf, SIZE_T n,
+                                       RWP_BOOKMARK_REPAIR_ENTRY *entries)
+{
+    SIZE_T i;
+    int count = 0, j;
+    char name[RWP_BOOKMARK_NAME_LIMIT + 1];
+    SIZE_T nameAt;
+    for (i = 0; i < n; ++i)
+    {
+        if (!rwp_bookmark_repair_marker(rtf, n, i, TRUE, name, &nameAt) ||
+            !rwp_bookmark_repair_google_name(name)) continue;
+        for (j = 0; j < count; ++j)
+            if (!_stricmp(entries[j].oldName, name)) break;
+        if (j == count)
+        {
+            if (count >= RWP_BOOKMARK_LIMIT) return -1;
+            ZeroMemory(&entries[count], sizeof(entries[count]));
+            strcpy(entries[count].oldName, name);
+            ++count;
+        }
+        ++entries[j].starts;
+    }
+    for (i = 0; i < n; ++i)
+    {
+        if (!rwp_bookmark_repair_marker(rtf, n, i, FALSE, name, &nameAt) ||
+            !rwp_bookmark_repair_google_name(name)) continue;
+        for (j = 0; j < count; ++j)
+            if (!_stricmp(entries[j].oldName, name)) break;
+        if (j == count) return -1; /* A closing marker has no opening one. */
+        ++entries[j].ends;
+    }
+    if (!count) return 0;
+    if (count + rwpBookmarkCount > RWP_BOOKMARK_LIMIT) return -1;
+    for (j = 0; j < count; ++j)
+        if (entries[j].starts != 1 || entries[j].ends != 1)
+            return -1;
+    if (!rwp_bookmark_repair_choose_names(entries, count)) return -1;
+    return count;
+}
+
+/* The only changed byte is the dot in the name, both in native bookmark
+ * groups and in matching real fldinst hyperlink destinations. In particular,
+ * visible labels and strings that happen to mention id.* are untouched. */
+static BOOL rwp_bookmark_repair_patch(const BYTE *rtf, SIZE_T n,
+                                      RWP_BOOKMARK_REPAIR_ENTRY *entries,
+                                      int count, RTF_MEMORY *result)
+{
+    int j;
+    SIZE_T i;
+    static const char linkPrefix[] = "HYPERLINK \"#";
+    ZeroMemory(result, sizeof(*result));
+    result->data = HeapAlloc(GetProcessHeap(), 0, n + 1);
+    if (!result->data) return FALSE;
+    memcpy(result->data, rtf, n);
+    result->data[n] = 0;
+    result->used = n;
+    result->capacity = n + 1;
+    for (i = 0; i < n; ++i)
+    {
+        char name[RWP_BOOKMARK_NAME_LIMIT + 1];
+        SIZE_T nameAt;
+        BOOL match = rwp_bookmark_repair_marker(rtf, n, i, TRUE, name, &nameAt);
+        if (!match)
+            match = rwp_bookmark_repair_marker(rtf, n, i, FALSE, name, &nameAt);
+        if (!match) continue;
+        for (j = 0; j < count; ++j)
+            if (!_stricmp(entries[j].oldName, name))
+            {
+                result->data[nameAt + 2] = (BYTE)entries[j].newName[2];
+                break;
+            }
+    }
+    for (j = 0; j < count; ++j)
+    {
+        char needle[128];
+        SIZE_T oldLen = strlen(entries[j].oldName);
+        SIZE_T prefixLen = sizeof(linkPrefix) - 1;
+        SIZE_T hits, *offsets;
+        if (prefixLen + oldLen + 2 > sizeof(needle)) return FALSE;
+        memcpy(needle, linkPrefix, prefixLen);
+        memcpy(needle + prefixLen, entries[j].oldName, oldLen);
+        needle[prefixLen + oldLen] = '"';
+        needle[prefixLen + oldLen + 1] = 0;
+        hits = rwp_recovery_find_targets(rtf, n, needle,
+                                         prefixLen + oldLen + 1, NULL);
+        entries[j].links = hits;
+        if (!hits) continue;
+        if (hits > (SIZE_T)-1 / sizeof(*offsets)) return FALSE;
+        offsets = HeapAlloc(GetProcessHeap(), 0, hits * sizeof(*offsets));
+        if (!offsets) return FALSE;
+        if (rwp_recovery_find_targets(rtf, n, needle,
+                                      prefixLen + oldLen + 1, offsets) != hits)
+        {
+            HeapFree(GetProcessHeap(), 0, offsets);
+            return FALSE;
+        }
+        for (i = 0; i < hits; ++i)
+            result->data[offsets[i] + prefixLen + 2] =
+                (BYTE)entries[j].newName[2];
+        HeapFree(GetProcessHeap(), 0, offsets);
+    }
+    return TRUE;
+}
+
+/* Google Docs uses zero-width anchors. A marker positioned at the paragraph
+ * ending or in an empty paragraph belongs to the next nonempty paragraph.
+ * A marker before ordinary text on its own paragraph stays where it is.
+ * Do this once after repair, NEVER during routine document load. */
+static LONG rwp_bookmark_repair_paragraph_anchor(LONG cp)
+{
+    LONG length, cursor;
+    BOOL crossed = FALSE;
+    if (cp < 0 || !hEditorWnd) return cp;
+    length = (LONG)SendMessageW(hEditorWnd, WM_GETTEXTLENGTH, 0, 0);
+    if (cp >= length) return cp;
+    cursor = cp;
+    while (cursor < length)
+    {
+        WCHAR text[257];
+        TEXTRANGEW range;
+        LONG wanted = length - cursor, got, k;
+        if (wanted > 256) wanted = 256;
+        range.chrg.cpMin = cursor;
+        range.chrg.cpMax = cursor + wanted;
+        range.lpstrText = text;
+        got = (LONG)SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0,
+                                 (LPARAM)&range);
+        if (got <= 0) break;
+        for (k = 0; k < got; ++k)
+        {
+            if (text[k] == L'\r' || text[k] == L'\n') crossed = TRUE;
+            else if (text[k] != L' ' && text[k] != L'\t')
+                return crossed ? cursor + k : cp;
+        }
+        cursor += got;
+    }
+    return cp;
+}
+
+static int rwp_bookmark_repair_reanchor(RWP_BOOKMARK_REPAIR_ENTRY *entries,
+                                        int count)
+{
+    int i, moved = 0;
+    for (i = 0; i < count; ++i)
+    {
+        WCHAR name[RWP_BOOKMARK_NAME_LIMIT + 1];
+        SIZE_T k;
+        LONG cp, cpEnd, destination;
+        ITextRange *replacement;
+        int index;
+        for (k = 0; entries[i].newName[k]; ++k)
+            name[k] = (WCHAR)(unsigned char)entries[i].newName[k];
+        name[k] = 0;
+        index = rwp_bookmark_index(name);
+        if (index < 0 || !rwpBookmarks[index].range) return -1;
+        if (FAILED(rwpBookmarks[index].range->lpVtbl->GetStart(
+                      rwpBookmarks[index].range, &cp)) ||
+            FAILED(rwpBookmarks[index].range->lpVtbl->GetEnd(
+                      rwpBookmarks[index].range, &cpEnd)))
+            return -1;
+        if (cp != cpEnd) continue; /* Preserve explicit text-range bookmarks. */
+        destination = rwp_bookmark_repair_paragraph_anchor(cp);
+        if (destination == cp) continue;
+        replacement = rwp_bookmark_capture_range(destination, destination);
+        if (!replacement) return -1;
+        rwpBookmarks[index].range->lpVtbl->Release(rwpBookmarks[index].range);
+        rwpBookmarks[index].range = replacement;
+        ++moved;
+    }
+    return moved;
+}
+
+/* Explicit Bookmark Tools action. The original file is never overwritten, and RTF
+ * inspection/repair does no work until the user explicitly runs the helper.
+ * Require an unchanged saved document to avoid losing in-memory edits. */
+static void rwp_bookmark_repair_imported_show(HWND owner)
+{
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    RTF_INPUT_MEMORY raw = {0};
+    RTF_MEMORY fixed = {0};
+    RTF_MEMORY original = {0};
+    RWP_CLOUD_DOC parsedCloud;
+    BOOL cloudFound = FALSE;
+    RWP_BOOKMARK_REPAIR_ENTRY *entries = NULL;
+    int count, moved, i;
+    SIZE_T links = 0;
+    CHARRANGE selection;
+    COLORREF background;
+    BOOL customBackground;
+    WCHAR report[256];
+    if (!hEditorWnd || fileFormat != SF_RTF || !wszFileName[0] ||
+        (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
+    {
+        MessageBoxW(owner, italian ?
+            L"Apri un documento RTF modificabile e salvato prima del ripristino." :
+            L"Open a saved, editable RTF document before running the repair.",
+            L"Bookmark", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    if (SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) ||
+        rwpRichFormattingChanged || rwpCloudMetadataUnsafe)
+    {
+        MessageBoxW(owner, italian ?
+            L"Salva o riapri il documento senza modifiche prima del ripristino." :
+            L"Save or reopen the document without unsaved changes before repairing.",
+            L"Bookmark", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    file = CreateFileW(wszFileName, GENERIC_READ, FILE_SHARE_READ, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) goto error;
+    if (!load_rtf_for_background_filter(file, &raw)) goto error;
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
+    if (raw.size < 5 || memcmp(raw.data, "{\\rtf", 5)) goto error;
+    entries = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                        RWP_BOOKMARK_LIMIT * sizeof(*entries));
+    if (!entries) goto error;
+    count = rwp_bookmark_repair_collect(raw.data, raw.size, entries);
+    if (count < 0) goto error;
+    if (!count)
+    {
+        MessageBoxW(owner, italian ?
+            L"Nessun segnalibro importato incompatibile rilevato." :
+            L"No incompatible imported bookmarks were found.",
+            L"Bookmark", MB_OK | MB_ICONINFORMATION);
+        goto done;
+    }
+    if (!rwp_bookmark_repair_patch(raw.data, raw.size, entries,
+                                   count, &fixed)) goto error;
+    for (i = 0; i < count; ++i) links += entries[i].links;
+    wsprintfW(report, italian ?
+        L"Riparare %d segnalibri e %u riferimenti interni? "
+        L"Il documento verra' ricaricato e la cronologia Annulla azzerata. "
+        L"Le modifiche rimarranno in sospeso finche' non salvi." :
+        L"Repair %d bookmarks and %u internal links? "
+        L"The document will reload and Undo history will be reset. "
+        L"Repairs will remain unsaved until you save the document.",
+        count, (UINT)links);
+    if (MessageBoxW(owner, report, L"Bookmark",
+                    MB_YESNO | MB_ICONQUESTION) != IDYES) goto done;
+    /* Keep a separate normalized source for rollback. DoOpenFile removes
+     * application-owned cloud/background groups before streaming to RichEdit. */
+    original.data = HeapAlloc(GetProcessHeap(), 0, raw.size + 1);
+    if (!original.data) goto error;
+    memcpy(original.data, raw.data, raw.size);
+    original.data[raw.size] = 0;
+    original.used = raw.size;
+    original.capacity = raw.size + 1;
+    ZeroMemory(&parsedCloud, sizeof(parsedCloud));
+    if (!rwp_cloud_read_strip(original.data, &original.used,
+                              &parsedCloud, &cloudFound)) goto error;
+    if (documentBackgroundPresent)
+        strip_editor_rtf_background(original.data, &original.used);
+    cloudFound = FALSE;
+    ZeroMemory(&parsedCloud, sizeof(parsedCloud));
+    if (!rwp_cloud_read_strip(fixed.data, &fixed.used,
+                              &parsedCloud, &cloudFound)) goto error;
+    if (documentBackgroundPresent)
+        strip_editor_rtf_background(fixed.data, &fixed.used);
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
+    background = documentBackgroundColor;
+    customBackground = documentBackgroundColorKnown;
+    if (!rwp_recovery_reload_rtf(&fixed))
+    {
+        /* Best-effort rollback; the old document was unmodified on disk. */
+        rwp_recovery_reload_rtf(&original);
+        goto error;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        WCHAR name[RWP_BOOKMARK_NAME_LIMIT + 1];
+        SIZE_T k;
+        for (k = 0; entries[i].newName[k]; ++k)
+            name[k] = (WCHAR)(unsigned char)entries[i].newName[k];
+        name[k] = 0;
+        if (rwp_bookmark_index(name) < 0)
+        {
+            rwp_recovery_reload_rtf(&original);
+            goto error;
+        }
+    }
+    moved = rwp_bookmark_repair_reanchor(entries, count);
+    if (moved < 0)
+    {
+        rwp_recovery_reload_rtf(&original);
+        goto error;
+    }
+    if (customBackground)
+        SendMessageW(hEditorWnd, EM_SETBKGNDCOLOR, 0, background);
+    else
+        SendMessageW(hEditorWnd, EM_SETBKGNDCOLOR, 1, 0);
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&selection);
+    rwpRichFormattingChanged = TRUE;
+    SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+    PostMessageW(hMainWnd, WM_USER, 0, 0);
+    wsprintfW(report, italian ?
+        L"Riparati %d segnalibri e %u collegamenti interni. "
+        L"Destinazioni riposizionate:%d. Salva il documento per conservarli." :
+        L"Repaired %d bookmarks and %u internal links. "
+        L"Anchors moved:%d. Save the document to keep the repair.",
+        count, (UINT)links, moved);
+    MessageBoxW(owner, report, L"Bookmark", MB_OK | MB_ICONINFORMATION);
+    goto done;
+error:
+    MessageBoxW(owner, italian ?
+        L"Impossibile riparare questo RTF senza rischiare modifiche parziali." :
+        L"Unable to safely repair this RTF document.",
+        L"Bookmark", MB_OK | MB_ICONWARNING);
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (fixed.data) HeapFree(GetProcessHeap(), 0, fixed.data);
+    if (original.data) HeapFree(GetProcessHeap(), 0, original.data);
+    if (raw.data) HeapFree(GetProcessHeap(), 0, raw.data);
+    if (entries) HeapFree(GetProcessHeap(), 0, entries);
 }
 
 static BOOL write_all(HANDLE file, const void *buffer, SIZE_T length)
@@ -28238,8 +28688,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                               L"Configure color order...");
                 InsertMenuW(submenu, 3, MF_BYPOSITION | MF_STRING,
                     ID_BOOKMARK_RECOVER,
-                    italian ? L"Recupera collegamenti a segnalibri..." :
-                              L"Recover Bookmark Links...");
+                    italian ? L"Strumenti segnalibri..." :
+                              L"Bookmark Tools...");
                 InsertMenuW(submenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
                 break;
             }
