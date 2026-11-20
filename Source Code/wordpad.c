@@ -64,6 +64,54 @@
 #include "wordpad.h"
 #include "cloud_native.h"
 
+/* The 1080p-or-lower interface uses the application's original 96-DPI
+ * dimensions even when Windows display scaling is above 100%. Above 1080p,
+ * preserve the program's existing DPI-unaware/Windows-scaled behavior.
+ * DPI awareness is process-wide, so the policy is selected at startup. */
+static BOOL rwpFixed96DpiInterface;
+
+static int rwp_ui_dpi(int actualDpi)
+{
+    return rwpFixed96DpiInterface ? 96 : (actualDpi > 0 ? actualDpi : 96);
+}
+
+static void rwp_initialize_display_scaling(void)
+{
+    DEVMODEW mode;
+    typedef BOOL (WINAPI *RWP_SET_PROCESS_DPI_AWARENESS_CONTEXT)(HANDLE);
+    typedef BOOL (WINAPI *RWP_SET_PROCESS_DPI_AWARE)(void);
+    RWP_SET_PROCESS_DPI_AWARENESS_CONTEXT setContext;
+    RWP_SET_PROCESS_DPI_AWARE setLegacyAware;
+    HMODULE user32;
+    BOOL aware = FALSE;
+
+    ZeroMemory(&mode, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    /* EnumDisplaySettings returns the display's physical pixel resolution;
+     * DPI-virtualized GetSystemMetrics is unsuitable for this decision. */
+    if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &mode) ||
+        !mode.dmPelsWidth || !mode.dmPelsHeight ||
+        mode.dmPelsWidth > 1920 || mode.dmPelsHeight > 1080)
+        return;
+
+    user32 = GetModuleHandleW(L"user32.dll");
+    setContext = user32 ? (RWP_SET_PROCESS_DPI_AWARENESS_CONTEXT)
+        GetProcAddress(user32, "SetProcessDpiAwarenessContext") : NULL;
+    /* SYSTEM_AWARE stops Windows from bitmap-enlarging the whole window,
+     * without Per-Monitor-V2's automatic dialog resize on DPI changes.
+     * -2 is DPI_AWARENESS_CONTEXT_SYSTEM_AWARE; older RosBE headers do not
+     * declare the context constants. */
+    if (setContext)
+        aware = setContext((HANDLE)(LONG_PTR)-2);
+    else if (user32)
+    {
+        setLegacyAware = (RWP_SET_PROCESS_DPI_AWARE)
+            GetProcAddress(user32, "SetProcessDPIAware");
+        if (setLegacyAware) aware = setLegacyAware();
+    }
+    rwpFixed96DpiInterface = aware;
+}
+
 /* Optional diagnostic: set WORDPADCUSTOM_PROFILE_STARTUP=1 before launching.
  * No disk I/O and no timing checkpoints when the variable is absent.
  * Reports are written to %%TEMP%%\\WordPadCustom_Startup_Timing.txt. */
@@ -2186,6 +2234,8 @@ static void rwp_theme_dialog_controls(HWND dialog)
  * Existing control widths, layout rows, and multiline editors are untouched. */
 #define RWP_WM_NORMALIZE_DIALOG_INPUTS (WM_APP + 244)
 
+static void rwp_fit_owned_dialog_to_96_dpi(HWND dialog);
+
 static int rwp_dialog_input_height(HWND control)
 {
     HDC dc;
@@ -2195,8 +2245,7 @@ static int rwp_dialog_input_height(HWND control)
 
     dc = GetDC(control);
     if (!dc) return 0;
-    dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    if (dpi <= 0) dpi = 96;
+    dpi = rwp_ui_dpi(GetDeviceCaps(dc, LOGPIXELSY));
     font = (HFONT)SendMessageW(control, WM_GETFONT, 0, 0);
     if (font) previous = (HFONT)SelectObject(dc, font);
     if (GetTextMetricsW(dc, &metrics))
@@ -2288,6 +2337,7 @@ static void rwp_schedule_dialog_input_normalization(HWND dialog)
 static void rwp_theme_dialog(HWND dialog)
 {
     if (!dialog || !rwpBarBrush) return;
+    rwp_fit_owned_dialog_to_96_dpi(dialog);
     rwp_try_dark_caption(dialog);
     rwp_theme_dialog_controls(dialog);
     rwp_schedule_dialog_input_normalization(dialog);
@@ -2296,6 +2346,7 @@ static void rwp_theme_dialog(HWND dialog)
 /* Shared theme for the native Google Drive dialog in cloud_native.c. */
 void rwp_cloud_apply_theme(HWND dialog)
 {
+    rwp_fit_owned_dialog_to_96_dpi(dialog);
     /* Match Ctrl+H's dark caption, including explicit title color on
      * newer Windows builds, and use the common owner-drawn controls. */
     rwp_try_dark_find_caption(dialog);
@@ -2317,7 +2368,7 @@ static HFONT rwp_create_configured_ui_font(HWND window, int extraPoints)
     if (dc)
     {
         int deviceDpi = GetDeviceCaps(dc, LOGPIXELSY);
-        if (deviceDpi > 0) dpi = deviceDpi;
+        dpi = rwp_ui_dpi(deviceDpi);
         ReleaseDC(window, dc);
     }
     return CreateFontW(-MulDiv(points, dpi, 72), 0, 0, 0, FW_NORMAL,
@@ -2348,6 +2399,89 @@ static LRESULT CALLBACK rwp_readable_dialog_subclass(HWND dialog, UINT message,
     return DefSubclassProc(dialog, message, wParam, lParam);
 }
 
+/* Dialog resource templates with the configured 14pt UI font are sized in
+ * dialog units, which Windows converts using the real system DPI in an aware
+ * process. Scale their geometry and font back to the 96-DPI baseline.
+ * Legacy 8pt dialogs use rwp_enlarge_legacy_dialog below instead. */
+static void rwp_fit_owned_dialog_to_96_dpi(HWND dialog)
+{
+    HDC dc;
+    int actualDpi, templateFontHeight;
+    HFONT original, baseline;
+    LOGFONTW source;
+    LONG_PTR style;
+    RECT client, outer;
+    HWND child;
+    int width, height, x, y;
+
+    if (!rwpFixed96DpiInterface || !dialog ||
+        GetPropW(dialog, rwpReadableFontKey)) return;
+    style = GetWindowLongPtrW(dialog, GWL_STYLE);
+    /* Property-sheet pages are managed by a system-owned tab container.
+     * Do not resize the pages independently of the container. */
+    if (style & WS_CHILD) return;
+
+    dc = GetDC(dialog);
+    if (!dc) return;
+    actualDpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(dialog, dc);
+    if (actualDpi <= 96) return;
+
+    original = (HFONT)SendMessageW(dialog, WM_GETFONT, 0, 0);
+    if (!original || !GetObjectW(original, sizeof(source), &source)) return;
+    templateFontHeight = MulDiv(RWP_UI_FONT_PT, actualDpi, 72);
+    /* Only scale our application-owned 14pt resource templates, not the
+     * legacy 8pt or Windows common-dialog templates. */
+    if (abs(source.lfHeight) < templateFontHeight - 2 ||
+        abs(source.lfHeight) > templateFontHeight + 2) return;
+
+    baseline = rwp_create_configured_ui_font(dialog, 0);
+    if (!baseline) return;
+    if (!SetPropW(dialog, rwpReadableFontKey, (HANDLE)baseline))
+    {
+        DeleteObject(baseline);
+        return;
+    }
+    if (!SetWindowSubclass(dialog, rwp_readable_dialog_subclass, 1, 0))
+    {
+        RemovePropW(dialog, rwpReadableFontKey);
+        DeleteObject(baseline);
+        return;
+    }
+
+    GetClientRect(dialog, &client);
+    GetWindowRect(dialog, &outer);
+    width = MulDiv(client.right, 96, actualDpi) +
+            (outer.right - outer.left) - client.right;
+    height = MulDiv(client.bottom, 96, actualDpi) +
+             (outer.bottom - outer.top) - client.bottom;
+    /* Keep the original centre instead of shifting every dialog to one side. */
+    x = outer.left + ((outer.right - outer.left) - width) / 2;
+    y = outer.top + ((outer.bottom - outer.top) - height) / 2;
+
+    SendMessageW(dialog, WM_SETREDRAW, FALSE, 0);
+    for (child = GetWindow(dialog, GW_CHILD); child;
+         child = GetWindow(child, GW_HWNDNEXT))
+    {
+        RECT bounds;
+        GetWindowRect(child, &bounds);
+        MapWindowPoints(HWND_DESKTOP, dialog, (POINT *)&bounds, 2);
+        SetWindowPos(child, NULL,
+                     MulDiv(bounds.left, 96, actualDpi),
+                     MulDiv(bounds.top, 96, actualDpi),
+                     MulDiv(bounds.right - bounds.left, 96, actualDpi),
+                     MulDiv(bounds.bottom - bounds.top, 96, actualDpi),
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        SendMessageW(child, WM_SETFONT, (WPARAM)baseline, FALSE);
+    }
+    SendMessageW(dialog, WM_SETFONT, (WPARAM)baseline, FALSE);
+    SetWindowPos(dialog, NULL, x, y, width, height,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SendMessageW(dialog, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(dialog, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
 static void rwp_enlarge_legacy_dialog(HWND dialog)
 {
     HFONT original, readable;
@@ -2371,7 +2505,7 @@ static void rwp_enlarge_legacy_dialog(HWND dialog)
     oldHeight = MulDiv(9, dpi, 72); /* Fallback for stock common dialogs. */
     if (original && GetObjectW(original, sizeof(source), &source))
         oldHeight = abs(source.lfHeight);
-    newHeight = MulDiv(RWP_UI_FONT_PT, dpi, 72);
+    newHeight = MulDiv(RWP_UI_FONT_PT, rwp_ui_dpi(dpi), 72);
     if (!oldHeight) return;
 
     /* Also supports a smaller global setting; no one-way 14pt minimum. */
@@ -13351,6 +13485,28 @@ static void rwp_unified_theme_checkboxes(HWND dlg)
     }
 }
 
+/* MapDialogRect retains the dialog template's original DPI-scaled base
+ * units even after WM_SETFONT and rwp_fit_owned_dialog_to_96_dpi have shrunk
+ * the window and its children. Match runtime layout calculations to the
+ * 96-DPI geometry used by this dialog on 1080p-and-smaller displays. */
+static void rwp_unified_map_dialog_rect(HWND dlg, RECT *rect)
+{
+    HDC dc;
+    int dpi;
+    if (!MapDialogRect(dlg, rect) ||
+        !rwpFixed96DpiInterface ||
+        !GetPropW(dlg, rwpReadableFontKey)) return;
+    dc = GetDC(dlg);
+    if (!dc) return;
+    dpi = GetDeviceCaps(dc, LOGPIXELSY);
+    ReleaseDC(dlg, dc);
+    if (dpi <= 96) return;
+    rect->left   = MulDiv(rect->left,   96, dpi);
+    rect->top    = MulDiv(rect->top,    96, dpi);
+    rect->right  = MulDiv(rect->right,  96, dpi);
+    rect->bottom = MulDiv(rect->bottom, 96, dpi);
+}
+
 static void rwp_unified_layout(HWND dlg);
 
 /* Show the formatting rows through a native vertical scrollbar.  No actual
@@ -13371,13 +13527,13 @@ static void rwp_unified_scroll_format_rows(HWND dlg, BOOL expanded, BOOL findEna
     int viewportTop, viewportBottom, rowHeight, page;
     SCROLLINFO info;
     units.bottom = 140;
-    MapDialogRect(dlg, &units);
+    rwp_unified_map_dialog_rect(dlg, &units);
     viewportTop = units.bottom;
     units.bottom = 286;
-    MapDialogRect(dlg, &units);
+    rwp_unified_map_dialog_rect(dlg, &units);
     viewportBottom = units.bottom;
     units.bottom = 16;
-    MapDialogRect(dlg, &units);
+    rwp_unified_map_dialog_rect(dlg, &units);
     rowHeight = units.bottom;
     for (page = 0; page < 2; ++page)
     {
@@ -13540,14 +13696,14 @@ static void rwp_unified_layout(HWND dlg)
     units.right = 0;
     /* Keep 14-point text readable while using the compact resource rows. */
     units.bottom = expanded ? 326 : 124;
-    MapDialogRect(dlg, &units);
+    rwp_unified_map_dialog_rect(dlg, &units);
     dialogHeight = units.bottom + (window.bottom - window.top) - client.bottom;
     baseY = 295;
     desiredY = expanded ? 295 : 94;
     units.left = units.top = 0;
     units.right = 0;
     units.bottom = desiredY - baseY;
-    MapDialogRect(dlg, &units);
+    rwp_unified_map_dialog_rect(dlg, &units);
     /* Position from the fixed 295-DLU footer row, not incrementally. */
     for (i = 0; i < (int)(sizeof(footer)/sizeof(footer[0])); ++i)
     {
@@ -13562,7 +13718,7 @@ static void rwp_unified_layout(HWND dlg)
          * the two-line Copy Format button. */
         {
             RECT pos = {0, 0, 0, 295};
-            MapDialogRect(dlg, &pos);
+            rwp_unified_map_dialog_rect(dlg, &pos);
             SetWindowPos(button, NULL, point.x, pos.bottom + units.bottom,
                          0, 0, SWP_NOZORDER | SWP_NOSIZE | SWP_NOACTIVATE);
         }
@@ -14127,6 +14283,10 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
     switch (message)
     {
     case WM_INITDIALOG:
+        /* This dialog initializes through the Format Search procedure,
+         * not the shared rwp_theme_dialog path. Apply the conditional
+         * 96-DPI resource geometry before configuring any child controls. */
+        rwp_fit_owned_dialog_to_96_dpi(dlg);
         /* Reuse original Format Search initialization, color palettes,
          * group defaults, owner-drawn combos and dark-mode styling. */
         rwp_format_search_dialog_proc(dlg, message, wParam, lParam);
@@ -14320,7 +14480,7 @@ static INT_PTR CALLBACK rwp_unified_dialog_proc(HWND dlg, UINT message,
             formatRegion.top = 133;
             formatRegion.right = 428;
             formatRegion.bottom = 290;
-            MapDialogRect(dlg, &formatRegion);
+            rwp_unified_map_dialog_rect(dlg, &formatRegion);
             if (PtInRect(&formatRegion, point))
             {
                 int ticks = (SHORT)HIWORD(wParam);
@@ -15060,8 +15220,7 @@ static BOOL rwp_symbol_color_format(HDC dc, BOOL preview)
     FLOAT fontSize;
     int dpi;
     if (*slot) return TRUE;
-    dpi = GetDeviceCaps(dc, LOGPIXELSY);
-    if (dpi <= 0) dpi = 96;
+    dpi = rwp_ui_dpi(GetDeviceCaps(dc, LOGPIXELSY));
     fontSize = (preview ? 25.0f : 22.0f) * (FLOAT)dpi / 72.0f;
     {
         HRESULT hr = rwp_dwrite_create_text_format(rwpSymbolColor.writeFactory,
@@ -15866,7 +16025,7 @@ static void rwp_symbol_change_font(BOOL selectedFromList)
     dc = GetDC(rwpSymbols.window);
     if (dc)
     {
-        dpi = GetDeviceCaps(dc, LOGPIXELSY);
+        dpi = rwp_ui_dpi(GetDeviceCaps(dc, LOGPIXELSY));
         ReleaseDC(rwpSymbols.window, dc);
     }
     if (dpi < 1) dpi = 96;
@@ -16273,7 +16432,7 @@ static INT_PTR CALLBACK rwp_symbol_dialog_proc(HWND dialog, UINT message,
         dc = GetDC(dialog);
         if (dc)
         {
-            rwpSymbols.rowHeight = MulDiv(54, GetDeviceCaps(dc, LOGPIXELSY), 96);
+            rwpSymbols.rowHeight = MulDiv(54, rwp_ui_dpi(GetDeviceCaps(dc, LOGPIXELSY)), 96);
             ReleaseDC(dialog, dc);
         }
         if (rwpSymbols.rowHeight < 30) rwpSymbols.rowHeight = 30;
@@ -17835,7 +17994,7 @@ static void rwp_update_counter_dialog(HWND dialog)
 static int rwp_shortcuts_scaled_px(HWND dialog, int pixels)
 {
     HDC dc = GetDC(dialog);
-    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSY) : 96;
+    int dpi = dc ? rwp_ui_dpi(GetDeviceCaps(dc, LOGPIXELSY)) : 96;
     if (dc) ReleaseDC(dialog, dc);
     if (dpi <= 0) dpi = 96;
     return MulDiv(pixels, dpi, 96);
@@ -28414,6 +28573,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     static const WCHAR wszAccelTable[] = {'M','A','I','N','A','C','C','E','L',
                                           'T','A','B','L','E','\0'};
 
+    rwp_initialize_display_scaling();
     rwp_startup_profile_begin();
     /* A shell-opened document may already be shown in another instance.
      * Check before creating another main window, so no empty window flashes. */
