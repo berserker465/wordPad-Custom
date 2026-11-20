@@ -392,6 +392,13 @@ static HWND rwpViewOptionsWnd;
 static HWND rwpShortcutSettingsWnd;
 static BOOL rwpShortcutStatusInUse;
 static HWND rwpColorOrderWnd;
+static HWND rwpZoomList, rwpDefaultZoomWnd, rwpSizesWnd, rwpFontWnd;
+static int rwpDefaultZoom = 100;
+static const WCHAR rwpStockSizes[] = L"8\r\n9\r\n10\r\n11\r\n12\r\n14\r\n16\r\n18\r\n20\r\n22\r\n24\r\n26\r\n28\r\n36\r\n48\r\n72";
+/* Standard multiline edit limit, including space for the terminator. */
+static WCHAR rwpSizes[32768];
+static void rwp_refresh_zoom(HWND editor);
+static void rwp_apply_zoom(int percent);
 static HWND rwpCounterWnd;
 static BOOL rwpOleInitialized;
 static HMENU hColorPopupMenu;
@@ -622,6 +629,7 @@ static void rwp_open_backup_preferences(void);
  * WM_COPYDATA safely transfers the path between processes; this is intentionally
  * per-DOCUMENT rather than a single-instance restriction for the application. */
 #define RWP_OPEN_DOC_QUERY 0x52575044UL
+#define RWP_WM_REFRESH_ZOOM (WM_APP + 254)
 #define RWP_WM_RELAYOUT (WM_APP + 52)
 #define RWP_WM_COMPLETE_EXPLORER_DROP (WM_APP + 53)
 #define RWP_WM_CLOUD_FINISH_HIDDEN_CLOSE (WM_APP + 54)
@@ -1597,9 +1605,11 @@ static void rwp_enlarge_combo(HWND comboEx)
     {
         SendMessageW(child, WM_SETFONT, (WPARAM)rwpUiFont, TRUE);
         SendMessageW(child, CB_SETITEMHEIGHT, (WPARAM)-1, 29);
-        /* The font combo has many families: show a generous number at once. */
+        /* Set popup row counts on the embedded toolbar combos. */
         if (GetDlgCtrlID(comboEx) == IDC_FONTLIST)
-            SendMessageW(child, CB_SETMINVISIBLE, RWP_FONT_LIST_VISIBLE_ROWS, 0);
+            SendMessageW(child, CB_SETMINVISIBLE, 27, 0);
+        else if (GetDlgCtrlID(comboEx) == IDC_SIZELIST)
+            SendMessageW(child, CB_SETMINVISIBLE, 18, 0);
     }
     child = (HWND)SendMessageW(comboEx, CBEM_GETEDITCONTROL, 0, 0);
     if (child) SendMessageW(child, WM_SETFONT, (WPARAM)rwpUiFont, TRUE);
@@ -1852,6 +1862,34 @@ static void rwp_theme_combo(HWND comboEx)
 }
 
 /* Toolbar notifications go to their rebar parent rather than the main window. */
+/* The zoom editor occupies a toolbar slot between two native separators. */
+static void rwp_position_toolbar_zoom(HWND toolbar)
+{
+    RECT slot, combo;
+    int index = (int)SendMessageW(toolbar, TB_COMMANDTOINDEX, IDC_VIEW_ZOOM, 0);
+    if (index < 0 || !SendMessageW(toolbar, TB_GETITEMRECT, index, (LPARAM)&slot) ||
+        !GetWindowRect(rwpZoomList, &combo)) return;
+    SetWindowPos(rwpZoomList, HWND_TOP, slot.left,
+                 slot.top + (slot.bottom - slot.top - (combo.bottom - combo.top)) / 2,
+                 slot.right - slot.left, 320, SWP_NOACTIVATE);
+}
+
+static LRESULT CALLBACK rwp_zoom_toolbar_proc(HWND toolbar, UINT msg, WPARAM wp,
+                                               LPARAM lp, UINT_PTR id, DWORD_PTR data)
+{
+    if ((msg == WM_COMMAND && (HWND)lp == rwpZoomList) ||
+        (msg == WM_NOTIFY && lp && ((NMHDR *)lp)->hwndFrom == rwpZoomList))
+        return SendMessageW(GetParent(GetParent(toolbar)), msg, wp, lp);
+    if (msg == WM_SIZE)
+    {
+        LRESULT result = DefSubclassProc(toolbar, msg, wp, lp);
+        rwp_position_toolbar_zoom(toolbar);
+        return result;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(toolbar, rwp_zoom_toolbar_proc, id);
+    return DefSubclassProc(toolbar, msg, wp, lp);
+}
+
 static LRESULT CALLBACK rwp_dark_rebar_proc(HWND window, UINT message,
               WPARAM wParam, LPARAM lParam, UINT_PTR ident, DWORD_PTR data)
 {
@@ -2877,6 +2915,13 @@ static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
     RWP_BOOKMARK_CLIPBOARD *bookmarkPaste = NULL;
     LRESULT result;
     (void)ident; (void)data;
+    if (message == WM_MOUSEWHEEL && (LOWORD(wParam) & MK_CONTROL))
+    {
+        result = DefSubclassProc(window, message, wParam, lParam);
+        rwp_refresh_zoom(window);
+        return result;
+    }
+
 
     if (message == WM_CONTEXTMENU)
         return rwp_show_editor_context_menu(window, lParam);
@@ -6259,6 +6304,9 @@ static void set_size(float size)
     SendMessageW(hEditorWnd, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
 }
 
+static void rwp_format_points(WCHAR *buffer, LONG twips);
+static BOOL rwp_parse_points(LPCWSTR text, LONG *twips);
+
 static void on_sizelist_modified(HWND hwndSizeList, LPWSTR wszNewFontSize)
 {
     WCHAR sizeBuffer[MAX_STRING_LEN];
@@ -6268,11 +6316,14 @@ static void on_sizelist_modified(HWND hwndSizeList, LPWSTR wszNewFontSize)
     format.cbSize = sizeof(format);
     SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&format);
 
-    wsprintfW(sizeBuffer, stringFormat, format.yHeight / 20);
+    rwp_format_points(sizeBuffer, format.yHeight);
     if(!(format.dwMask & CFM_SIZE) || lstrcmpW(sizeBuffer, wszNewFontSize))
     {
         float size = 0;
-        if(number_from_string(wszNewFontSize, &size, NULL)
+        LONG twips;
+        if (rwp_parse_points(wszNewFontSize, &twips))
+            set_size(twips / 20.0f);
+        else if(number_from_string(wszNewFontSize, &size, NULL)
            && size > 0)
         {
             set_size(size);
@@ -6285,57 +6336,150 @@ static void on_sizelist_modified(HWND hwndSizeList, LPWSTR wszNewFontSize)
     }
 }
 
-static void add_size(HWND hSizeListWnd, unsigned size)
+static void rwp_format_points(WCHAR *buffer, LONG twips)
 {
-    WCHAR buffer[3];
-    COMBOBOXEXITEMW cbItem;
-    cbItem.mask = CBEIF_TEXT;
-    cbItem.iItem = -1;
-
-    wsprintfW(buffer, stringFormat, size);
-    cbItem.pszText = buffer;
-    SendMessageW(hSizeListWnd, CBEM_INSERTITEMW, 0, (LPARAM)&cbItem);
+    LONG fraction = twips % 20 * 5;
+    if (!fraction) wsprintfW(buffer, L"%ld", twips / 20);
+    else if (fraction % 10) wsprintfW(buffer, L"%ld.%02ld", twips / 20, fraction);
+    else wsprintfW(buffer, L"%ld.%ld", twips / 20, fraction / 10);
 }
 
-static void populate_size_list(HWND hSizeListWnd)
+/* Rich Edit measures point sizes in twentieths. Accept either decimal separator. */
+static BOOL rwp_parse_points(LPCWSTR text, LONG *twips)
 {
-    HWND hReBarWnd = GetDlgItem(hMainWnd, IDC_REBAR);
-    HWND hFontListWnd = GetDlgItem(hReBarWnd, IDC_FONTLIST);
-    COMBOBOXEXITEMW cbFontItem;
-    CHARFORMAT2W fmt;
-    HWND hListEditWnd = (HWND)SendMessageW(hSizeListWnd, CBEM_GETEDITCONTROL, 0, 0);
-    HDC hdc = GetDC(hMainWnd);
-    static const unsigned choices[] = {8,9,10,11,12,14,16,18,20,22,24,26,28,36,48,72};
-    WCHAR buffer[3];
-    size_t i;
-    DWORD fontStyle;
+    LONG points = 0, fraction = 0;
+    while (*text == L' ' || *text == L'\t') ++text;
+    if (*text < L'0' || *text > L'9') return FALSE;
+    do {
+        points = points * 10 + *text++ - L'0';
+        if (points > 1638) return FALSE;
+    } while (*text >= L'0' && *text <= L'9');
+    if (*text == L',' || *text == L'.')
+    {
+        ++text;
+        if (*text < L'0' || *text > L'9') return FALSE;
+        fraction = (*text++ - L'0') * 10;
+        if (*text >= L'0' && *text <= L'9') fraction += *text++ - L'0';
+    }
+    while (*text == L' ' || *text == L'\t') ++text;
+    *twips = points * 20 + fraction / 5;
+    return !*text && !(fraction % 5) && *twips > 0 && *twips <= 32760;
+}
 
-    ZeroMemory(&fmt, sizeof(fmt));
+static void rwp_add_choice(HWND combo, BOOL extended, LPCWSTR text)
+{
+    if (extended)
+    {
+        COMBOBOXEXITEMW item = {0};
+        item.iItem = -1;
+        item.mask = CBEIF_TEXT;
+        item.pszText = (LPWSTR)text;
+        SendMessageW(combo, CBEM_INSERTITEMW, 0, (LPARAM)&item);
+    }
+    else SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)text);
+}
+
+/* Validate the complete list before saving or using it from the registry. */
+static BOOL rwp_size_choices(LPCWSTR text, HWND combo, BOOL extended)
+{
+    BOOL haveSize = FALSE;
+    while (*text)
+    {
+        WCHAR line[48], display[32];
+        LONG twips;
+        size_t len = wcscspn(text, L"\r\n");
+        if (len)
+        {
+            if (len >= sizeof(line)/sizeof(line[0])) return FALSE;
+            memcpy(line, text, len * sizeof(WCHAR));
+            line[len] = 0;
+            if (!rwp_parse_points(line, &twips)) return FALSE;
+            if (combo)
+            {
+                rwp_format_points(display, twips);
+                rwp_add_choice(combo, extended, display);
+            }
+            haveSize = TRUE;
+        }
+        text += len;
+        while (*text == L'\r' || *text == L'\n') ++text;
+    }
+    return haveSize;
+}
+
+static void populate_size_list(HWND combo)
+{
+    CHARFORMAT2W fmt = {0};
+    WCHAR display[32];
+    HWND edit = (HWND)SendMessageW(combo, CBEM_GETEDITCONTROL, 0, 0);
+    SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+    rwp_size_choices(rwpSizes, combo, TRUE);
     fmt.cbSize = sizeof(fmt);
     SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
-
-    cbFontItem.mask = CBEIF_LPARAM;
-    cbFontItem.iItem = SendMessageW(hFontListWnd, CB_FINDSTRINGEXACT, -1, (LPARAM)fmt.szFaceName);
-    SendMessageW(hFontListWnd, CBEM_GETITEMW, 0, (LPARAM)&cbFontItem);
-
-    fontStyle = (DWORD)LOWORD(cbFontItem.lParam);
-
-    SendMessageW(hSizeListWnd, CB_RESETCONTENT, 0, 0);
-
-    if((fontStyle & RASTER_FONTTYPE) && cbFontItem.iItem)
-    {
-        add_size(hSizeListWnd, (BYTE)MulDiv(HIWORD(cbFontItem.lParam), 72,
-                               GetDeviceCaps(hdc, LOGPIXELSY)));
-    } else
-    {
-        for(i = 0; i < sizeof(choices)/sizeof(choices[0]); i++)
-            add_size(hSizeListWnd, choices[i]);
-    }
-
-    wsprintfW(buffer, stringFormat, fmt.yHeight / 20);
-    SendMessageW(hListEditWnd, WM_SETTEXT, 0, (LPARAM)buffer);
+    rwp_format_points(display, fmt.yHeight);
+    SetWindowTextW(edit, display);
 }
 
+static void rwp_fill_zoom(HWND combo, BOOL extended)
+{
+    int percent;
+    WCHAR text[12];
+    for (percent = 5; percent <= 300; percent += percent == 5 ? 5 : 10)
+    {
+        wsprintfW(text, L"%d%%", percent);
+        rwp_add_choice(combo, extended, text);
+    }
+}
+
+static int rwp_parse_zoom(LPCWSTR text)
+{
+    int percent = 0;
+    while (*text == L' ') ++text;
+    while (*text >= L'0' && *text <= L'9')
+    {
+        percent = percent * 10 + *text++ - L'0';
+        if (percent > 300) return 0;
+    }
+    while (*text == L' ') ++text;
+    if (*text == L'%') ++text;
+    while (*text == L' ') ++text;
+    return !*text && percent >= 5 ? percent : 0;
+}
+
+static void rwp_refresh_zoom(HWND editor)
+{
+    int numerator = 0, denominator = 0, percent;
+    WCHAR display[16];
+    HWND edit = (HWND)SendMessageW(rwpZoomList, CBEM_GETEDITCONTROL, 0, 0);
+    SendMessageW(editor, EM_GETZOOM, (WPARAM)&numerator, (LPARAM)&denominator);
+    percent = denominator ? MulDiv(numerator, 100, denominator) : 100;
+    if (percent < 5 || percent > 300)
+    {
+        percent = percent < 5 ? 5 : 300;
+        SendMessageW(editor, EM_SETZOOM, percent, 100);
+    }
+    wsprintfW(display, L"%d%%", percent);
+    SetWindowTextW(edit, display);
+}
+
+static void rwp_apply_zoom(int percent)
+{
+    SendMessageW(hEditorWnd, EM_SETZOOM, percent, 100);
+    rwp_refresh_zoom(hEditorWnd);
+}
+
+static void rwp_commit_zoom(LPCWSTR text)
+{
+    int percent = rwp_parse_zoom(text);
+    if (percent) rwp_apply_zoom(percent);
+    else
+    {
+        MessageBeep(MB_ICONWARNING);
+        rwp_refresh_zoom(hEditorWnd);
+    }
+}
+
+static void rwp_load_view_preferences(void);
 static void update_size_list(void)
 {
     HWND hReBar = GetDlgItem(hMainWnd, IDC_REBAR);
@@ -6349,8 +6493,8 @@ static void update_size_list(void)
 
     SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
 
-    SendMessageW(hwndSizeListEdit, WM_GETTEXT, MAX_PATH, (LPARAM)fontSize);
-    wsprintfW(sizeBuffer, stringFormat, fmt.yHeight / 20);
+    SendMessageW(hwndSizeListEdit, WM_GETTEXT, sizeof(fontSize)/sizeof(fontSize[0]), (LPARAM)fontSize);
+    rwp_format_points(sizeBuffer, fmt.yHeight);
 
     if(lstrcmpW(fontSize, sizeBuffer))
         SendMessageW(hwndSizeListEdit, WM_SETTEXT, 0, (LPARAM)sizeBuffer);
@@ -6468,56 +6612,6 @@ static void on_fontlist_modified(LPWSTR wszNewFaceName)
     if(!(format.dwMask & CFM_FACE) || lstrcmpW(format.szFaceName, wszNewFaceName))
         set_font(wszNewFaceName);
 }
-
-static void dialog_choose_font(void)
-{
-    CHOOSEFONTW cf;
-    LOGFONTW lf;
-    CHARFORMAT2W fmt;
-    HDC hDC = GetDC(hMainWnd);
-
-    ZeroMemory(&cf, sizeof(cf));
-    cf.lStructSize = sizeof(cf);
-    cf.hwndOwner = hMainWnd;
-    cf.lpLogFont = &lf;
-    cf.Flags = CF_SCREENFONTS | CF_NOSCRIPTSEL | CF_INITTOLOGFONTSTRUCT | CF_EFFECTS | CF_NOVERTFONTS;
-
-    ZeroMemory(&fmt, sizeof(fmt));
-    fmt.cbSize = sizeof(fmt);
-
-    SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
-    lstrcpyW(cf.lpLogFont->lfFaceName, fmt.szFaceName);
-    cf.lpLogFont->lfItalic = (fmt.dwEffects & CFE_ITALIC) != 0;
-    cf.lpLogFont->lfWeight = (fmt.dwEffects & CFE_BOLD) ? FW_BOLD : FW_NORMAL;
-    cf.lpLogFont->lfUnderline = (fmt.dwEffects & CFE_UNDERLINE) != 0;
-    cf.lpLogFont->lfStrikeOut = (fmt.dwEffects & CFE_STRIKEOUT) != 0;
-    cf.lpLogFont->lfHeight = -MulDiv(fmt.yHeight / 20, GetDeviceCaps(hDC, LOGPIXELSY), 72);
-    cf.rgbColors = fmt.crTextColor;
-
-    if(ChooseFontW(&cf))
-    {
-        ZeroMemory(&fmt, sizeof(fmt));
-        fmt.cbSize = sizeof(fmt);
-        fmt.dwMask = CFM_BOLD | CFM_ITALIC | CFM_SIZE | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_COLOR;
-        fmt.yHeight = cf.iPointSize * 2;
-
-        if(cf.nFontType & BOLD_FONTTYPE)
-            fmt.dwEffects |= CFE_BOLD;
-        if(cf.nFontType & ITALIC_FONTTYPE)
-            fmt.dwEffects |= CFE_ITALIC;
-        if(cf.lpLogFont->lfUnderline)
-            fmt.dwEffects |= CFE_UNDERLINE;
-        if(cf.lpLogFont->lfStrikeOut)
-            fmt.dwEffects |= CFE_STRIKEOUT;
-
-        fmt.crTextColor = cf.rgbColors;
-
-        if (rwp_set_color_format_preserving_combining_sequences(hEditorWnd, &fmt))
-            rwp_record_selected_text_color(fmt.crTextColor, FALSE);
-        set_font(cf.lpLogFont->lfFaceName);
-    }
-}
-
 
 /* Enumerate font families into memory first. The previous callback repeatedly
  * searched and inserted into ComboBoxEx, producing many synchronous window
@@ -9656,6 +9750,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
 
     SetFocus(hEditorWnd);
 
+    rwp_apply_zoom(rwpDefaultZoom);
     set_caption(szOpenFileName);
     if (szOpenFileName[0])
         SHAddToRecentDocs(SHARD_PATHW, szOpenFileName);
@@ -11644,8 +11739,12 @@ static void rwp_bulk_paint_radio(HWND radio, HDC dc)
     textRect = rect;
     textRect.left += 19;
     textRect.right -= 2;
+    /* Let DrawText interpret ampersands as dialog access keys. Mirror
+     * Windows' keyboard-cue setting so underlines appear when appropriate. */
     DrawTextW(dc, title, -1, &textRect,
-              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+              ((SendMessageW(radio, WM_QUERYUISTATE, 0, 0) & UISF_HIDEACCEL) ?
+               DT_HIDEPREFIX : 0));
     SelectObject(dc, oldFont);
     if (boldFont) DeleteObject(boldFont);
 
@@ -11688,6 +11787,12 @@ static LRESULT CALLBACK rwp_bulk_radio_subclass(HWND window, UINT message,
     case WM_ENABLE:
         InvalidateRect(window, NULL, FALSE);
         break;
+    case WM_UPDATEUISTATE:
+    {
+        LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        InvalidateRect(window, NULL, FALSE);
+        return result;
+    }
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, rwp_bulk_radio_subclass, 1);
         break;
@@ -13796,34 +13901,7 @@ static BOOL rwp_unified_read_first_selected_format(CHARFORMAT2W *cf,
  * Accept decimal comma or point so copying a fractional size stays exact. */
 static BOOL rwp_bulk_parse_size_twips(const WCHAR *text, LONG *twips)
 {
-    LONG points = 0, hundredths = 0;
-    int decimals = 0;
-    const WCHAR *p = text;
-    while (*p == L' ' || *p == L'\t') ++p;
-    if (*p < L'0' || *p > L'9') return FALSE;
-    while (*p >= L'0' && *p <= L'9')
-    {
-        points = points * 10 + (*p - L'0');
-        if (points > 500) return FALSE;
-        ++p;
-    }
-    if (*p == L'.' || *p == L',')
-    {
-        ++p;
-        if (*p < L'0' || *p > L'9') return FALSE;
-        while (*p >= L'0' && *p <= L'9')
-        {
-            if (++decimals > 2) return FALSE;
-            hundredths = hundredths * 10 + (*p - L'0');
-            ++p;
-        }
-    }
-    while (*p == L' ' || *p == L'\t') ++p;
-    if (*p || points < 1 || (points == 500 && hundredths)) return FALSE;
-    if (decimals == 1) hundredths *= 10;
-    if (hundredths % 5) return FALSE;
-    *twips = points * 20 + hundredths / 5;
-    return TRUE;
+    return rwp_parse_points(text, twips) && *twips >= 20 && *twips <= 10000;
 }
 
 static void rwp_unified_write_size(HWND dlg, int controlId, LONG twips)
@@ -19524,7 +19602,7 @@ static LRESULT OnCreate( HWND hWnd )
      * with TB_SETIMAGELIST (per Microsoft TB_SETIMAGELIST documentation).
      * Create the control directly, configure imagery, then add buttons. */
     hToolBarWnd = CreateWindowExW(0, TOOLBARCLASSNAMEW, NULL,
-      WS_CHILD | WS_VISIBLE | CCS_NOPARENTALIGN | CCS_NOMOVEY |
+      WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | CCS_NOPARENTALIGN | CCS_NOMOVEY |
       CCS_NORESIZE | TBSTYLE_FLAT | TBSTYLE_TOOLTIPS,
       0, 0, 0, 0, hReBarWnd, (HMENU)IDC_TOOLBAR, hInstance, NULL);
     if (!hToolBarWnd) return -1;
@@ -19553,22 +19631,45 @@ static LRESULT OnCreate( HWND hWnd )
     AddButton(hToolBarWnd, 12, ID_OVERTYPE);
     AddSeparator(hToolBarWnd);
     AddButton(hToolBarWnd, 15, ID_EDIT_REMOVE_FORMATTING);
+    AddSeparator(hToolBarWnd);
+    {
+        TBBUTTON slot = {0};
+        slot.iBitmap = 94; /* Separator width reserves room for the editable combo. */
+        slot.idCommand = IDC_VIEW_ZOOM;
+        slot.fsStyle = BTNS_SEP;
+        SendMessageW(hToolBarWnd, TB_ADDBUTTONSW, 1, (LPARAM)&slot);
+    }
+    AddSeparator(hToolBarWnd);
     AddButton(hToolBarWnd, 11, ID_DATETIME);
     AddButton(hToolBarWnd, 13, ID_INSERT_TABLE);
 
     rwp_disable_native_theme(hToolBarWnd);
     SendMessageW(hToolBarWnd, TB_AUTOSIZE, 0, 0);
 
+    rwpUiFont = rwp_create_configured_ui_font(hWnd, 0);
+    rwpZoomList = CreateWindowExW(0, WC_COMBOBOXEXW, NULL,
+        WS_BORDER | WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | WS_VSCROLL,
+        0, 0, 94, 320, hToolBarWnd, (HMENU)IDC_VIEW_ZOOM, hInstance, NULL);
+    rwp_theme_combo(rwpZoomList);
+    rwp_enlarge_combo(rwpZoomList);
+    rwp_fill_zoom(rwpZoomList, TRUE);
+    if (!rwpZoomList) return -1;
+    SetWindowSubclass(hToolBarWnd, rwp_zoom_toolbar_proc, 1, 0);
+    rwp_position_toolbar_zoom(hToolBarWnd);
+
     /* Row 1: independent 36px buttons, 44px rebar child row. */
-    rwp_insert_ui_band(hReBarWnd, hToolBarWnd, BANDID_TOOLBAR,
-                       0, 678, 44, TRUE);
+    {
+        SIZE extent = {0};
+        SendMessageW(hToolBarWnd, TB_GETMAXSIZE, 0, (LPARAM)&extent);
+        rwp_insert_ui_band(hReBarWnd, hToolBarWnd, BANDID_TOOLBAR,
+                           0, max(extent.cx, 678 + 94 + 16), 44, TRUE);
+    }
 
     /* Row 2: enlarged font/size editors and formatting icons. */
     /* Same configured UI font as the dialogs; document formatting is separate. */
-    rwpUiFont = rwp_create_configured_ui_font(hMainWnd, 0);
     hFontListWnd = CreateWindowExW(0, WC_COMBOBOXEXW, NULL,
                       WS_BORDER | WS_VISIBLE | WS_CHILD | CBS_DROPDOWN | CBS_SORT,
-                      0, 0, 250, 480, hReBarWnd, (HMENU)IDC_FONTLIST, hInstance, NULL);
+                      0, 0, 250, 720, hReBarWnd, (HMENU)IDC_FONTLIST, hInstance, NULL);
     rwp_theme_combo(hFontListWnd);
     rwp_enlarge_combo(hFontListWnd);
     rwp_insert_ui_band(hReBarWnd, hFontListWnd, BANDID_FONTLIST,
@@ -19576,7 +19677,7 @@ static LRESULT OnCreate( HWND hWnd )
 
     hSizeListWnd = CreateWindowExW(0, WC_COMBOBOXEXW, NULL,
                       WS_BORDER | WS_VISIBLE | WS_CHILD | CBS_DROPDOWN,
-                      0, 0, 80, 200, hReBarWnd, (HMENU)IDC_SIZELIST, hInstance, NULL);
+                      0, 0, 80, 600, hReBarWnd, (HMENU)IDC_SIZELIST, hInstance, NULL);
     rwp_theme_combo(hSizeListWnd);
     rwp_enlarge_combo(hSizeListWnd);
     rwp_insert_ui_band(hReBarWnd, hSizeListWnd, BANDID_SIZELIST,
@@ -19690,6 +19791,7 @@ static LRESULT OnCreate( HWND hWnd )
     rwp_startup_profile_mark("Font enumeration begin");
     populate_font_list(hFontListWnd);
     rwp_startup_profile_mark("Font enumeration completed");
+    rwp_load_view_preferences();
     populate_size_list(hSizeListWnd);
     DoLoadStrings();
     SendMessageW(hEditorWnd, EM_SETMODIFY, FALSE, 0);
@@ -19865,6 +19967,17 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
     HWND hwndFontList = GetDlgItem(hwndReBar, IDC_FONTLIST);
     HWND hwndSizeList = GetDlgItem(hwndReBar, IDC_SIZELIST);
 
+    if (pHdr->hwndFrom == rwpZoomList && pHdr->code == CBEN_ENDEDITW)
+    {
+        NMCBEENDEDITW *edit = (NMCBEENDEDITW *)lParam;
+        if (edit->iWhy != CBENF_ESCAPE && edit->fChanged)
+            rwp_commit_zoom(edit->szText);
+        else
+            rwp_refresh_zoom(hEditorWnd);
+        /* ComboBoxEx finishes updating its edit after this notification. */
+        PostMessageW(hWnd, RWP_WM_REFRESH_ZOOM, 0, 0);
+        return 0;
+    }
     if (pHdr->hwndFrom == hwndFontList || pHdr->hwndFrom == hwndSizeList)
     {
         if (pHdr->code == CBEN_ENDEDITW)
@@ -20540,6 +20653,259 @@ static int rwp_track_highlight_palette(HWND owner, int x, int y, BOOL allowAny)
     if (previousState != (UINT)-1 && (previousState & (MF_DISABLED | MF_GRAYED)))
         EnableMenuItem(popup, ID_COLOR_AUTOMATIC, MF_BYCOMMAND | MF_GRAYED);
     return selection;
+}
+
+static void rwp_load_view_preferences(void)
+{
+    DWORD bytes = sizeof(rwpSizes);
+    int zoom;
+    if (!rwp_read_binary_option(L"FontSizePresets", rwpSizes, &bytes) ||
+        bytes < sizeof(WCHAR) || bytes % sizeof(WCHAR) ||
+        rwpSizes[bytes/sizeof(WCHAR)-1] || !rwp_size_choices(rwpSizes, NULL, FALSE))
+        lstrcpyW(rwpSizes, rwpStockSizes);
+    bytes = sizeof(zoom);
+    if (rwp_read_binary_option(L"DefaultDocumentZoom", &zoom, &bytes) &&
+        bytes == sizeof(zoom) && zoom >= 5 && zoom <= 300)
+        rwpDefaultZoom = zoom;
+}
+
+static INT_PTR CALLBACK rwp_default_zoom_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    WCHAR text[40];
+    BOOL it = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    int zoom;
+    HWND combo = GetDlgItem(dlg, IDC_PREF_VALUE);
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+        rwp_theme_dialog(dlg);
+        if (it)
+        {
+            SetWindowTextW(dlg, L"Zoom predefinito");
+            SetDlgItemTextW(dlg, IDC_PREF_HINT, L"Zoom per documenti nuovi e aperti (5% - 300%):");
+            SetDlgItemTextW(dlg, IDCANCEL, L"Annulla");
+        }
+        rwp_fill_zoom(combo, FALSE);
+        SendMessageW(combo, CB_LIMITTEXT, 16, 0);
+        wsprintfW(text, L"%d%%", rwpDefaultZoom);
+        SetWindowTextW(combo, text);
+        return TRUE;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK)
+        {
+            GetWindowTextW(combo, text, 40);
+            zoom = rwp_parse_zoom(text);
+            if (!zoom)
+            {
+                SetDlgItemTextW(dlg, IDC_PREF_HINT, it ? L"Inserisci un intero dal 5% al 300%." :
+                                                        L"Enter a whole percentage from 5% to 300%.");
+                SetFocus(combo);
+                return TRUE;
+            }
+            if (!rwp_write_binary_option(L"DefaultDocumentZoom", &zoom, sizeof(zoom)))
+            {
+                rwp_report_settings_save_error(dlg);
+                return TRUE;
+            }
+            rwpDefaultZoom = zoom;
+        }
+        else if (LOWORD(wp) != IDCANCEL) break;
+        /* fall through */
+    case WM_CLOSE: DestroyWindow(dlg); return TRUE;
+    case WM_NCDESTROY: rwpDefaultZoomWnd = NULL; break;
+    }
+    return FALSE;
+}
+
+static INT_PTR CALLBACK rwp_sizes_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    BOOL it = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    HWND edit = GetDlgItem(dlg, IDC_PREF_VALUE);
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+        rwp_theme_dialog(dlg);
+        if (it)
+        {
+            SetWindowTextW(dlg, L"Configura dimensioni carattere");
+            SetDlgItemTextW(dlg, IDC_PREF_HINT, L"Una dimensione per riga, nell'ordine desiderato.");
+            SetDlgItemTextW(dlg, IDC_PREF_RESET, L"Ripristina valori");
+            SetDlgItemTextW(dlg, IDCANCEL, L"Annulla");
+        }
+        SendMessageW(edit, EM_SETLIMITTEXT, sizeof(rwpSizes)/sizeof(WCHAR)-1, 0);
+        SetWindowTextW(edit, rwpSizes);
+        return TRUE;
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDC_PREF_RESET)
+        {
+            SetWindowTextW(edit, rwpStockSizes);
+            return TRUE;
+        }
+        if (LOWORD(wp) == IDOK)
+        {
+            WCHAR draft[sizeof(rwpSizes)/sizeof(WCHAR)];
+            int length = GetWindowTextW(edit, draft, sizeof(draft)/sizeof(WCHAR));
+            if (!rwp_size_choices(draft, NULL, FALSE))
+            {
+                SetDlgItemTextW(dlg, IDC_PREF_HINT, it ?
+                    L"Una dimensione per riga: da 0,05 a 1638 pt, a passi di 0,05." :
+                    L"Enter one size per line, 0.05 to 1638 pt in steps of 0.05.");
+                SetFocus(edit);
+                return TRUE;
+            }
+            if (!rwp_write_binary_option(L"FontSizePresets", draft, (length + 1)*sizeof(WCHAR)))
+            {
+                rwp_report_settings_save_error(dlg);
+                return TRUE;
+            }
+            lstrcpyW(rwpSizes, draft);
+            populate_size_list(GetDlgItem(GetDlgItem(hMainWnd, IDC_REBAR), IDC_SIZELIST));
+            if (rwpFontWnd)
+            {
+                HWND sizes = GetDlgItem(rwpFontWnd, IDC_FONT_POINTS);
+                WCHAR current[48];
+                GetWindowTextW(sizes, current, 48);
+                SendMessageW(sizes, CB_RESETCONTENT, 0, 0);
+                rwp_size_choices(rwpSizes, sizes, FALSE);
+                SetWindowTextW(sizes, current);
+            }
+        }
+        else if (LOWORD(wp) != IDCANCEL) break;
+        /* fall through */
+    case WM_CLOSE: DestroyWindow(dlg); return TRUE;
+    case WM_NCDESTROY: rwpSizesWnd = NULL; break;
+    }
+    return FALSE;
+}
+
+static const DWORD rwpFontEffects[] = {CFM_BOLD, CFM_ITALIC, CFM_UNDERLINE, CFM_STRIKEOUT};
+
+static INT_PTR CALLBACK rwp_font_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
+{
+    static CHARFORMAT2W draft;
+    static DWORD changed;
+    static BOOL automatic;
+    BOOL it = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    int id = LOWORD(wp), i;
+    WCHAR text[48];
+    switch (msg)
+    {
+    case WM_INITDIALOG:
+        rwp_theme_dialog(dlg);
+        if (it)
+        {
+            SetWindowTextW(dlg, L"Carattere");
+            SetDlgItemTextW(dlg, IDC_FONT_FACE_LABEL, L"Carattere");
+            SetDlgItemTextW(dlg, IDC_FONT_POINTS_LABEL, L"Punti");
+            SetDlgItemTextW(dlg, IDC_FONT_BOLD_CHECK, L"Grassetto");
+            SetDlgItemTextW(dlg, IDC_FONT_ITALIC_CHECK, L"Corsivo");
+            SetDlgItemTextW(dlg, IDC_FONT_UNDER_CHECK, L"Sottolineato");
+            SetDlgItemTextW(dlg, IDC_FONT_STRIKE_CHECK, L"Barrato");
+            SetDlgItemTextW(dlg, IDC_FONT_COLOR_PICK, L"Colore testo...");
+            SetDlgItemTextW(dlg, IDCANCEL, L"Annulla");
+        }
+        ZeroMemory(&draft, sizeof(draft));
+        draft.cbSize = sizeof(draft);
+        SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&draft);
+        automatic = !!(draft.dwEffects & CFE_AUTOCOLOR);
+        rwp_bulk_fill_font_combo(dlg, IDC_FONT_FACE_EDIT);
+        rwp_size_choices(rwpSizes, GetDlgItem(dlg, IDC_FONT_POINTS), FALSE);
+        SendDlgItemMessageW(dlg, IDC_FONT_POINTS, CB_LIMITTEXT, 32, 0);
+        if (draft.dwMask & CFM_FACE) SetDlgItemTextW(dlg, IDC_FONT_FACE_EDIT, draft.szFaceName);
+        if (draft.dwMask & CFM_SIZE)
+        {
+            rwp_format_points(text, draft.yHeight);
+            SetDlgItemTextW(dlg, IDC_FONT_POINTS, text);
+        }
+        for (i = 0; i < 4; ++i)
+            CheckDlgButton(dlg, IDC_FONT_BOLD_CHECK+i, !(draft.dwMask & rwpFontEffects[i]) ?
+                BST_INDETERMINATE : (draft.dwEffects & rwpFontEffects[i]) ? BST_CHECKED : BST_UNCHECKED);
+        changed = 0;
+        return TRUE;
+    case WM_DRAWITEM:
+        if (wp == IDC_FONT_SAMPLE)
+        {
+            DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp;
+            LOGFONTW lf = {0};
+            LONG size;
+            HFONT font, old;
+            RECT bounds = d->rcItem;
+            GetDlgItemTextW(dlg, IDC_FONT_FACE_EDIT, lf.lfFaceName, LF_FACESIZE);
+            GetDlgItemTextW(dlg, IDC_FONT_POINTS, text, 48);
+            if (!rwp_parse_points(text, &size)) size = 240;
+            lf.lfHeight = -MulDiv(size, GetDeviceCaps(d->hDC, LOGPIXELSY), 1440);
+            lf.lfWeight = IsDlgButtonChecked(dlg, IDC_FONT_BOLD_CHECK) == BST_CHECKED ? FW_BOLD : FW_NORMAL;
+            lf.lfItalic = IsDlgButtonChecked(dlg, IDC_FONT_ITALIC_CHECK) == BST_CHECKED;
+            lf.lfUnderline = IsDlgButtonChecked(dlg, IDC_FONT_UNDER_CHECK) == BST_CHECKED;
+            lf.lfStrikeOut = IsDlgButtonChecked(dlg, IDC_FONT_STRIKE_CHECK) == BST_CHECKED;
+            font = CreateFontIndirectW(&lf);
+            old = font ? (HFONT)SelectObject(d->hDC, font) : NULL;
+            FillRect(d->hDC, &bounds, GetSysColorBrush(COLOR_WINDOW));
+            SetBkMode(d->hDC, TRANSPARENT);
+            SetTextColor(d->hDC, automatic ? GetSysColor(COLOR_WINDOWTEXT) : draft.crTextColor);
+            DrawTextW(d->hDC, L"AaBbYyZz", -1, &bounds, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (font) { SelectObject(d->hDC, old); DeleteObject(font); }
+            return TRUE;
+        }
+        break;
+    case WM_COMMAND:
+        if (id == IDC_FONT_FACE_EDIT || id == IDC_FONT_POINTS)
+        {
+            if (HIWORD(wp) != CBN_EDITCHANGE && HIWORD(wp) != CBN_SELCHANGE) break;
+            changed |= id == IDC_FONT_FACE_EDIT ? CFM_FACE : CFM_SIZE;
+        }
+        else if (id >= IDC_FONT_BOLD_CHECK && id <= IDC_FONT_STRIKE_CHECK)
+            changed |= rwpFontEffects[id-IDC_FONT_BOLD_CHECK];
+        else if (id == IDC_FONT_COLOR_PICK)
+        {
+            if (rwp_bulk_pick_palette_color(dlg, id, &draft.crTextColor, &automatic))
+                changed |= CFM_COLOR;
+        }
+        else if (id == IDOK)
+        {
+            CHARFORMAT2W fmt = {0};
+            fmt.cbSize = sizeof(fmt);
+            fmt.dwMask = changed;
+            GetDlgItemTextW(dlg, IDC_FONT_FACE_EDIT, fmt.szFaceName, LF_FACESIZE);
+            GetDlgItemTextW(dlg, IDC_FONT_POINTS, text, 48);
+            if ((changed & CFM_FACE) && !fmt.szFaceName[0])
+            {
+                SetFocus(GetDlgItem(dlg, IDC_FONT_FACE_EDIT));
+                return TRUE;
+            }
+            if ((changed & CFM_SIZE) && !rwp_parse_points(text, &fmt.yHeight))
+            {
+                MessageBeep(MB_ICONWARNING);
+                SetFocus(GetDlgItem(dlg, IDC_FONT_POINTS));
+                return TRUE;
+            }
+            for (i = 0; i < 4; ++i)
+                {
+                    UINT state = IsDlgButtonChecked(dlg, IDC_FONT_BOLD_CHECK+i);
+                    if (state == BST_CHECKED) fmt.dwEffects |= rwpFontEffects[i];
+                    if (state == BST_INDETERMINATE) fmt.dwMask &= ~rwpFontEffects[i];
+                }
+            if (changed & CFM_COLOR)
+            {
+                fmt.crTextColor = draft.crTextColor;
+                if (automatic) fmt.dwEffects |= CFE_AUTOCOLOR;
+                if (rwp_set_color_format_preserving_combining_sequences(hEditorWnd, &fmt))
+                    rwp_record_selected_text_color(fmt.crTextColor, automatic);
+            }
+            else if (changed) SendMessageW(hEditorWnd, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+            update_font_list();
+            DestroyWindow(dlg);
+            SetFocus(hEditorWnd);
+            return TRUE;
+        }
+        else if (id == IDCANCEL) { DestroyWindow(dlg); return TRUE; }
+        else break;
+        InvalidateRect(GetDlgItem(dlg, IDC_FONT_SAMPLE), NULL, TRUE);
+        return TRUE;
+    case WM_CLOSE: DestroyWindow(dlg); return TRUE;
+    case WM_NCDESTROY: rwpFontWnd = NULL; break;
+    }
+    return FALSE;
 }
 
 static void destroy_color_swatches(void)
@@ -26466,7 +26832,8 @@ static HWND get_clipboard_command_target(HWND hWnd, HWND hwndEditor)
     HWND hwndFontEdit = hwndFontList ? (HWND)SendMessageW(hwndFontList, CBEM_GETEDITCONTROL, 0, 0) : NULL;
     HWND hwndSizeEdit = hwndSizeList ? (HWND)SendMessageW(hwndSizeList, CBEM_GETEDITCONTROL, 0, 0) : NULL;
 
-    if (hwndFocus == hwndFontEdit || hwndFocus == hwndSizeEdit)
+    if (hwndFocus == hwndFontEdit || hwndFocus == hwndSizeEdit ||
+        (rwpZoomList && hwndFocus == (HWND)SendMessageW(rwpZoomList, CBEM_GETEDITCONTROL, 0, 0)))
         return hwndFocus;
 
     return hwndEditor;
@@ -27378,6 +27745,7 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
                 backgroundSaveEpoch = 0;
 
                 set_fileformat(SF_RTF);
+                rwp_apply_zoom(rwpDefaultZoom);
                 /* Also reset the insertion format, not just SCF_DEFAULT. */
                 background_set_font_colors(RGB(0, 0, 0), TRUE,
                                            RGB(0, 0, 0), TRUE);
@@ -27485,7 +27853,13 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         break;
 
     case ID_FONTSETTINGS:
-        dialog_choose_font();
+        rwp_show_settings_window(&rwpFontWnd, IDD_FONT_MODELESS, rwp_font_proc);
+        break;
+    case ID_DEFAULT_ZOOM:
+        rwp_show_settings_window(&rwpDefaultZoomWnd, IDD_DEFAULT_ZOOM, rwp_default_zoom_proc);
+        break;
+    case ID_CONFIGURE_SIZES:
+        rwp_show_settings_window(&rwpSizesWnd, IDD_CONFIGURE_SIZES, rwp_sizes_proc);
         break;
 
     case ID_CAPITALIZE_WORDS:
@@ -28131,6 +28505,15 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         }
         break;
 
+    case IDC_VIEW_ZOOM:
+        if (HIWORD(wParam) == CBN_SELENDOK)
+        {
+            WCHAR text[24];
+            if (get_comboexlist_selection(rwpZoomList, text, 24))
+                rwp_commit_zoom(text);
+        }
+        break;
+
     case IDC_SIZELIST:
         if (HIWORD(wParam) == CBN_SELENDOK)
         {
@@ -28381,6 +28764,10 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 HeapFree(GetProcessHeap(), 0, transfer);
             }
         }
+        return 0;
+
+    case RWP_WM_REFRESH_ZOOM:
+        rwp_refresh_zoom(hEditorWnd);
         return 0;
 
     case RWP_WM_RELAYOUT:
@@ -28825,6 +29212,17 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
         }
     }
 
+    {
+        int i;
+        for (i = 0; i < GetMenuItemCount(rwpMainMenu); ++i)
+        {
+            HMENU menu = GetSubMenu(rwpMainMenu, i);
+            if (menu && GetMenuState(menu, ID_VIEWPROPERTIES, MF_BYCOMMAND) != (UINT)-1)
+                InsertMenuW(menu, ID_VIEWPROPERTIES, MF_BYCOMMAND | MF_STRING, ID_DEFAULT_ZOOM,
+                    PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN ?
+                    L"Zoom predefinito..." : L"Default Zoom...");
+        }
+    }
     /* Add configuration and recovery commands to every localized Help menu. */
     {
         int i;
@@ -28850,7 +29248,9 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                     ID_BOOKMARK_RECOVER,
                     italian ? L"Strumenti segnalibri..." :
                               L"Bookmark Tools...");
-                InsertMenuW(submenu, 4, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                InsertMenuW(submenu, 3, MF_BYPOSITION | MF_STRING, ID_CONFIGURE_SIZES,
+                    italian ? L"Configura dimensioni carattere..." : L"Configure font sizes...");
+                InsertMenuW(submenu, 5, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
                 break;
             }
         }
@@ -29001,6 +29401,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     set_caption(NULL);
     set_bar_states();
     set_fileformat(SF_RTF);
+    rwp_apply_zoom(rwpDefaultZoom);
     hColorPopupMenu = LoadMenuW(hInstance, MAKEINTRESOURCEW(IDM_COLOR_POPUP));
     rwp_load_color_order();
     /* Printer metadata is now fetched on demand only when page-margin
@@ -29032,6 +29433,17 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
             (rwp_capture_shortcut_key(rwpShortcutSettingsWnd, &msg) ||
              IsDialogMessageW(rwpShortcutSettingsWnd, &msg)))
             continue;
+        if ((rwpFontWnd && IsDialogMessageW(rwpFontWnd, &msg)) ||
+            (rwpSizesWnd && IsDialogMessageW(rwpSizesWnd, &msg)) ||
+            (rwpDefaultZoomWnd && IsDialogMessageW(rwpDefaultZoomWnd, &msg)))
+            continue;
+        if (rwpZoomList && IsChild(rwpZoomList, msg.hwnd) &&
+            (msg.message == WM_KEYDOWN || msg.message == WM_CHAR))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            continue;
+        }
         if (rwpColorOrderWnd && IsWindow(rwpColorOrderWnd) &&
             IsDialogMessageW(rwpColorOrderWnd, &msg))
             continue;
