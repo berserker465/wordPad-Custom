@@ -1122,6 +1122,64 @@ static DWORD WINAPI rwp_drive_worker(LPVOID data)
     return 0;
 }
 
+/* Automatic backups need only a UI-thread message target for completion.
+ * A message-only window cannot be shown, activated or placed on the taskbar,
+ * unlike the manual upload dialog used by File > Upload to Google Drive. */
+static const WCHAR rwpDriveAutoClass[] = L"RWordPadCloudAutoMessageSink";
+
+static LRESULT CALLBACK rwp_drive_auto_window(HWND window, UINT message,
+                                               WPARAM wp, LPARAM lp)
+{
+    RWP_DRIVE_CTX *c=(RWP_DRIVE_CTX*)GetWindowLongPtrW(window,GWLP_USERDATA);
+    if(message==RWP_DRIVE_DONE && c) {
+        RWP_DRIVE_AUTO_COMPLETE callback=c->autoCallback;
+        void *userData=c->userData;
+        WCHAR fileID[256],failure[512];
+        c->busy=FALSE;
+        lstrcpynW(fileID,c->resultID,256);
+        failure[0]=0;
+        if(wp && c->retentionWarning[0]) {
+            if(!MultiByteToWideChar(CP_UTF8,0,c->retentionWarning,-1,failure,512))
+                lstrcpyW(failure,L"Cloud revision retention could not be completed.");
+        }
+        if(!wp) {
+            if(!c->error[0])lstrcpynA(c->error,"Google Drive upload failed.",sizeof(c->error));
+            if(!MultiByteToWideChar(CP_UTF8,0,c->error,-1,failure,512))
+                lstrcpyW(failure,L"Google Drive upload failed.");
+        }
+        /* Clear before destruction so a normal completion is never reported
+         * again as cancellation by WM_NCDESTROY. */
+        c->autoCallback=NULL;
+        DestroyWindow(window);
+        if(callback)callback(wp?TRUE:FALSE,fileID,failure,userData);
+        return 0;
+    }
+    if(message==WM_NCDESTROY && c) {
+        RWP_DRIVE_AUTO_COMPLETE callback=c->autoCallback;
+        void *userData=c->userData;
+        LRESULT result=DefWindowProcW(window,message,wp,lp);
+        c->autoCallback=NULL;
+        if(rwpDriveAutoWnd==window)rwpDriveAutoWnd=NULL;
+        c->dialog=NULL;
+        /* The worker holds its own reference if it is still running. */
+        if(callback)
+            callback(FALSE,L"",L"Automatic upload stopped before completion.",userData);
+        rwp_drive_release(c);
+        return result;
+    }
+    return DefWindowProcW(window,message,wp,lp);
+}
+
+static BOOL rwp_drive_register_auto_window(void)
+{
+    WNDCLASSW klass;
+    ZeroMemory(&klass,sizeof(klass));
+    klass.lpfnWndProc=rwp_drive_auto_window;
+    klass.hInstance=GetModuleHandleW(NULL);
+    klass.lpszClassName=rwpDriveAutoClass;
+    return RegisterClassW(&klass)!=0 || GetLastError()==ERROR_CLASS_ALREADY_EXISTS;
+}
+
 static INT_PTR CALLBACK rwp_drive_dialog(HWND dialog,UINT message,WPARAM wp,LPARAM lp)
 {
     RWP_DRIVE_CTX *c=(RWP_DRIVE_CTX*)GetWindowLongPtrW(dialog,DWLP_USER);
@@ -1138,11 +1196,6 @@ static INT_PTR CALLBACK rwp_drive_dialog(HWND dialog,UINT message,WPARAM wp,LPAR
         if(c->docFolder[0])lstrcpynW(c->folder,c->docFolder,256);
         if(!c->folder[0])lstrcpyW(c->folder,L"root");
         SetDlgItemTextW(dialog,IDC_CLOUD_NATIVE_FOLDER,c->folder);
-        if (c->automatic) {
-            /* A hidden dialog is only a UI-thread message sink for the worker. */
-            PostMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDOK,0), 0);
-            return TRUE;
-        }
         rwp_drive_status(c,GetFileAttributesW(c->credentialPath)!=INVALID_FILE_ATTRIBUTES?
                          L"Saved Google login found; will attempt automatic token renewal.":
                          L"Ready. Load your Desktop OAuth JSON if a new login is needed.");
@@ -1152,26 +1205,6 @@ static INT_PTR CALLBACK rwp_drive_dialog(HWND dialog,UINT message,WPARAM wp,LPAR
     if(message==RWP_DRIVE_DONE)
     {
         c->busy=FALSE;
-        if (c->automatic) {
-            RWP_DRIVE_AUTO_COMPLETE cb=c->autoCallback;
-            void *userData=c->userData;
-            WCHAR fileID[256],failure[512];
-            lstrcpynW(fileID,c->resultID,256);
-            failure[0]=0;
-            if(wp && c->retentionWarning[0]) {
-                if(!MultiByteToWideChar(CP_UTF8,0,c->retentionWarning,-1,failure,512))
-                    lstrcpyW(failure,L"Cloud revision retention could not be completed.");
-            }
-            if(!wp) {
-                if(!c->error[0])lstrcpynA(c->error,"Google Drive upload failed.",sizeof(c->error));
-                if(!MultiByteToWideChar(CP_UTF8,0,c->error,-1,failure,512))
-                    lstrcpyW(failure,L"Google Drive upload failed.");
-            }
-            c->autoCallback=NULL;
-            DestroyWindow(dialog);
-            if(cb)cb(wp?TRUE:FALSE,fileID,failure,userData);
-            return TRUE;
-        }
         if(wp)
         {
             RWP_DRIVE_COMPLETE callback=c->callback;
@@ -1215,14 +1248,8 @@ static INT_PTR CALLBACK rwp_drive_dialog(HWND dialog,UINT message,WPARAM wp,LPAR
         void *userData=c->userData;
         c->callback=NULL;
         if(rwpDriveUploadWnd==dialog)rwpDriveUploadWnd=NULL;
-        if(rwpDriveAutoWnd==dialog)rwpDriveAutoWnd=NULL;
         c->dialog=NULL;
         if(callback)callback(FALSE,L"",userData);
-        if(c->autoCallback) {
-            RWP_DRIVE_AUTO_COMPLETE autoCallback=c->autoCallback;
-            c->autoCallback=NULL;
-            autoCallback(FALSE,L"",L"Automatic upload window closed before completion.",userData);
-        }
         rwp_drive_release(c);
         return TRUE;
     }
@@ -1264,26 +1291,6 @@ static INT_PTR CALLBACK rwp_drive_dialog(HWND dialog,UINT message,WPARAM wp,LPAR
         {
             WCHAR typedClient[320],typedSecret[300];char newClient[300],secret[256];
             if(c->busy)return TRUE;
-            if (c->automatic) {
-                HANDLE thread;
-                /* Never modify preferences and never request OAuth interactively. */
-                if(!c->clientID[0] || !rwp_drive_load_saved(c) ||
-                   !c->refresh[0] || !c->secret[0]) {
-                    rwp_drive_error(c,"No saved Google authorization. Use File > Upload to Google Drive once.");
-                    PostMessageW(dialog,RWP_DRIVE_DONE,0,0);
-                    return TRUE;
-                }
-                c->busy=TRUE;
-                InterlockedIncrement(&c->refs);
-                thread=CreateThread(NULL,0,rwp_drive_worker,c,0,NULL);
-                if(!thread) {
-                    rwp_drive_release(c);
-                    c->busy=FALSE;
-                    rwp_drive_error(c,"Unable to start automatic backup worker thread.");
-                    PostMessageW(dialog,RWP_DRIVE_DONE,0,0);
-                } else CloseHandle(thread);
-                return TRUE;
-            }
             GetDlgItemTextW(dialog,IDC_CLOUD_NATIVE_CLIENT,typedClient,320);
             GetDlgItemTextW(dialog,IDC_CLOUD_NATIVE_SECRET,typedSecret,300);
             GetDlgItemTextW(dialog,IDC_CLOUD_NATIVE_FOLDER,c->folder,256);
@@ -1414,9 +1421,9 @@ BOOL rwp_drive_native_upload_async(HWND owner,LPCWSTR document,LPCWSTR folderOve
     return TRUE;
 }
 
-/* Modeless but invisible transport for opt-in saves. A copy of the exact
- * saved RTF is captured by the caller and copied once more into this context;
- * the caller may then release its own queue snapshot. */
+/* Message-only transport for opt-in saves. The editor has already captured
+ * the exact saved bytes; the transport owns an independent immutable snapshot
+ * and reports completion on the editor's UI thread without creating a dialog. */
 BOOL rwp_drive_native_auto_upload_async(HWND owner, LPCWSTR document,
                                         LPCWSTR savedSnapshot, LPCWSTR folder,
                                         LPCWSTR documentID, LPCWSTR remoteID,
@@ -1426,7 +1433,9 @@ BOOL rwp_drive_native_auto_upload_async(HWND owner, LPCWSTR document,
 {
     RWP_DRIVE_CTX *c;
     WCHAR directory[MAX_PATH];
-    HWND dialog;
+    HWND window;
+    HANDLE thread;
+    (void)owner; /* The HWND_MESSAGE transport has no visible owner. */
     if (rwp_drive_auto_busy() || rwp_drive_upload_window() ||
         !document || !*document || !savedSnapshot || !*savedSnapshot ||
         !folder || !*folder || !documentID || !*documentID ||
@@ -1446,18 +1455,50 @@ BOOL rwp_drive_native_auto_upload_async(HWND owner, LPCWSTR document,
     if(!rwp_drive_prepare_path(c) ||
        !GetTempPathW(MAX_PATH,directory) ||
        !GetTempFileNameW(directory,L"RWA",0,c->sourceSnapshot) ||
-       !CopyFileW(savedSnapshot,c->sourceSnapshot,FALSE)) {
+       !CopyFileW(savedSnapshot,c->sourceSnapshot,FALSE) ||
+       !rwp_drive_register_auto_window()) {
         rwp_drive_release(c);
         return FALSE;
     }
-    dialog=CreateDialogParamW(GetModuleHandleW(NULL),
-        MAKEINTRESOURCEW(IDD_CLOUD_NATIVE_UPLOAD),owner,rwp_drive_dialog,(LPARAM)c);
-    if(!dialog) {
+
+    window=CreateWindowExW(0,rwpDriveAutoClass,L"",0,0,0,0,0,
+                           HWND_MESSAGE,NULL,GetModuleHandleW(NULL),NULL);
+    if(!window) {
         rwp_drive_release(c);
         return FALSE;
     }
-    rwpDriveAutoWnd=dialog;
-    /* Do not ShowWindow: the editor remains fully usable. */
+    /* The message-only window is never shown and has no dialog controls. */
+    SetLastError(ERROR_SUCCESS);
+    if(!SetWindowLongPtrW(window,GWLP_USERDATA,(LONG_PTR)c) &&
+       GetLastError()!=ERROR_SUCCESS) {
+        DestroyWindow(window);
+        rwp_drive_release(c);
+        return FALSE;
+    }
+    c->dialog=window;
+    rwpDriveAutoWnd=window;
+
+    /* Mirror the automatic dialog's previous startup behavior: load the
+     * global client ID, use this document's folder, then load the existing
+     * encrypted login. Never modify preferences or request an OAuth browser. */
+    rwp_drive_load_prefs(c);
+    lstrcpynW(c->folder,c->docFolder,256);
+    if(!c->clientID[0] || !rwp_drive_load_saved(c) ||
+       !c->refresh[0] || !c->secret[0]) {
+        rwp_drive_error(c,"No saved Google authorization. Use File > Upload to Google Drive once.");
+        PostMessageW(window,RWP_DRIVE_DONE,0,0);
+        return TRUE;
+    }
+
+    c->busy=TRUE;
+    InterlockedIncrement(&c->refs);
+    thread=CreateThread(NULL,0,rwp_drive_worker,c,0,NULL);
+    if(!thread) {
+        rwp_drive_release(c);
+        c->busy=FALSE;
+        rwp_drive_error(c,"Unable to start automatic backup worker thread.");
+        PostMessageW(window,RWP_DRIVE_DONE,0,0);
+    } else CloseHandle(thread);
     return TRUE;
 }
 
