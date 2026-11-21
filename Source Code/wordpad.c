@@ -25634,12 +25634,48 @@ static BOOL rwp_image_rtf_current_goals(const RTF_MEMORY *rtf,
     return *width > 0 && *height > 0;
 }
 
-static void rwp_image_size_dialog_enable(HWND dialog)
+static UINT rwp_display_size_field(HWND dialog)
 {
-    UINT mode = IsDlgButtonChecked(dialog, IDC_IMAGE_USE_WIDTH) == BST_CHECKED ?
+    return IsDlgButtonChecked(dialog, IDC_IMAGE_USE_WIDTH) == BST_CHECKED ?
                     IDC_IMAGE_WIDTH :
                 IsDlgButtonChecked(dialog, IDC_IMAGE_USE_HEIGHT) == BST_CHECKED ?
                     IDC_IMAGE_HEIGHT : IDC_IMAGE_PERCENT;
+}
+
+static BOOL rwp_read_display_amount(HWND dialog, UINT field, double *amount)
+{
+    WCHAR input[64], *first, *last;
+    int i;
+    GetDlgItemTextW(dialog, field, input, 64);
+    for (i = 0; input[i]; ++i) if (input[i] == L',') input[i] = L'.';
+    first = input;
+    while (*first == L' ' || *first == L'\t') ++first;
+    *amount = wcstod(first, &last);
+    if (first == last) return FALSE;
+    while (*last == L' ' || *last == L'\t') ++last;
+    return !*last && *amount > 0 && *amount <= 1000000.0 &&
+           (field != IDC_IMAGE_PERCENT || (*amount >= 1 && *amount <= 500));
+}
+
+static BOOL rwp_display_size_goals(UINT field, double amount, LONG width, LONG height,
+                                   LONG *goalWidth, LONG *goalHeight)
+{
+    double factor, w, h;
+    if (width < 1 || height < 1) return FALSE;
+    factor = field == IDC_IMAGE_WIDTH ? amount / width :
+             field == IDC_IMAGE_HEIGHT ? amount / height : amount / 100.0;
+    w = width * 15.0 * factor;
+    h = height * 15.0 * factor;
+    if (!(factor >= 0.01 && factor <= 5 && w >= 1 && w <= 1000000 &&
+          h >= 1 && h <= 1000000)) return FALSE;
+    *goalWidth = (LONG)(w + 0.5);
+    *goalHeight = (LONG)(h + 0.5);
+    return TRUE;
+}
+
+static void rwp_image_size_dialog_enable(HWND dialog)
+{
+    UINT mode = rwp_display_size_field(dialog);
     EnableWindow(GetDlgItem(dialog, IDC_IMAGE_PERCENT), mode == IDC_IMAGE_PERCENT);
     EnableWindow(GetDlgItem(dialog, IDC_IMAGE_WIDTH), mode == IDC_IMAGE_WIDTH);
     EnableWindow(GetDlgItem(dialog, IDC_IMAGE_HEIGHT), mode == IDC_IMAGE_HEIGHT);
@@ -25734,27 +25770,12 @@ static INT_PTR CALLBACK rwp_image_size_dialog_proc(HWND dialog, UINT message,
         }
         if (LOWORD(wParam) == IDOK && options)
         {
-            UINT chosenField = IsDlgButtonChecked(dialog, IDC_IMAGE_USE_WIDTH) == BST_CHECKED ?
-                                   IDC_IMAGE_WIDTH :
-                               IsDlgButtonChecked(dialog, IDC_IMAGE_USE_HEIGHT) == BST_CHECKED ?
-                                   IDC_IMAGE_HEIGHT : IDC_IMAGE_PERCENT;
-            WCHAR input[64], *first, *last;
-            double amount, factor, goalWidth, goalHeight;
-            int j;
-            GetDlgItemTextW(dialog, chosenField, input, 64);
-            for (j = 0; input[j]; ++j) if (input[j] == L',') input[j] = L'.';
-            first = input;
-            while (*first == L' ' || *first == L'\t') ++first;
-            amount = wcstod(first, &last);
-            while (*last == L' ' || *last == L'\t') ++last;
-            factor = chosenField == IDC_IMAGE_WIDTH ? amount / options->sourceWidth :
-                     chosenField == IDC_IMAGE_HEIGHT ? amount / options->sourceHeight :
-                                                        amount / 100.0;
-            goalWidth = options->sourceWidth * 15.0 * factor;
-            goalHeight = options->sourceHeight * 15.0 * factor;
-            if (first == last || *last || !(factor >= 0.01 && factor <= 5.0) ||
-                !(goalWidth >= 1.0 && goalWidth <= 1000000.0) ||
-                !(goalHeight >= 1.0 && goalHeight <= 1000000.0))
+            UINT chosenField = rwp_display_size_field(dialog);
+            double amount;
+            if (!rwp_read_display_amount(dialog, chosenField, &amount) ||
+                !rwp_display_size_goals(chosenField, amount, options->sourceWidth,
+                                        options->sourceHeight, &options->newWidth,
+                                        &options->newHeight))
             {
                 MessageBoxW(dialog,
                     italian ? L"Inserisci una dimensione valida (tra l'1% e il 500% dell'immagine originale)." :
@@ -25765,10 +25786,6 @@ static INT_PTR CALLBACK rwp_image_size_dialog_proc(HWND dialog, UINT message,
                 SendDlgItemMessageW(dialog, chosenField, EM_SETSEL, 0, -1);
                 return TRUE;
             }
-            options->newWidth = (LONG)(goalWidth + 0.5);
-            options->newHeight = (LONG)(goalHeight + 0.5);
-            if (!options->newWidth) options->newWidth = 1;
-            if (!options->newHeight) options->newHeight = 1;
             {
                 RWP_IMAGE_SIZE_SETTINGS request = *options;
                 options->target = NULL; /* Transfer tracking reference to Apply. */
@@ -25783,6 +25800,77 @@ static INT_PTR CALLBACK rwp_image_size_dialog_proc(HWND dialog, UINT message,
     return FALSE;
 }
 
+/* Locate the hex body without interpreting nested picture properties as data. */
+static const char *rwp_picture_hex_start(const char *group, const char *end)
+{
+    const char *p = group + 6;
+    while (p < end - 1)
+    {
+        if (*p == '{')
+        {
+            const char *nested = rwp_inline_group_end(p, end);
+            if (!nested) return NULL;
+            p = nested;
+            continue;
+        }
+        if (*p == '\\')
+        {
+            ++p;
+            if (p >= end - 1) return NULL;
+            if (*p == '\\' || *p == '{' || *p == '}') { ++p; continue; }
+            while (p < end - 1 && ((*p >= 'a' && *p <= 'z') ||
+                   (*p >= 'A' && *p <= 'Z'))) ++p;
+            if (p < end - 1 && (*p == '-' || (*p >= '0' && *p <= '9')))
+            {
+                if (*p == '-') ++p;
+                while (p < end - 1 && *p >= '0' && *p <= '9') ++p;
+            }
+            if (p < end - 1 && *p == ' ') ++p;
+            continue;
+        }
+        if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') { ++p; continue; }
+        return p;
+    }
+    return NULL;
+}
+
+/* Change only top-level display properties. Copy nested metadata and the
+ * entire encoded image body verbatim, regardless of their size. */
+static BOOL rwp_append_resized_picture(RTF_MEMORY *out, const char *group, const char *end,
+                                       LONG width, LONG height)
+{
+    const char *body = rwp_picture_hex_start(group, end), *p = group + 6, *start = group;
+    LONG written;
+    char goals[100];
+    int n;
+    if (!body) return FALSE;
+    while (p < body)
+    {
+        SIZE_T next;
+        if (*p == '{')
+        {
+            p = rwp_inline_group_end(p, body);
+            if (!p) return FALSE;
+            continue;
+        }
+        if (*p == '\\' &&
+            (rwp_image_rtf_number((const BYTE *)group, body-group, p-group, "picwgoal", NULL, &next, NULL) ||
+             rwp_image_rtf_number((const BYTE *)group, body-group, p-group, "pichgoal", NULL, &next, NULL) ||
+             rwp_image_rtf_number((const BYTE *)group, body-group, p-group, "picscalex", NULL, &next, NULL) ||
+             rwp_image_rtf_number((const BYTE *)group, body-group, p-group, "picscaley", NULL, &next, NULL)))
+        {
+            if (stream_out_memory((DWORD_PTR)out, (LPBYTE)start, (LONG)(p-start), &written)) return FALSE;
+            start = p = group + next;
+        }
+        else ++p;
+    }
+    n = snprintf(goals, sizeof(goals), "\\picwgoal%ld\\pichgoal%ld\\picscalex100\\picscaley100 ", width, height);
+    return n > 0 && n < (int)sizeof(goals) &&
+        !stream_out_memory((DWORD_PTR)out, (LPBYTE)start, (LONG)(body-start), &written) &&
+        !stream_out_memory((DWORD_PTR)out, (LPBYTE)goals, n, &written) &&
+        !stream_out_memory((DWORD_PTR)out, (LPBYTE)body, (LONG)(end-body), &written);
+}
+
 /* Rebuild a self-contained RTF selection containing ONLY the picture group.
  * This avoids carrying cell/row controls back into a table (which could
  * reintroduce nested tables), while retaining every byte inside the picture
@@ -25790,70 +25878,25 @@ static INT_PTR CALLBACK rwp_image_size_dialog_proc(HWND dialog, UINT message,
 static BOOL rwp_image_rtf_resize(const RTF_MEMORY *source, LONG width, LONG height,
                                  RTF_INPUT_MEMORY *replacement)
 {
-    SIZE_T marker, groupEnd, i, out = 0;
-    char header[128], digits[32];
-    int added;
-    BYTE *dest;
-    static const char documentStart[] = "{\\rtf1\\ansi ";
-    if (!rwp_image_rtf_find_picture(source->data, source->used, &marker))
-        return FALSE;
+    SIZE_T marker, groupEnd;
+    RTF_MEMORY output = {0};
+    LONG written;
+    static const char prefix[] = "{\\rtf1\\ansi ";
+    if (!rwp_image_rtf_find_picture(source->data, source->used, &marker)) return FALSE;
     groupEnd = rtf_group_end((const char *)source->data, source->used, marker);
     if (groupEnd <= marker + 6 || groupEnd > source->used) return FALSE;
-    added = snprintf(header, sizeof(header),
-                     "\\picwgoal%ld\\pichgoal%ld\\picscalex100\\picscaley100 ",
-                     width, height);
-    if (added <= 0 || added >= (int)sizeof(header) ||
-        groupEnd - marker > (SIZE_T)-1 - 256) return FALSE;
-    dest = HeapAlloc(GetProcessHeap(), 0, (groupEnd - marker) + 256);
-    if (!dest) return FALSE;
-    memcpy(dest, documentStart, sizeof(documentStart) - 1);
-    out = sizeof(documentStart) - 1;
-    for (i = marker; i < groupEnd; )
+    if (stream_out_memory((DWORD_PTR)&output, (LPBYTE)prefix, sizeof(prefix)-1, &written) ||
+        !rwp_append_resized_picture(&output, (const char *)source->data + marker,
+                                    (const char *)source->data + groupEnd, width, height) ||
+        stream_out_memory((DWORD_PTR)&output, (LPBYTE)"}", 1, &written))
     {
-        if (i == marker + 6)
-        {
-            memcpy(dest + out, header, (SIZE_T)added);
-            out += (SIZE_T)added;
-        }
-        if (i >= marker + 6 && i - (marker + 6) < 16384 &&
-            source->data[i] == '\\')
-        {
-            static const char *const names[] =
-                { "picwgoal", "pichgoal", "picscalex", "picscaley" };
-            LONG values[4];
-            unsigned k;
-            values[0] = width;
-            values[1] = height;
-            values[2] = values[3] = 100;
-            for (k = 0; k < 4; ++k)
-            {
-                SIZE_T begin, end;
-                if (rwp_image_rtf_number(source->data, groupEnd, i,
-                                         names[k], &begin, &end, NULL))
-                {
-                    int newLength = snprintf(digits, sizeof(digits), "%ld", values[k]);
-                    if (newLength < 1 || newLength >= (int)sizeof(digits))
-                        goto failed;
-                    memcpy(dest + out, source->data + i, begin - i);
-                    out += begin - i;
-                    memcpy(dest + out, digits, (SIZE_T)newLength);
-                    out += (SIZE_T)newLength;
-                    i = end;
-                    break;
-                }
-            }
-            if (k < 4) continue;
-        }
-        dest[out++] = source->data[i++];
+        if (output.data) HeapFree(GetProcessHeap(), 0, output.data);
+        return FALSE;
     }
-    dest[out++] = '}'; /* The new document contains only the picture group. */
-    replacement->data = dest;
-    replacement->size = out;
+    replacement->data = output.data;
+    replacement->size = output.used;
     replacement->pos = 0;
     return TRUE;
-failed:
-    HeapFree(GetProcessHeap(), 0, dest);
-    return FALSE;
 }
 
 /* Convert embedded PNG/JPEG pictures to newly encoded JPEG bytes.  The
@@ -25863,7 +25906,9 @@ typedef struct RWP_IMAGE_COMPRESSION_OPTIONS
 {
     ULONG quality;
     UINT maxWidth, maxHeight; /* Zero disables that dimension's limit. */
-    BOOL singleImage;
+    BOOL singleImage, compress, resize;
+    UINT sizeField;
+    double sizeAmount;
     ITextRange *target; /* Only used for an individual picture. */
     SIZE_T originalLength;
     ULONGLONG originalDigest;
@@ -25876,9 +25921,26 @@ static void rwp_apply_image_compression(RWP_IMAGE_COMPRESSION_OPTIONS *settings)
 
 typedef struct RWP_IMAGE_COMPRESSION_STATS
 {
-    SIZE_T eligible, changed, failed;
+    SIZE_T eligible, changed, failed, resized;
     ULONGLONG beforeBytes, afterBytes;
 } RWP_IMAGE_COMPRESSION_STATS;
+
+static void rwp_update_document_image_tools(HWND dialog)
+{
+    BOOL compress = IsDlgButtonChecked(dialog, IDC_TOOL_COMPRESSION) == BST_CHECKED;
+    BOOL resize = IsDlgButtonChecked(dialog, IDC_TOOL_DISPLAY) == BST_CHECKED;
+    UINT field = rwp_display_size_field(dialog);
+    UINT id;
+    for (id = IDC_COMPRESS_SCOPE; id <= IDC_COMPRESS_METADATA_NOTE; ++id)
+        EnableWindow(GetDlgItem(dialog, id), compress);
+    for (id = IDC_IMAGE_USE_PERCENT; id <= IDC_IMAGE_HEIGHT; id += 2)
+    {
+        EnableWindow(GetDlgItem(dialog, id), resize);
+        EnableWindow(GetDlgItem(dialog, id + 1), resize && field == id + 1);
+    }
+    EnableWindow(GetDlgItem(dialog, IDC_IMAGE_RATIO_NOTE), resize);
+    EnableWindow(GetDlgItem(dialog, IDOK), compress || resize);
+}
 
 static INT_PTR CALLBACK rwp_image_compression_dialog_proc(HWND dialog,
                                                          UINT message,
@@ -25898,8 +25960,8 @@ static INT_PTR CALLBACK rwp_image_compression_dialog_proc(HWND dialog,
         SetWindowTextW(dialog, settings->singleImage ?
                        (italian ? L"Opzioni immagine - Compressione JPG" :
                                   L"Image options - JPEG compression") :
-                       (italian ? L"Compressione immagini del documento" :
-                                  L"Document images compression"));
+                       (italian ? L"Strumenti immagini del documento" :
+                                  L"Document Image Tools"));
         if (italian)
         {
             SetDlgItemTextW(dialog, IDC_COMPRESS_SCOPE,
@@ -25927,6 +25989,26 @@ static INT_PTR CALLBACK rwp_image_compression_dialog_proc(HWND dialog,
         SendDlgItemMessageW(dialog, IDC_COMPRESS_QUALITY, EM_LIMITTEXT, 3, 0);
         SendDlgItemMessageW(dialog, IDC_COMPRESS_WIDTH, EM_LIMITTEXT, 5, 0);
         SendDlgItemMessageW(dialog, IDC_COMPRESS_HEIGHT, EM_LIMITTEXT, 5, 0);
+        if (!settings->singleImage)
+        {
+            if (italian)
+            {
+                SetDlgItemTextW(dialog, IDC_TOOL_COMPRESSION, L"Compressione JPG");
+                SetDlgItemTextW(dialog, IDC_TOOL_DISPLAY, L"Dimensioni di visualizzazione in serie");
+                SetDlgItemTextW(dialog, IDC_IMAGE_USE_PERCENT, L"Scala (%):");
+                SetDlgItemTextW(dialog, IDC_IMAGE_USE_WIDTH, L"Larghezza (pixel):");
+                SetDlgItemTextW(dialog, IDC_IMAGE_USE_HEIGHT, L"Altezza (pixel):");
+                SetDlgItemTextW(dialog, IDC_IMAGE_RATIO_NOTE, L"Rispetto a ogni PNG/JPG originale. Mantiene le proporzioni. Le immagini fuori dall'intervallo 1%-500% vengono ignorate.");
+                SetDlgItemTextW(dialog, IDC_COMPRESS_METADATA_NOTE, L"La compressione JPG altera o rimuove i metadati. La trasparenza diventa bianca. Impossibile annullare con Ctrl+Z: creare prima una copia.");
+                SetDlgItemTextW(dialog, IDOK, L"Applica");
+            }
+            CheckRadioButton(dialog, IDC_IMAGE_USE_PERCENT, IDC_IMAGE_USE_HEIGHT, IDC_IMAGE_USE_PERCENT);
+            SetDlgItemInt(dialog, IDC_IMAGE_PERCENT, 100, FALSE);
+            SendDlgItemMessageW(dialog, IDC_IMAGE_PERCENT, EM_LIMITTEXT, 24, 0);
+            SendDlgItemMessageW(dialog, IDC_IMAGE_WIDTH, EM_LIMITTEXT, 24, 0);
+            SendDlgItemMessageW(dialog, IDC_IMAGE_HEIGHT, EM_LIMITTEXT, 24, 0);
+            rwp_update_document_image_tools(dialog);
+        }
         return TRUE;
     case WM_NCDESTROY:
         if (rwpImageCompressionWnd == dialog) rwpImageCompressionWnd = NULL;
@@ -25947,29 +26029,55 @@ static INT_PTR CALLBACK rwp_image_compression_dialog_proc(HWND dialog,
             SetFocus(hEditorWnd);
             return TRUE;
         }
+        if (settings && !settings->singleImage && HIWORD(wParam) == BN_CLICKED &&
+            (LOWORD(wParam) == IDC_TOOL_COMPRESSION || LOWORD(wParam) == IDC_TOOL_DISPLAY ||
+             LOWORD(wParam) == IDC_IMAGE_USE_PERCENT || LOWORD(wParam) == IDC_IMAGE_USE_WIDTH ||
+             LOWORD(wParam) == IDC_IMAGE_USE_HEIGHT))
+        {
+            rwp_update_document_image_tools(dialog);
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDOK)
         {
             BOOL qualityOk, widthOk, heightOk;
             UINT quality, width, height;
             if (!settings) return TRUE;
-            quality = GetDlgItemInt(dialog, IDC_COMPRESS_QUALITY, &qualityOk, FALSE);
-            width = GetDlgItemInt(dialog, IDC_COMPRESS_WIDTH, &widthOk, FALSE);
-            height = GetDlgItemInt(dialog, IDC_COMPRESS_HEIGHT, &heightOk, FALSE);
-            if (!qualityOk || quality < 1 || quality > 100 ||
-                !widthOk || width > 32768 || !heightOk || height > 32768)
+            settings->compress = settings->singleImage ||
+                IsDlgButtonChecked(dialog, IDC_TOOL_COMPRESSION) == BST_CHECKED;
+            settings->resize = !settings->singleImage &&
+                IsDlgButtonChecked(dialog, IDC_TOOL_DISPLAY) == BST_CHECKED;
+            if (!settings->compress && !settings->resize) return TRUE;
+            settings->sizeField = rwp_display_size_field(dialog);
+            if (settings->resize && !rwp_read_display_amount(dialog, settings->sizeField,
+                                                             &settings->sizeAmount))
             {
-                MessageBoxW(dialog,
-                    italian ? L"Immettere una qualità da 1 a 100 e limiti da 0 a 32768 pixel (0 = nessun limite)." :
-                              L"Enter JPEG quality 1-100 and size limits 0-32768 pixels (0 = unlimited).",
-                    italian ? L"Valori non validi" : L"Invalid values", MB_OK | MB_ICONWARNING);
+                MessageBoxW(dialog, italian ? L"Inserisci una dimensione positiva o una scala da 1% a 500%." :
+                    L"Enter a positive pixel size or a scale from 1% to 500%.",
+                    italian ? L"Dimensioni immagine" : L"Image display size", MB_OK | MB_ICONWARNING);
+                SetFocus(GetDlgItem(dialog, settings->sizeField));
                 return TRUE;
             }
-            settings->quality = quality;
-            settings->maxWidth = width;
-            settings->maxHeight = height;
-            rwpImageLastQuality = quality;
-            rwpImageLastWidth = width;
-            rwpImageLastHeight = height;
+            if (settings->compress)
+            {
+                quality = GetDlgItemInt(dialog, IDC_COMPRESS_QUALITY, &qualityOk, FALSE);
+                width = GetDlgItemInt(dialog, IDC_COMPRESS_WIDTH, &widthOk, FALSE);
+                height = GetDlgItemInt(dialog, IDC_COMPRESS_HEIGHT, &heightOk, FALSE);
+                if (!qualityOk || quality < 1 || quality > 100 ||
+                    !widthOk || width > 32768 || !heightOk || height > 32768)
+                {
+                    MessageBoxW(dialog,
+                        italian ? L"Immettere una qualità da 1 a 100 e limiti da 0 a 32768 pixel (0 = nessun limite)." :
+                                  L"Enter JPEG quality 1-100 and size limits 0-32768 pixels (0 = unlimited).",
+                        italian ? L"Valori non validi" : L"Invalid values", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                settings->quality = quality;
+                settings->maxWidth = width;
+                settings->maxHeight = height;
+                rwpImageLastQuality = quality;
+                rwpImageLastWidth = width;
+                rwpImageLastHeight = height;
+            }
             {
                 RWP_IMAGE_COMPRESSION_OPTIONS request = *settings;
                 settings->target = NULL; /* Apply owns the live picture reference. */
@@ -26113,36 +26221,7 @@ static BOOL rwp_append_compressed_picture(RTF_MEMORY *output,
     BOOL hadWidth = FALSE, hadHeight = FALSE;
     static const char digits[] = "0123456789abcdef";
     if (!output || !group || !end || !jpeg || !jpegSize) return FALSE;
-    /* Find the first image-data digit, skipping RTF header controls and nested
-     * picprop groups. This matches the original inline PNG/JPEG extractor. */
-    while (p < end - 1)
-    {
-        if (*p == '{')
-        {
-            const char *nested = rwp_inline_group_end(p, end);
-            if (!nested) return FALSE;
-            p = nested;
-            continue;
-        }
-        if (*p == '\\')
-        {
-            ++p;
-            if (p >= end - 1) return FALSE;
-            if (*p == '\\' || *p == '{' || *p == '}') { ++p; continue; }
-            while (p < end - 1 && ((*p >= 'a' && *p <= 'z') ||
-                   (*p >= 'A' && *p <= 'Z'))) ++p;
-            if (p < end - 1 && (*p == '-' || (*p >= '0' && *p <= '9')))
-            {
-                if (*p == '-') ++p;
-                while (p < end - 1 && *p >= '0' && *p <= '9') ++p;
-            }
-            if (p < end - 1 && *p == ' ') ++p;
-            continue;
-        }
-        if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') { ++p; continue; }
-        dataStart = p;
-        break;
-    }
+    dataStart = rwp_picture_hex_start(group, end);
     if (!dataStart) return FALSE;
     p = group;
     while (p < dataStart)
@@ -26222,6 +26301,63 @@ static BOOL rwp_append_compressed_picture(RTF_MEMORY *output,
     return !stream_out_memory((DWORD_PTR)output, (LPBYTE)"}", 1, &dummy);
 }
 
+/* Prepare both requested changes for one picture before writing it. A size
+ * outside the allowed range skips that picture, including its compression. */
+static BOOL rwp_transform_picture(RTF_MEMORY *out, const char *group, const char *stop,
+                                  const RWP_IMAGE_COMPRESSION_OPTIONS *options,
+                                  RWP_IMAGE_COMPRESSION_STATS *stats)
+{
+    BYTE *raw = NULL, *jpeg = NULL;
+    SIZE_T rawSize = 0, jpegSize = 0;
+    WCHAR filename[MAX_PATH];
+    UINT width = 0, height = 0;
+    LONG sourceW, sourceH, goalW, goalH, currentW, currentH, written;
+    RTF_MEMORY resized = {0}, picture = {0};
+    BOOL okay = FALSE, changeSize = FALSE;
+    stats->eligible++;
+    if (!rwp_inline_picture_extract_group(group, stop, &raw, &rawSize, filename, MAX_PATH))
+        goto skipped;
+    if (options->resize)
+    {
+        if (!rwp_image_dimensions(raw, (DWORD)rawSize, &sourceW, &sourceH) ||
+            !rwp_display_size_goals(options->sizeField, options->sizeAmount,
+                                    sourceW, sourceH, &goalW, &goalH)) goto skipped;
+        picture.data = (BYTE *)group;
+        picture.used = stop - group;
+        changeSize = !rwp_image_rtf_current_goals(&picture, &currentW, &currentH) ||
+                     goalW != currentW || goalH != currentH;
+    }
+    if (options->compress && !rwp_encode_image_as_jpeg(raw, rawSize, options,
+                                        &jpeg, &jpegSize, &width, &height)) goto skipped;
+    if (changeSize)
+    {
+        if (!rwp_append_resized_picture(&resized, group, stop, goalW, goalH)) goto done;
+        group = (const char *)resized.data;
+        stop = group + resized.used;
+    }
+    if (options->compress)
+    {
+        if (!rwp_append_compressed_picture(out, group, stop, jpeg, jpegSize, width, height))
+            goto done;
+        stats->beforeBytes += rawSize;
+        stats->afterBytes += jpegSize;
+    }
+    else if (stream_out_memory((DWORD_PTR)out, (LPBYTE)group, (LONG)(stop-group), &written))
+        goto done;
+    if (changeSize) stats->resized++;
+    if (changeSize || options->compress) stats->changed++;
+    okay = TRUE;
+    goto done;
+skipped:
+    stats->failed++;
+    okay = !stream_out_memory((DWORD_PTR)out, (LPBYTE)group, (LONG)(stop-group), &written);
+done:
+    if (resized.data) HeapFree(GetProcessHeap(), 0, resized.data);
+    if (jpeg) HeapFree(GetProcessHeap(), 0, jpeg);
+    if (raw) HeapFree(GetProcessHeap(), 0, raw);
+    return okay;
+}
+
 static BOOL rwp_compress_document_rtf(const RTF_MEMORY *source,
                                      RTF_MEMORY *result,
                                      const RWP_IMAGE_COMPRESSION_OPTIONS *options,
@@ -26259,45 +26395,16 @@ static BOOL rwp_compress_document_rtf(const RTF_MEMORY *source,
                               (LONG)(group - cursor), &dummy)) return FALSE;
         stop = rwp_inline_group_end(group, end);
         if (!stop) return FALSE;
-        if (memcmp(group, "{\\object", 8) &&
+        if (group[2] == 'p' &&
             (rwp_inline_group_has_keyword(group, stop, "\\pngblip") ||
              rwp_inline_group_has_keyword(group, stop, "\\jpegblip")))
         {
             if (onlyIndex < 0 || index == onlyIndex)
             {
-                BYTE *raw = NULL, *jpeg = NULL;
-                SIZE_T rawSize = 0, jpegSize = 0;
-                WCHAR filename[MAX_PATH];
-                UINT width = 0, height = 0;
-                stats->eligible++;
-                if (rwp_inline_picture_extract_group(group, stop, &raw,
-                      &rawSize, filename, MAX_PATH) &&
-                    rwp_encode_image_as_jpeg(raw, rawSize, options, &jpeg,
-                                             &jpegSize, &width, &height))
-                {
-                    /* Do not leave half a JPEG group in the result if an
-                     * allocation fails while writing. The whole operation
-                     * will then abort without modifying the editor. */
-                    if (!rwp_append_compressed_picture(result, group, stop,
-                                                       jpeg, jpegSize,
-                                                       width, height))
-                    {
-                        if (raw) HeapFree(GetProcessHeap(), 0, raw);
-                        HeapFree(GetProcessHeap(), 0, jpeg);
-                        return FALSE;
-                    }
-                    stats->changed++;
-                    stats->beforeBytes += rawSize;
-                    stats->afterBytes += jpegSize;
-                    HeapFree(GetProcessHeap(), 0, jpeg);
-                    if (raw) HeapFree(GetProcessHeap(), 0, raw);
-                    cursor = stop;
-                    ++index;
-                    continue;
-                }
-                if (raw) HeapFree(GetProcessHeap(), 0, raw);
-                if (jpeg) HeapFree(GetProcessHeap(), 0, jpeg);
-                stats->failed++;
+                if (!rwp_transform_picture(result, group, stop, options, stats)) return FALSE;
+                cursor = stop;
+                ++index;
+                continue;
             }
             ++index;
         }
@@ -26311,6 +26418,8 @@ static BOOL rwp_compress_document_rtf(const RTF_MEMORY *source,
 static void rwp_apply_image_compression(RWP_IMAGE_COMPRESSION_OPTIONS *settings)
 {
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    LPCWSTR title = settings->singleImage ? (italian ? L"Compressione immagini" : L"Image compression") :
+                                           (italian ? L"Strumenti immagini del documento" : L"Document Image Tools");
     RWP_IMAGE_COMPRESSION_STATS stats;
     RTF_MEMORY original = {0}, converted = {0};
     RWP_LINKOUTPUT bookmarked = {0}, backupBookmarks = {0};
@@ -26410,15 +26519,21 @@ done:
     if (original.data) HeapFree(GetProcessHeap(), 0, original.data);
     if (!okay)
         MessageBoxW(hMainWnd,
-            italian ? L"Compressione non riuscita. Il documento potrebbe contenere dati immagine non validi o memoria insufficiente." :
-                      L"Compression failed. Image data may be invalid or insufficient memory is available.",
-            italian ? L"Compressione immagini" : L"Image compression",
+            italian ? L"Operazione non riuscita. Il documento potrebbe contenere dati immagine non validi o memoria insufficiente." :
+                      L"Operation failed. Image data may be invalid or insufficient memory is available.",
+            title,
             MB_OK | MB_ICONERROR);
     else
     {
         double savedKb = ((double)stats.beforeBytes -
                           (double)stats.afterBytes) / 1024.0;
-        if (!stats.changed)
+        if (settings->resize)
+            wsprintfW(summary, italian ?
+                L"Immagini idonee: %u. Ridimensionate: %u. Compresse: %u. Ignorate: %u." :
+                L"Eligible pictures: %u. Display size changed: %u. Compressed: %u. Skipped: %u.",
+                (UINT)stats.eligible, (UINT)stats.resized,
+                settings->compress ? (UINT)stats.changed : 0, (UINT)stats.failed);
+        else if (!stats.changed)
             wsprintfW(summary, italian ?
                 L"Nessuna immagine convertita. Immagini idonee: %u. Non elaborate: %u." :
                 L"No pictures converted. Eligible: %u. Failed: %u.",
@@ -26430,7 +26545,7 @@ done:
                 (UINT)stats.changed, (UINT)stats.failed, savedKb);
         summary[sizeof(summary)/sizeof(WCHAR) - 1] = 0;
         MessageBoxW(hMainWnd, summary,
-                    italian ? L"Compressione immagini" : L"Image compression",
+                    title,
                     MB_OK | MB_ICONINFORMATION);
     }
     SetFocus(hEditorWnd);
@@ -26489,9 +26604,24 @@ static void rwp_open_image_compression_dialog(BOOL singleImage)
         if (!settings->target) goto failed;
     }
     rwpImageCompressionWnd = CreateDialogParamW(GetModuleHandleW(NULL),
-        MAKEINTRESOURCEW(IDD_IMAGE_COMPRESSION), hMainWnd,
+        MAKEINTRESOURCEW(singleImage ? IDD_IMAGE_COMPRESSION : IDD_DOCUMENT_IMAGE_TOOLS), hMainWnd,
         rwp_image_compression_dialog_proc, (LPARAM)settings);
     if (!rwpImageCompressionWnd) goto failed;
+    if (!singleImage)
+    {
+        MONITORINFO monitor;
+        RECT dialogRect;
+        monitor.cbSize = sizeof(monitor);
+        if (GetMonitorInfoW(MonitorFromWindow(hMainWnd, MONITOR_DEFAULTTONEAREST), &monitor) &&
+            GetWindowRect(rwpImageCompressionWnd, &dialogRect))
+        {
+            LONG spareHeight = (monitor.rcWork.bottom - monitor.rcWork.top) -
+                               (dialogRect.bottom - dialogRect.top);
+            LONG y = monitor.rcWork.top + (spareHeight > 0 ? spareHeight / 2 : 0);
+            SetWindowPos(rwpImageCompressionWnd, NULL, dialogRect.left, y, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
     ShowWindow(rwpImageCompressionWnd, SW_SHOWNORMAL);
     SetForegroundWindow(rwpImageCompressionWnd);
     return;
@@ -29369,8 +29499,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                         italian ? L"Contatore documento..." :
                                   L"Document counter...");
             AppendMenuW(submenu, MF_STRING, ID_IMAGE_COMPRESS_DOCUMENT,
-                        italian ? L"Compressione immagini del documento..." :
-                                  L"Document images compression...");
+                        italian ? L"Strumenti immagini del documento..." :
+                                  L"Document Image Tools...");
             break;
         }
     }
