@@ -7412,12 +7412,232 @@ typedef struct RWP_BOOKMARK_RECOVERY
     int count;
 } RWP_BOOKMARK_RECOVERY;
 
+/* A broken link can retain an imported identifier (for example id.xxxx)
+ * that is not a valid *new* WordPad bookmark name. Do not use the strict
+ * bookmark-creation validator for reading existing hyperlink destinations. */
+static BOOL rwp_recovery_target_name_ok(LPCWSTR name)
+{
+    SIZE_T i, n;
+    if (!name) return FALSE;
+    n = lstrlenW(name);
+    if (!n || n > RWP_BOOKMARK_NAME_LIMIT) return FALSE;
+    for (i = 0; i < n; ++i)
+        if (name[i] <= 32 || name[i] > 126 || name[i] == L'"' ||
+            name[i] == L'\\' || name[i] == L'{' || name[i] == L'}' ||
+            name[i] == L'#') return FALSE;
+    return TRUE;
+}
+
+typedef struct RWP_RECOVERY_FIELD
+{
+    SIZE_T start, end;
+    SIZE_T targetAt, targetLength;
+    SIZE_T resultAt, resultEnd; /* fldrslt contents, excluding outer braces */
+    WCHAR name[RWP_BOOKMARK_NAME_LIMIT + 1];
+} RWP_RECOVERY_FIELD;
+
+/* Skip an RTF control word/symbol without mistaking escaped braces or \bin
+ * payloads for document structure. The shared rtf_group_end does likewise. */
+static SIZE_T rwp_recovery_step(const BYTE *rtf, SIZE_T size, SIZE_T at)
+{
+    SIZE_T p, count = 0;
+    if (at >= size) return size;
+    if (rtf[at] != '\\' || at + 1 >= size) return at + 1;
+    p = at + 1;
+    if (!isalpha((unsigned char)rtf[p]))
+    {
+        if (rtf[p] == '\'' && p + 2 < size) return p + 3;
+        return p + 1;
+    }
+    while (p < size && isalpha((unsigned char)rtf[p])) ++p;
+    if (p - at == 4 && !memcmp(rtf + at + 1, "bin", 3))
+    {
+        SIZE_T digits = p;
+        while (digits < size && isdigit((unsigned char)rtf[digits]))
+        {
+            if (count > size / 10) return size;
+            count = count * 10 + rtf[digits++] - '0';
+        }
+        if (digits != p)
+        {
+            if (digits < size && rtf[digits] == ' ') ++digits;
+            return count <= size - digits ? digits + count : size;
+        }
+    }
+    if (p < size && rtf[p] == '-') ++p;
+    while (p < size && isdigit((unsigned char)rtf[p])) ++p;
+    if (p < size && rtf[p] == ' ') ++p;
+    return p;
+}
+
+/* Extract only an internal RTF field destination: HYPERLINK "#anchor" or
+ * HYPERLINK \\l "anchor". An external URL with a #fragment is never a
+ * bookmark link and must never appear in the recovery list. */
+static BOOL rwp_recovery_parse_instruction(const BYTE *rtf, SIZE_T begin,
+                                            SIZE_T end, RWP_RECOVERY_FIELD *field)
+{
+    SIZE_T i;
+    for (i = begin; i + 9 < end; ++i)
+    {
+        SIZE_T p, start, used = 0;
+        BOOL localSwitch = FALSE;
+        if (_strnicmp((const char *)rtf + i, "HYPERLINK", 9) ||
+            (i > begin && isalpha((unsigned char)rtf[i-1])) ||
+            (i + 9 < end && isalpha((unsigned char)rtf[i+9])))
+            continue;
+        p = i + 9;
+        while (p < end && (rtf[p] == ' ' || rtf[p] == '\r' ||
+                           rtf[p] == '\n' || rtf[p] == '{')) ++p;
+        if (p + 1 < end && rtf[p] == '\\')
+        {
+            SIZE_T switchAt = p + 1;
+            if (rtf[switchAt] == '\\') ++switchAt;
+            if (switchAt < end && (rtf[switchAt] == 'l' || rtf[switchAt] == 'L') &&
+                (switchAt + 1 == end || !isalpha((unsigned char)rtf[switchAt+1])))
+            {
+                localSwitch = TRUE;
+                p = switchAt + 1;
+                while (p < end && (rtf[p] == ' ' || rtf[p] == '\r' ||
+                                   rtf[p] == '\n' || rtf[p] == '{')) ++p;
+            }
+        }
+        if (p >= end || rtf[p] != '"') continue;
+        ++p;
+        if (!localSwitch)
+        {
+            if (p >= end || rtf[p] != '#') continue;
+            ++p;
+        }
+        start = p;
+        while (p < end && rtf[p] != '"')
+        {
+            BYTE c = rtf[p];
+            if (used == RWP_BOOKMARK_NAME_LIMIT || c <= 32 || c > 126 ||
+                c == '\\' || c == '{' || c == '}' || c == '#') break;
+            field->name[used++] = (WCHAR)c;
+            ++p;
+        }
+        field->name[used] = 0;
+        if (p >= end || rtf[p] != '"' ||
+            !rwp_recovery_target_name_ok(field->name)) continue;
+        field->targetAt = start;
+        field->targetLength = used;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL rwp_recovery_read_field(const BYTE *rtf, SIZE_T size,
+                                    SIZE_T start, RWP_RECOVERY_FIELD *field)
+{
+    SIZE_T at, finish;
+    BOOL hasTarget = FALSE;
+    static const char fieldPrefix[] = "{\\field";
+    static const char instPrefix[] = "{\\*\\fldinst";
+    static const char altInstPrefix[] = "{\\fldinst";
+    static const char resultPrefix[] = "{\\fldrslt";
+    if (start + sizeof(fieldPrefix) - 1 >= size ||
+        memcmp(rtf + start, fieldPrefix, sizeof(fieldPrefix) - 1) ||
+        isalpha((unsigned char)rtf[start + sizeof(fieldPrefix) - 1]))
+        return FALSE;
+    ZeroMemory(field, sizeof(*field));
+    finish = rtf_group_end((const char *)rtf, size, start);
+    if (!finish) return FALSE;
+    field->start = start;
+    field->end = finish;
+    at = start + sizeof(fieldPrefix) - 1;
+    while (at < finish - 1)
+    {
+        SIZE_T groupEnd, instructionAt = 0;
+        if (rtf[at] != '{')
+        {
+            at = rwp_recovery_step(rtf, finish - 1, at);
+            continue;
+        }
+        groupEnd = rtf_group_end((const char *)rtf, size, at);
+        if (!groupEnd || groupEnd > finish) return FALSE;
+        if (at + sizeof(instPrefix) - 1 < groupEnd &&
+            !memcmp(rtf + at, instPrefix, sizeof(instPrefix) - 1) &&
+            !isalpha((unsigned char)rtf[at + sizeof(instPrefix) - 1]))
+            instructionAt = at + sizeof(instPrefix) - 1;
+        else if (at + sizeof(altInstPrefix) - 1 < groupEnd &&
+                 !memcmp(rtf + at, altInstPrefix, sizeof(altInstPrefix) - 1) &&
+                 !isalpha((unsigned char)rtf[at + sizeof(altInstPrefix) - 1]))
+            instructionAt = at + sizeof(altInstPrefix) - 1;
+        if (instructionAt)
+            hasTarget = rwp_recovery_parse_instruction(rtf, instructionAt,
+                                                        groupEnd - 1, field);
+        else if (at + sizeof(resultPrefix) - 1 < groupEnd &&
+                 !memcmp(rtf + at, resultPrefix, sizeof(resultPrefix) - 1) &&
+                 !isalpha((unsigned char)rtf[at + sizeof(resultPrefix) - 1]))
+        {
+            field->resultAt = at + sizeof(resultPrefix) - 1;
+            /* A space immediately after the control word is its delimiter. */
+            if (rtf[field->resultAt] == ' ') ++field->resultAt;
+            field->resultEnd = groupEnd - 1;
+        }
+        at = groupEnd;
+    }
+    return hasTarget;
+}
+
+/* Return only real internal HYPERLINK fields. An unrecognized or external
+ * field is skipped; the scan never interprets visible document text. */
+static BOOL rwp_recovery_next_field(const BYTE *rtf, SIZE_T size,
+                                    SIZE_T *cursor, RWP_RECOVERY_FIELD *field)
+{
+    SIZE_T at = *cursor;
+    while (at < size)
+    {
+        if (rtf[at] == '{' && at + 7 < size &&
+            !memcmp(rtf + at, "{\\field", 7) &&
+            !isalpha((unsigned char)rtf[at + 7]))
+        {
+            if (rwp_recovery_read_field(rtf, size, at, field))
+            {
+                *cursor = field->end;
+                return TRUE;
+            }
+        }
+        at = rwp_recovery_step(rtf, size, at);
+    }
+    *cursor = size;
+    return FALSE;
+}
+
+/* Some imported formats can preserve native bookmark markers that RichEdit
+ * has not registered as live TOM bookmarks. Such destinations still exist in
+ * the serialized file and must not be incorrectly classified as missing. */
+static BOOL rwp_recovery_marker_exists(const BYTE *rtf, SIZE_T size,
+                                       LPCWSTR name)
+{
+    static const char *const prefixes[] = {"{\\*\\bkmkstart ", "{\\bkmkstart "};
+    SIZE_T i, k, nameLength = lstrlenW(name);
+    for (i = 0; i < size; ++i)
+    {
+        if (rtf[i] != '{') continue;
+        for (k = 0; k < sizeof(prefixes) / sizeof(prefixes[0]); ++k)
+        {
+            SIZE_T p, length = strlen(prefixes[k]), c;
+            if (i + length + nameLength >= size ||
+                memcmp(rtf + i, prefixes[k], length)) continue;
+            p = i + length;
+            for (c = 0; c < nameLength; ++c)
+                if (tolower((unsigned char)rtf[p+c]) !=
+                    tolower((unsigned char)name[c])) break;
+            if (c == nameLength && rtf[p+c] == '}') return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static BOOL rwp_bookmark_collect_dead(RWP_BOOKMARK_RECOVERY *state)
 {
     RTF_MEMORY memory;
+    RWP_RECOVERY_FIELD field;
     EDITSTREAM stream;
-    SIZE_T i;
-    static const char prefix[] = "HYPERLINK \"#";
+    SIZE_T cursor = 0;
+    int j;
     ZeroMemory(state, sizeof(*state));
     ZeroMemory(&memory, sizeof(memory));
     ZeroMemory(&stream, sizeof(stream));
@@ -7429,33 +7649,21 @@ static BOOL rwp_bookmark_collect_dead(RWP_BOOKMARK_RECOVERY *state)
         if (memory.data) HeapFree(GetProcessHeap(), 0, memory.data);
         return FALSE;
     }
-    for (i = 0; i + sizeof(prefix) < memory.used; ++i)
+    while (rwp_recovery_next_field(memory.data, memory.used, &cursor, &field))
     {
-        WCHAR name[RWP_BOOKMARK_NAME_LIMIT + 1];
-        SIZE_T at, n = 0;
-        int j;
-        if (memcmp(memory.data + i, prefix, sizeof(prefix) - 1)) continue;
-        at = i + sizeof(prefix) - 1;
-        while (at < memory.used && n < RWP_BOOKMARK_NAME_LIMIT &&
-               ((memory.data[at] >= 'A' && memory.data[at] <= 'Z') ||
-                (memory.data[at] >= 'a' && memory.data[at] <= 'z') ||
-                (memory.data[at] >= '0' && memory.data[at] <= '9') ||
-                 memory.data[at] == '_'))
-            name[n++] = (WCHAR)memory.data[at++];
-        name[n] = 0;
-        if (at >= memory.used || memory.data[at] != '"' ||
-            !rwp_bookmark_valid_name(name) || rwp_bookmark_index(name) >= 0)
-            continue;
+        if (rwp_bookmark_index(field.name) >= 0) continue;
         for (j = 0; j < state->count; ++j)
-            if (!lstrcmpiW(state->dead[j].name, name)) break;
+            if (!lstrcmpiW(state->dead[j].name, field.name)) break;
         if (j == state->count)
         {
+            if (rwp_recovery_marker_exists(memory.data, memory.used, field.name))
+                continue;
             if (state->count >= RWP_DEAD_BOOKMARK_LIMIT)
             {
                 HeapFree(GetProcessHeap(), 0, memory.data);
                 return FALSE; /* Never show a truncated recovery list. */
             }
-            lstrcpyW(state->dead[j].name, name);
+            lstrcpyW(state->dead[j].name, field.name);
             state->dead[j].links = 0;
             ++state->count;
         }
@@ -7472,22 +7680,6 @@ static BOOL rwp_bookmark_collect_dead(RWP_BOOKMARK_RECOVERY *state)
  * the target strings in fldinst groups, then reload the fully formed RTF.
  * This is deliberately a whole-document operation: RichEdit resets its undo
  * history on EM_STREAMIN, so the UI warns before initiating it. */
-static BOOL rwp_recovery_make_target(LPCWSTR name, char *buffer, SIZE_T size,
-                                     SIZE_T *length)
-{
-    SIZE_T i, prefix;
-    static const char start[] = "HYPERLINK \"#";
-    if (!rwp_bookmark_valid_name(name)) return FALSE;
-    prefix = sizeof(start) - 1;
-    if (prefix + (SIZE_T)lstrlenW(name) + 2 > size) return FALSE;
-    memcpy(buffer, start, prefix);
-    for (i = 0; name[i]; ++i) buffer[prefix + i] = (char)name[i];
-    buffer[prefix + i] = '"';
-    buffer[prefix + i + 1] = 0;
-    *length = prefix + i + 1;
-    return TRUE;
-}
-
 /* Only match internal targets inside a real RTF fldinst destination. Braces
  * escaped as \\{ or \\} must not affect the group-depth accounting. */
 static SIZE_T rwp_recovery_find_targets(const BYTE *rtf, SIZE_T n,
@@ -7534,53 +7726,111 @@ static SIZE_T rwp_recovery_find_targets(const BYTE *rtf, SIZE_T n,
     return hits;
 }
 
+/* Reassign all links sharing one missing bookmark destination. Change only
+ * the destination bytes in real fldinst groups; retain visible text and field
+ * formatting, including imported id.* names and the \\l field form. */
 static int rwp_recovery_patch_targets(const BYTE *rtf, SIZE_T n,
                                       LPCWSTR oldName, LPCWSTR newName,
                                       RTF_MEMORY *result)
 {
-    char oldField[128], newField[128];
-    SIZE_T oldLen, newLen, count, newSize, *offsets = NULL;
-    SIZE_T i, sourceAt = 0, destAt = 0;
+    RWP_RECOVERY_FIELD field;
+    SIZE_T cursor = 0, count = 0, sourceAt = 0, destAt = 0, newSize = n;
+    SIZE_T newLength = lstrlenW(newName), oldLength = lstrlenW(oldName), i;
     ZeroMemory(result, sizeof(*result));
-    if (!rwp_recovery_make_target(oldName, oldField, sizeof(oldField), &oldLen) ||
-        !rwp_recovery_make_target(newName, newField, sizeof(newField), &newLen))
-        return -1;
-    count = rwp_recovery_find_targets(rtf, n, oldField, oldLen, NULL);
+    if (!rwp_recovery_target_name_ok(oldName) ||
+        !rwp_bookmark_valid_name(newName)) return -1;
+    while (rwp_recovery_next_field(rtf, n, &cursor, &field))
+        if (!lstrcmpiW(field.name, oldName)) ++count;
     if (!count) return 0;
-    if (count > (SIZE_T)-1 / sizeof(SIZE_T)) return -1;
-    if (newLen > oldLen && count > ((SIZE_T)-1 - n - 1) / (newLen - oldLen))
-        return -1;
-    newSize = n;
-    if (newLen > oldLen) newSize += count * (newLen - oldLen);
-    else newSize -= count * (oldLen - newLen);
-    if (newSize >= 256 * 1024 * 1024) return -1;
-    offsets = HeapAlloc(GetProcessHeap(), 0, count * sizeof(*offsets));
-    if (!offsets) return -1;
-    if (rwp_recovery_find_targets(rtf, n, oldField, oldLen, offsets) != count)
-        goto error;
-    result->data = HeapAlloc(GetProcessHeap(), 0, newSize + 1);
-    if (!result->data) goto error;
-    for (i = 0; i < count; ++i)
+    if (newLength > oldLength)
     {
-        SIZE_T at = offsets[i];
-        if (at < sourceAt || at > n) goto error;
-        memcpy(result->data + destAt, rtf + sourceAt, at - sourceAt);
-        destAt += at - sourceAt;
-        memcpy(result->data + destAt, newField, newLen);
-        destAt += newLen;
-        sourceAt = at + oldLen;
+        if (count > ((SIZE_T)-1 - n - 1) / (newLength - oldLength)) return -1;
+        newSize += count * (newLength - oldLength);
+    }
+    else
+        newSize -= count * (oldLength - newLength);
+    if (newSize >= 256 * 1024 * 1024) return -1;
+    result->data = HeapAlloc(GetProcessHeap(), 0, newSize + 1);
+    if (!result->data) return -1;
+    cursor = 0;
+    while (rwp_recovery_next_field(rtf, n, &cursor, &field))
+    {
+        if (lstrcmpiW(field.name, oldName)) continue;
+        if (field.targetAt < sourceAt || field.targetLength != oldLength)
+            goto error;
+        memcpy(result->data + destAt, rtf + sourceAt, field.targetAt - sourceAt);
+        destAt += field.targetAt - sourceAt;
+        for (i = 0; i < newLength; ++i)
+            result->data[destAt++] = (BYTE)newName[i];
+        sourceAt = field.targetAt + field.targetLength;
     }
     memcpy(result->data + destAt, rtf + sourceAt, n - sourceAt);
     destAt += n - sourceAt;
+    if (destAt != newSize) goto error;
     result->data[destAt] = 0;
     result->used = destAt;
     result->capacity = newSize + 1;
-    HeapFree(GetProcessHeap(), 0, offsets);
     return (int)count;
 error:
-    if (result->data) HeapFree(GetProcessHeap(), 0, result->data);
+    HeapFree(GetProcessHeap(), 0, result->data);
     ZeroMemory(result, sizeof(*result));
-    if (offsets) HeapFree(GetProcessHeap(), 0, offsets);
+    return -1;
+}
+
+/* Remove a dead hyperlink without deleting its visible label. Replace its
+ * complete RTF field wrapper with a formatting group containing fldrslt's
+ * original contents. Reject unfamiliar fields with no fldrslt rather than
+ * silently discarding their text. */
+static int rwp_recovery_unlink_targets(const BYTE *rtf, SIZE_T n,
+                                       LPCWSTR oldName, RTF_MEMORY *result)
+{
+    RWP_RECOVERY_FIELD field;
+    SIZE_T cursor = 0, count = 0, newSize = n, sourceAt = 0, destAt = 0;
+    ZeroMemory(result, sizeof(*result));
+    if (!rwp_recovery_target_name_ok(oldName)) return -1;
+    while (rwp_recovery_next_field(rtf, n, &cursor, &field))
+    {
+        SIZE_T fieldSize, replacementSize;
+        if (lstrcmpiW(field.name, oldName)) continue;
+        if (!field.resultAt || field.resultAt > field.resultEnd ||
+            field.resultEnd > field.end) return -1;
+        fieldSize = field.end - field.start;
+        replacementSize = field.resultEnd - field.resultAt + 2; /* {content} */
+        if (replacementSize > fieldSize) return -1;
+        newSize -= fieldSize - replacementSize;
+        ++count;
+    }
+    if (!count) return 0;
+    if (newSize >= 256 * 1024 * 1024) return -1;
+    result->data = HeapAlloc(GetProcessHeap(), 0, newSize + 1);
+    if (!result->data) return -1;
+    cursor = 0;
+    while (rwp_recovery_next_field(rtf, n, &cursor, &field))
+    {
+        SIZE_T length;
+        if (lstrcmpiW(field.name, oldName)) continue;
+        if (field.start < sourceAt || field.resultAt > field.resultEnd)
+            goto error;
+        length = field.start - sourceAt;
+        memcpy(result->data + destAt, rtf + sourceAt, length);
+        destAt += length;
+        result->data[destAt++] = '{';
+        length = field.resultEnd - field.resultAt;
+        memcpy(result->data + destAt, rtf + field.resultAt, length);
+        destAt += length;
+        result->data[destAt++] = '}';
+        sourceAt = field.end;
+    }
+    memcpy(result->data + destAt, rtf + sourceAt, n - sourceAt);
+    destAt += n - sourceAt;
+    if (destAt != newSize) goto error;
+    result->data[destAt] = 0;
+    result->used = destAt;
+    result->capacity = newSize + 1;
+    return (int)count;
+error:
+    HeapFree(GetProcessHeap(), 0, result->data);
+    ZeroMemory(result, sizeof(*result));
     return -1;
 }
 
@@ -7605,7 +7855,7 @@ static BOOL rwp_recovery_reload_rtf(const RTF_MEMORY *rtf)
 
 static BOOL rwp_patch_rtf_with_original_images(RTF_MEMORY *mem);
 
-static int rwp_bookmark_retarget_links(LPCWSTR oldName, LPCWSTR newName)
+static int rwp_bookmark_fix_dead_links(LPCWSTR oldName, LPCWSTR newName, BOOL unlink)
 {
     RTF_MEMORY source = {0}, rewritten = {0};
     RWP_LINKOUTPUT bookmarked = {0};
@@ -7616,11 +7866,10 @@ static int rwp_bookmark_retarget_links(LPCWSTR oldName, LPCWSTR newName)
     BOOL customBackground = documentBackgroundColorKnown;
     if (!hEditorWnd ||
         (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY) ||
-        !rwp_bookmark_valid_name(oldName) ||
-        rwp_bookmark_index(newName) < 0)
+        !rwp_recovery_target_name_ok(oldName) ||
+        (!unlink && (!newName || rwp_bookmark_index(newName) < 0)))
         return -1;
     rwp_bookmarks_prune_deleted();
-    if (!rwpBookmarkCount) return -1;
     SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
     background = documentBackgroundColor;
     ZeroMemory(&stream, sizeof(stream));
@@ -7632,10 +7881,27 @@ static int rwp_bookmark_retarget_links(LPCWSTR oldName, LPCWSTR newName)
     /* Keep original picture payloads before the RTF round-trip, matching
      * the existing lossless image-save code. */
     if (!rwp_patch_rtf_with_original_images(&source)) goto done;
-    if (!rwp_bookmarks_patch_saved_rtf(source.data, source.used, &bookmarked))
-        goto done;
-    changed = rwp_recovery_patch_targets((const BYTE *)bookmarked.data,
-               bookmarked.used, oldName, newName, &rewritten);
+    if (rwpBookmarkCount)
+    {
+        if (!rwp_bookmarks_patch_saved_rtf(source.data, source.used, &bookmarked))
+            goto done;
+    }
+    else
+    {
+        /* With no bookmarks, there are still dead hyperlinks to remove.
+         * The bookmark writer intentionally returns FALSE for an empty list;
+         * copy the current RTF unchanged so the unlink operation can run. */
+        bookmarked.data = HeapAlloc(GetProcessHeap(), 0, source.used + 1);
+        if (!bookmarked.data) goto done;
+        memcpy(bookmarked.data, source.data, source.used);
+        bookmarked.data[source.used] = 0;
+        bookmarked.used = source.used;
+    }
+    changed = unlink ?
+        rwp_recovery_unlink_targets((const BYTE *)bookmarked.data,
+                                    bookmarked.used, oldName, &rewritten) :
+        rwp_recovery_patch_targets((const BYTE *)bookmarked.data,
+                                    bookmarked.used, oldName, newName, &rewritten);
     if (changed <= 0) goto done;
     /* Bookmark markers survive reloading only when we explicitly reconstruct
      * the live TOM ranges from the RTF that was just rewritten. */
@@ -7672,8 +7938,9 @@ static void rwp_bookmark_recovery_fill(HWND dialog, RWP_BOOKMARK_RECOVERY *state
 {
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     int i;
-    BOOL canRecover = state->count > 0 && rwpBookmarkCount > 0 &&
+    BOOL canEdit = state->count > 0 &&
         !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY);
+    BOOL canRecover = canEdit && rwpBookmarkCount > 0;
     SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST, LB_RESETCONTENT, 0, 0);
     SendDlgItemMessageW(dialog, IDC_BOOKMARK_RECOVER_TO, CB_RESETCONTENT, 0, 0);
     for (i = 0; i < state->count; ++i)
@@ -7698,6 +7965,7 @@ static void rwp_bookmark_recovery_fill(HWND dialog, RWP_BOOKMARK_RECOVERY *state
                        L"No unresolved bookmark links found."));
     EnableWindow(GetDlgItem(dialog, IDC_BOOKMARK_RECOVER_TO), canRecover);
     EnableWindow(GetDlgItem(dialog, IDOK), canRecover);
+    EnableWindow(GetDlgItem(dialog, IDC_BOOKMARK_RECOVER_REMOVE), canEdit);
 }
 
 static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
@@ -7719,6 +7987,8 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
             SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_LABEL,
                 L"Riassegna a un segnalibro esistente:");
             SetDlgItemTextW(dialog, IDOK, L"Riassegna collegamenti");
+            SetDlgItemTextW(dialog, IDC_BOOKMARK_RECOVER_REMOVE,
+                L"Rimuovi collegamenti");
             SetDlgItemTextW(dialog, IDC_BOOKMARK_REPAIR_GROUP,
                 L"Ripara segnalibri RTF importati");
             SetDlgItemTextW(dialog, IDC_BOOKMARK_REPAIR_DESC,
@@ -7754,6 +8024,52 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
                     L"Bookmark", MB_OK | MB_ICONWARNING);
             return TRUE;
         }
+        if (LOWORD(wParam) == IDC_BOOKMARK_RECOVER_REMOVE &&
+            HIWORD(wParam) == BN_CLICKED)
+        {
+            RWP_BOOKMARK_RECOVERY fresh;
+            WCHAR prompt[340];
+            int selected = (int)SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST,
+                                                     LB_GETCURSEL, 0, 0);
+            int changed;
+            if (selected < 0 || selected >= state->count) return TRUE;
+            wsprintfW(prompt, italian ?
+                L"Rimuovere %d collegamenti a questo segnalibro mancante? "
+                L"Il testo visibile e la formattazione saranno conservati. "
+                L"La cronologia Annulla verra' azzerata. Continuare?" :
+                L"Remove %d links to this missing bookmark? "
+                L"Visible text and formatting will be preserved. "
+                L"Undo history will be reset. Continue?",
+                state->dead[selected].links);
+            if (MessageBoxW(dialog, prompt, L"Bookmark",
+                            MB_YESNO | MB_ICONQUESTION) != IDYES) return TRUE;
+            changed = rwp_bookmark_fix_dead_links(state->dead[selected].name,
+                                                   NULL, TRUE);
+            if (changed < 1)
+            {
+                MessageBoxW(dialog, italian ?
+                    L"Impossibile rimuovere questi collegamenti." :
+                    L"Could not remove these links.",
+                    L"Bookmark", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            if (!rwp_bookmark_collect_dead(&fresh))
+            {
+                MessageBoxW(dialog, italian ?
+                    L"Impossibile aggiornare l'elenco dei collegamenti." :
+                    L"Unable to refresh the bookmark-link list.",
+                    L"Bookmark", MB_OK | MB_ICONWARNING);
+                EndDialog(dialog, 1);
+                return TRUE;
+            }
+            *state = fresh;
+            rwp_bookmark_recovery_fill(dialog, state);
+            MessageBoxW(dialog, italian ?
+                L"Collegamenti rimossi. Il testo e' stato conservato." :
+                L"Links removed. Visible text was preserved.",
+                L"Bookmark", MB_OK | MB_ICONINFORMATION);
+            return TRUE;
+        }
         if (LOWORD(wParam) == IDOK)
         {
             int selected = (int)SendDlgItemMessageW(dialog, IDC_BOOKMARK_DEAD_LIST,
@@ -7778,7 +8094,7 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
                     L"Undo history. Continue?",
                     L"Bookmark", MB_YESNO | MB_ICONQUESTION) != IDYES)
                 return TRUE;
-            changed = rwp_bookmark_retarget_links(state->dead[selected].name, target);
+            changed = rwp_bookmark_fix_dead_links(state->dead[selected].name, target, FALSE);
             if (changed < 1)
             {
                 MessageBoxW(dialog, italian ?

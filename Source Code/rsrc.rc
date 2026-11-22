@@ -145,21 +145,22 @@ BEGIN
 END
 
 /* Both bookmark tools share one dialog; imported RTF inspection is on demand. */
-IDD_BOOKMARK_RECOVER DIALOGEX 0, 0, 330, 243
+IDD_BOOKMARK_RECOVER DIALOGEX 0, 0, 330, 271
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Bookmark Tools"
 FONT RWP_UI_FONT_PT, RWP_UI_FONT_FAMILY
 BEGIN
-    GROUPBOX "Recover Broken Bookmark Links", IDC_BOOKMARK_RECOVER_GROUP, 7, 6, 316, 163
+    GROUPBOX "Recover Broken Bookmark Links", IDC_BOOKMARK_RECOVER_GROUP, 7, 6, 316, 191
     LTEXT "Unresolved bookmark targets (with link counts):", IDC_BOOKMARK_RECOVER_DESC, 16, 19, 298, 13
     LISTBOX IDC_BOOKMARK_DEAD_LIST, 16, 33, 298, 96, LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP
     LTEXT "Reassign selected target to an existing bookmark:", IDC_BOOKMARK_RECOVER_LABEL, 16, 131, 298, 12
     COMBOBOX IDC_BOOKMARK_RECOVER_TO, 16, 145, 181, 95, CBS_DROPDOWN | CBS_SORT | WS_VSCROLL | WS_TABSTOP
     DEFPUSHBUTTON "Reassign Links", IDOK, 205, 144, 109, 20
-    GROUPBOX "Repair Imported RTF Bookmarks", IDC_BOOKMARK_REPAIR_GROUP, 7, 173, 316, 43
-    LTEXT "Converts incompatible imported bookmarks and their internal links. Scans only when requested.", IDC_BOOKMARK_REPAIR_DESC, 16, 184, 173, 27
-    PUSHBUTTON "Repair Imported Bookmarks...", IDC_BOOKMARK_REPAIR_RUN, 197, 185, 117, 21, WS_TABSTOP
-    PUSHBUTTON "Close", IDCANCEL, 256, 219, 58, 19
+    PUSHBUTTON "Remove Links", IDC_BOOKMARK_RECOVER_REMOVE, 205, 170, 109, 20
+    GROUPBOX "Repair Imported RTF Bookmarks", IDC_BOOKMARK_REPAIR_GROUP, 7, 201, 316, 43
+    LTEXT "Converts incompatible imported bookmarks and their internal links. Scans only when requested.", IDC_BOOKMARK_REPAIR_DESC, 16, 212, 173, 27
+    PUSHBUTTON "Repair Imported Bookmarks...", IDC_BOOKMARK_REPAIR_RUN, 197, 213, 117, 21, WS_TABSTOP
+    PUSHBUTTON "Close", IDCANCEL, 256, 247, 58, 19
 END
 
 /* Bookmark dialogs; labels switch to Italian in code. */
