@@ -259,7 +259,7 @@ static void paint_ruler(HWND hWnd, LONG EditLeftmost, BOOL NewMetrics)
                                   CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
                                   DEFAULT_PITCH, L"Segoe UI");
     HFONT oldFont;
-    int width, cmPixels, quarter, x, i, tick, midY;
+    int labelStep, width, intervalPixels, quarter, x, i, tick, midY;
     (void)NewMetrics;
     if (!dc) return;
     GetClientRect(hWnd, &view);
@@ -283,13 +283,13 @@ static void paint_ruler(HWND hWnd, LONG EditLeftmost, BOOL NewMetrics)
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(235, 239, 244));
     SetTextAlign(dc, TA_CENTER | TA_TOP);
-    cmPixels = twips_to_pixels(centmm_to_twips(1000), GetDeviceCaps(dc, LOGPIXELSX));
-    if (cmPixels < 4) cmPixels = 4;
-    quarter = cmPixels / 4;
+    intervalPixels = twips_to_pixels(rwp_ruler_interval_twips(&labelStep), GetDeviceCaps(dc, LOGPIXELSX));
+    if (intervalPixels < 4) intervalPixels = 4;
+    quarter = intervalPixels / 4;
     if (quarter < 1) quarter = 1;
     midY = (view.top + view.bottom) / 2;
     width = track.right;
-    for (i = 1, x = EditLeftmost; x < width && i <= 500; ++i, x += cmPixels)
+    for (i = 1, x = EditLeftmost; x < width && i <= 500; ++i, x += intervalPixels)
     {
         WCHAR number[12];
         int j;
@@ -300,9 +300,9 @@ static void paint_ruler(HWND hWnd, LONG EditLeftmost, BOOL NewMetrics)
             MoveToEx(dc, tick, midY - (j == 2 ? 3 : 1), NULL);
             LineTo(dc, tick, midY + (j == 2 ? 4 : 2));
         }
-        tick = x + cmPixels;
+        tick = x + intervalPixels;
         if (tick >= width) break;
-        wsprintfW(number, L"%d", i);
+        wsprintfW(number, L"%d", i * labelStep);
         TextOutW(dc, tick, track.top + 2, number, lstrlenW(number));
     }
     SelectObject(dc, oldFont);

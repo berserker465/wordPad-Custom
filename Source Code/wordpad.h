@@ -197,6 +197,14 @@
 #define ID_INSERT_TEXT 1636
 #define ID_TABLE_COPY_BORDER_FORMAT 1637
 #define ID_TABLE_PASTE_BORDER_FORMAT 1638
+#define ID_EDIT_CONTEXT_LINK 4900
+#define IDD_GENERAL_OPTIONS 4901
+#define IDC_MEASURE_GROUP 4902
+#define IDC_MEASURE_CM 4903
+#define IDC_MEASURE_IN 4904
+#define IDC_MEASURE_PT 4905
+#define IDC_MEASURE_PC 4906
+#define IDC_AUTO_WORD 4907
 #define ID_COPY_LINK 1639
 #define ID_CONFIGURE_SHORTCUTS 1640
 #define ID_CONFIGURE_COLOR_ORDER 1641
@@ -693,6 +701,7 @@ LRESULT CALLBACK ruler_proc(HWND, UINT, WPARAM, LPARAM);
 void redraw_ruler(HWND);
 
 /* registry.c */
+int rwp_ruler_interval_twips(int *labelStep);
 int reg_formatindex(WPARAM);
 void registry_read_filelist(HWND);
 void registry_read_options(void);

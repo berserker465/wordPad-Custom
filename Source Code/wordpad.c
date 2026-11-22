@@ -772,8 +772,23 @@ typedef enum
 {
     UNIT_CM,
     UNIT_INCH,
-    UNIT_PT
+    UNIT_PT,
+    UNIT_PICA
 } UNIT;
+
+static struct {
+    DWORD unit;
+    DWORD autoWord;
+} generalOptions = {UNIT_CM, FALSE};
+
+static const double unitTwips[] = {1440.0 / 2.54, 1440.0, 20.0, 240.0};
+
+int rwp_ruler_interval_twips(int *labelStep)
+{
+    static const int steps[] = {1, 1, 36, 3};
+    *labelStep = steps[generalOptions.unit];
+    return (int)(unitTwips[generalOptions.unit] * *labelStep + 0.5);
+}
 
 typedef struct
 {
@@ -2589,6 +2604,13 @@ static void rwp_enlarge_legacy_dialog(HWND dialog)
     }
     SendMessageW(dialog, WM_SETFONT, (WPARAM)readable, FALSE);
 
+    /* The property sheet owns each page's outer rectangle. */
+    if (GetWindowLongPtrW(dialog, GWL_STYLE) & WS_CHILD)
+    {
+        SendMessageW(dialog, WM_SETREDRAW, TRUE, 0);
+        return;
+    }
+
     /* Preserve the original non-client frame thickness and keep the enlarged
      * window on the same monitor when there is room for it. */
     newWidth += (outer.right - outer.left) - oldWidth;
@@ -3295,6 +3317,9 @@ typedef struct RWP_LINKOUTPUT
 typedef struct RWP_LINKDIALOG
 {
     WCHAR name[RWP_LINK_MAX_NAME];
+    WCHAR target[RWP_LINK_MAX_URL];
+    CHARRANGE field;
+    BOOL editing;
     BOOL preferBookmark;
     int matchingBookmark; /* Preselect only; never create a link automatically. */
 } RWP_LINKDIALOG;
@@ -3545,7 +3570,7 @@ static BOOL rwp_decode_context_link_url(LPCWSTR encoded, WCHAR *url,
         url[used++] = value;
     }
     url[used] = 0;
-    return link_valid_url(url); /* No #Bookmark targets or quoted strings. */
+    return used != 0;
 }
 
 /* Resolve the external destination without changing the live selection. */
@@ -3555,7 +3580,7 @@ static BOOL rwp_external_link_url_from_range(RWP_TEXT_RANGE2 *range,
     BSTR encoded = NULL;
     BOOL result = FALSE;
     if (range && SUCCEEDED(range->lpVtbl->GetURL(range, &encoded)) && encoded)
-        result = rwp_decode_context_link_url(encoded, url, capacity);
+        result = rwp_decode_context_link_url(encoded, url, capacity) && link_valid_url(url);
     if (encoded) SysFreeString(encoded);
     return result;
 }
@@ -3599,6 +3624,11 @@ void rwp_append_remove_link_to_popup(HMENU popup, HWND editor, LONG cp)
     if (!hasLink && !hasBookmark) return;
     rwpLinkContextCp = cp;
     AppendMenuW(popup, MF_SEPARATOR, 0, NULL);
+    if (hasLink)
+        AppendMenuW(popup, MF_STRING |
+            ((fileFormat != SF_RTF || (SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY)) ?
+             MF_GRAYED : 0), ID_EDIT_CONTEXT_LINK,
+            italian ? L"Modifica collegamento..." : L"Edit link...");
     if (canCopyLink)
         AppendMenuW(popup, MF_STRING, ID_COPY_LINK,
                     italian ? L"Copia collegamento" : L"Copy link");
@@ -3719,7 +3749,7 @@ typedef struct RWP_LINK_STYLE
     BYTE underlined;
 } RWP_LINK_STYLE;
 
-static BOOL prepare_link_display_format(void)
+static BOOL prepare_link_display_format(HWND editor)
 {
     CHARRANGE original, run;
     CHARFORMAT2W fmt;
@@ -3727,7 +3757,7 @@ static BOOL prepare_link_display_format(void)
     RWP_LINK_STYLE *styles;
     COLORREF defaultColor = GetSysColor(COLOR_WINDOWTEXT);
 
-    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&original);
+    SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&original);
     if (original.cpMax <= original.cpMin)
         return FALSE;
     length = (SIZE_T)(original.cpMax - original.cpMin);
@@ -3737,7 +3767,7 @@ static BOOL prepare_link_display_format(void)
     /* The normal case is uniform formatting: only one change/undo entry. */
     ZeroMemory(&fmt, sizeof(fmt));
     fmt.cbSize = sizeof(fmt);
-    SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+    SendMessageW(editor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
     if ((fmt.dwMask & (CFM_COLOR | CFM_UNDERLINE)) ==
                       (CFM_COLOR | CFM_UNDERLINE))
     {
@@ -3749,7 +3779,7 @@ static BOOL prepare_link_display_format(void)
         fmt.dwMask = CFM_COLOR | CFM_UNDERLINE;
         fmt.crTextColor = color;
         if (underline) fmt.dwEffects = CFE_UNDERLINE;
-        SendMessageW(hEditorWnd, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        SendMessageW(editor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
         return TRUE;
     }
 
@@ -3762,10 +3792,10 @@ static BOOL prepare_link_display_format(void)
     {
         run.cpMin = original.cpMin + (LONG)i;
         run.cpMax = run.cpMin + 1;
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&run);
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&run);
         ZeroMemory(&fmt, sizeof(fmt));
         fmt.cbSize = sizeof(fmt);
-        SendMessageW(hEditorWnd, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        SendMessageW(editor, EM_GETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
         styles[i].color = (fmt.dwEffects & CFE_AUTOCOLOR)
                               ? defaultColor : fmt.crTextColor;
         styles[i].underlined = (fmt.dwEffects & CFE_UNDERLINE) != 0;
@@ -3778,16 +3808,16 @@ static BOOL prepare_link_display_format(void)
             ;
         run.cpMin = original.cpMin + (LONG)start;
         run.cpMax = original.cpMin + (LONG)i;
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&run);
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&run);
         ZeroMemory(&fmt, sizeof(fmt));
         fmt.cbSize = sizeof(fmt);
         fmt.dwMask = CFM_COLOR | CFM_UNDERLINE;
         fmt.crTextColor = styles[start].color;
         if (styles[start].underlined) fmt.dwEffects = CFE_UNDERLINE;
-        SendMessageW(hEditorWnd, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
+        SendMessageW(editor, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&fmt);
     }
     HeapFree(GetProcessHeap(), 0, styles);
-    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&original);
+    SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&original);
     return TRUE;
 }
 
@@ -3880,7 +3910,7 @@ static SIZE_T link_encode_rtf_url(LPCWSTR url, char *dest)
     return j;
 }
 
-static BOOL attach_url_to_selected_text(LPCWSTR url)
+static BOOL attach_url_to_selected_text(HWND editor, LPCWSTR url)
 {
     static const char fieldStart[] = "{\\field{\\*\\fldinst{HYPERLINK \"";
     static const char fieldEnd[] = "\"}}{\\fldrslt{";
@@ -3897,7 +3927,7 @@ static BOOL attach_url_to_selected_text(LPCWSTR url)
     ZeroMemory(&stream, sizeof(stream));
     stream.dwCookie = (DWORD_PTR)&saved;
     stream.pfnCallback = link_stream_out;
-    SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF | SFF_SELECTION,
+    SendMessageW(editor, EM_STREAMOUT, SF_RTF | SFF_SELECTION,
                  (LPARAM)&stream);
     if (stream.dwError || !saved.data ||
         !link_rtf_body_bounds(saved.data, saved.used, &body, &end))
@@ -3936,7 +3966,7 @@ static BOOL attach_url_to_selected_text(LPCWSTR url)
     ZeroMemory(&stream, sizeof(stream));
     stream.dwCookie = (DWORD_PTR)&input;
     stream.pfnCallback = link_stream_in;
-    SendMessageW(hEditorWnd, EM_STREAMIN, SF_RTF | SFF_SELECTION,
+    SendMessageW(editor, EM_STREAMIN, SF_RTF | SFF_SELECTION,
                  (LPARAM)&stream);
     success = stream.dwError == 0 && input.offset == input.size;
 
@@ -3947,7 +3977,7 @@ done:
     return success;
 }
 
-static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
+static BOOL insert_hyperlink(HWND editor, LPCWSTR name, LPCWSTR url)
 {
     CHARRANGE original, added;
     WCHAR *originalText = NULL;
@@ -3955,7 +3985,7 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
     BOOL sameText = FALSE;
     BOOL insertedNewText = FALSE;
     LONG n = (LONG)lstrlenW(name);
-    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&original);
+    SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&original);
 
     /* Preserve the existing characters (and all their formatting) whenever
      * the hyperlink label is identical to the selected text. */
@@ -3967,7 +3997,7 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
         {
             textRange.chrg = original;
             textRange.lpstrText = originalText;
-            SendMessageW(hEditorWnd, EM_GETTEXTRANGE, 0, (LPARAM)&textRange);
+            SendMessageW(editor, EM_GETTEXTRANGE, 0, (LPARAM)&textRange);
             sameText = lstrcmpW(originalText, name) == 0;
             HeapFree(GetProcessHeap(), 0, originalText);
         }
@@ -3979,15 +4009,15 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
          * replaced. A replacement label cannot preserve different styles
          * character-by-character because the characters differ. */
         /* EM_REPLACESEL has no defined return value, even on success. */
-        SendMessageW(hEditorWnd, EM_REPLACESEL, TRUE, (LPARAM)name);
+        SendMessageW(editor, EM_REPLACESEL, TRUE, (LPARAM)name);
         added.cpMin = original.cpMin;
         added.cpMax = original.cpMin + n;
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&added);
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&added);
         insertedNewText = TRUE;
     }
     /* Export the existing selected formatting into the field result. Unlike
      * SetURL, this follows the working Google Docs/WordPad RTF field form. */
-    if (!prepare_link_display_format())
+    if (!prepare_link_display_format(editor))
         return FALSE;
 
     /* Rich Edit normally turns a friendly-name field into an autoURL when
@@ -4006,7 +4036,7 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
     {
         CHARRANGE selected, latter, former, afterLatter, afterFormer, caret;
         LONG split = n / 2;
-        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selected);
+        SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&selected);
         if (selected.cpMax - selected.cpMin != n)
             return FALSE;
         /* A UTF-16 surrogate pair must not be divided across two fields. */
@@ -4017,37 +4047,37 @@ static BOOL insert_hyperlink(LPCWSTR name, LPCWSTR url)
         if (split <= 0 || split >= n) return FALSE;
         latter.cpMin = selected.cpMin + split;
         latter.cpMax = selected.cpMax;
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&latter);
-        if (!attach_url_to_selected_text(url))
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&latter);
+        if (!attach_url_to_selected_text(editor, url))
             return FALSE;
         /* The latter field has already been inserted. Its current end is
          * the desired final caret location, before the former field shifts
          * the following character positions. */
-        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&afterLatter);
+        SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&afterLatter);
         former.cpMin = selected.cpMin;
         former.cpMax = selected.cpMin + split;
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&former);
-        if (!attach_url_to_selected_text(url))
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&former);
+        if (!attach_url_to_selected_text(editor, url))
             return FALSE;
         /* Inserting the former RTF field increases the Rich Edit story's
          * CP offsets, including hidden field instructions. Measure that
          * increase from its actual post-insertion caret, then place the
          * caret after BOTH adjacent fields, not at the halfway split. */
-        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&afterFormer);
+        SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&afterFormer);
         caret.cpMin = caret.cpMax = afterLatter.cpMax +
                       (afterFormer.cpMax - former.cpMax);
-        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&caret);
+        SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&caret);
     }
-    else if (!attach_url_to_selected_text(url))
+    else if (!attach_url_to_selected_text(editor, url))
     {
         /* A newly inserted label is left as ordinary text on RTF failure,
          * rather than silently reporting a hyperlink that is not present. */
         if (!insertedNewText)
-            SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&original);
+            SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&original);
         return FALSE;
     }
-    rwpRichFormattingChanged = TRUE;
-    SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+    if (editor == hEditorWnd) rwpRichFormattingChanged = TRUE;
+    SendMessageW(editor, EM_SETMODIFY, TRUE, 0);
     return TRUE;
 }
 
@@ -4768,7 +4798,7 @@ static INT_PTR CALLBACK rwp_bookmark_choose_proc(HWND dialog, UINT message,
                 target[0] = L'#';
                 lstrcpynW(target + 1, rwpBookmarks[index].name,
                           RWP_BOOKMARK_NAME_LIMIT + 1);
-                if (!insert_hyperlink(text, target))
+                if (!insert_hyperlink(hEditorWnd, text, target))
                 {
                     MessageBoxW(dialog, italian ? L"Impossibile inserire il collegamento." :
                         L"Unable to insert the bookmark link.", L"Bookmark",
@@ -5495,9 +5525,17 @@ static void rwp_link_dialog_switch_mode(HWND hwnd, BOOL bookmark)
                    (italian ? L"Indirizzo (URL):" : L"Address (URL):"));
 }
 
+static BOOL rwp_replace_link(const RWP_LINKDIALOG *state, LPCWSTR text, LPCWSTR url);
+
+static void rwp_close_link_dialog(HWND dlg, BOOL editing)
+{
+    if (editing) EndDialog(dlg, 0);
+    else DestroyWindow(dlg);
+}
+
 static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    RWP_LINKDIALOG *state;
+    RWP_LINKDIALOG *state = (RWP_LINKDIALOG *)GetWindowLongPtrW(hwnd, DWLP_USER);
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     switch (msg)
     {
@@ -5505,6 +5543,7 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
         {
             int i;
             state = (RWP_LINKDIALOG *)lParam;
+            if (state->editing) SetWindowLongPtrW(hwnd, DWLP_USER, (LONG_PTR)state);
             rwp_theme_dialog(hwnd);
             if (italian)
             {
@@ -5517,11 +5556,17 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 SetDlgItemTextW(hwnd, IDOK, L"Aggiungi");
                 SetDlgItemTextW(hwnd, IDCANCEL, L"Annulla");
             }
+            if (state->editing)
+            {
+                SetWindowTextW(hwnd, italian ? L"Modifica collegamento" : L"Edit link");
+                SetDlgItemTextW(hwnd, IDOK, italian ? L"Salva" : L"Save");
+                if (!state->preferBookmark) SetDlgItemTextW(hwnd, IDC_LINK_URL, state->target);
+            }
             SetDlgItemTextW(hwnd, IDC_LINK_TEXT, state->name);
             SendDlgItemMessageW(hwnd, IDC_LINK_TEXT, EM_LIMITTEXT,
                                 RWP_LINK_MAX_NAME - 1, 0);
             SendDlgItemMessageW(hwnd, IDC_LINK_URL, EM_LIMITTEXT,
-                                RWP_LINK_MAX_URL - 12, 0);
+                                state->editing ? RWP_LINK_MAX_URL - 1 : RWP_LINK_MAX_URL - 12, 0);
             SendDlgItemMessageW(hwnd, IDC_LINK_BOOKMARK, CB_LIMITTEXT,
                                 RWP_BOOKMARK_NAME_LIMIT, 0);
             for (i = 0; i < rwpBookmarkCount; ++i)
@@ -5541,16 +5586,18 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 SendDlgItemMessageW(hwnd, IDC_LINK_BOOKMARK, CB_SETCURSEL,
                                     selected, 0);
             }
-            else
+            else if (!state->preferBookmark || !state->editing)
                 EnableWindow(GetDlgItem(hwnd, IDC_LINK_KIND_BOOKMARK), FALSE);
             SetWindowSubclass(GetDlgItem(hwnd, IDC_LINK_KIND_URL),
                               rwp_bulk_radio_subclass, 1, 0);
             SetWindowSubclass(GetDlgItem(hwnd, IDC_LINK_KIND_BOOKMARK),
                               rwp_bulk_radio_subclass, 1, 0);
+            if (state->editing && state->preferBookmark)
+                SetDlgItemTextW(hwnd, IDC_LINK_BOOKMARK, state->target + 1);
             rwp_link_dialog_switch_mode(hwnd,
-                state->preferBookmark && rwpBookmarkCount > 0);
+                state->preferBookmark && (state->editing || rwpBookmarkCount > 0));
             SetFocus(GetDlgItem(hwnd,
-                state->preferBookmark && rwpBookmarkCount > 0 ?
+                state->preferBookmark && (state->editing || rwpBookmarkCount > 0) ?
                     IDC_LINK_BOOKMARK : IDC_LINK_URL));
             return FALSE;
         }
@@ -5558,7 +5605,7 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
             if (rwpLinkDialogWnd == hwnd) rwpLinkDialogWnd = NULL;
             break;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
+            rwp_close_link_dialog(hwnd, state != NULL);
             return TRUE;
         case WM_COMMAND:
             if (LOWORD(wParam) == IDC_LINK_KIND_URL && HIWORD(wParam) == BN_CLICKED)
@@ -5573,7 +5620,7 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
             }
             if (LOWORD(wParam) == IDCANCEL)
             {
-                DestroyWindow(hwnd);
+                rwp_close_link_dialog(hwnd, state != NULL);
                 SetFocus(hEditorWnd);
                 return TRUE;
             }
@@ -5602,9 +5649,10 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                     WCHAR target[RWP_BOOKMARK_NAME_LIMIT + 1];
                     GetDlgItemTextW(hwnd, IDC_LINK_BOOKMARK, target,
                                     RWP_BOOKMARK_NAME_LIMIT + 1);
-                    rwp_bookmark_sanitize_name(target);
-                    if (!rwp_bookmark_valid_name(target) ||
-                        rwp_bookmark_index(target) < 0)
+                    if (!(state && state->target[0] == L'#' && !lstrcmpW(state->target + 1, target)))
+                        rwp_bookmark_sanitize_name(target);
+                    if (!(state && state->target[0] == L'#' && !lstrcmpW(state->target + 1, target)) &&
+                        (!rwp_bookmark_valid_name(target) || rwp_bookmark_index(target) < 0))
                     {
                         MessageBoxW(hwnd, italian ?
                             L"Inserisci o scegli il nome di un segnalibro esistente." :
@@ -5627,7 +5675,8 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                     }
                     else
                         GetDlgItemTextW(hwnd, IDC_LINK_URL, input, RWP_LINK_MAX_URL);
-                    if (!normalize_link_url(input, url, RWP_LINK_MAX_URL))
+                    if (state && !lstrcmpW(input, state->target)) lstrcpyW(url, input);
+                    else if (!normalize_link_url(input, url, RWP_LINK_MAX_URL))
                     {
                         MessageBoxW(hwnd, italian ?
                             L"Inserisci un URL http://, https://, mailto: oppure www." :
@@ -5636,17 +5685,17 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                         return TRUE;
                     }
                     if (!text[0]) lstrcpynW(text, url, RWP_LINK_MAX_NAME);
-                    if (useSource)
+                    if (useSource && !state)
                         link_exclude_source_trailing_whitespace(text);
                 }
-                if (!insert_hyperlink(text, url))
+                if (!(state ? rwp_replace_link(state, text, url) : insert_hyperlink(hEditorWnd, text, url)))
                 {
                     MessageBoxW(hwnd, italian ? L"Impossibile inserire il collegamento." :
                         L"Could not insert the hyperlink.",
                         L"Link", MB_OK | MB_ICONERROR);
                     return TRUE;
                 }
-                DestroyWindow(hwnd);
+                rwp_close_link_dialog(hwnd, state != NULL);
                 SetFocus(hEditorWnd);
                 return TRUE;
             }
@@ -6236,7 +6285,7 @@ static void set_caption(LPCWSTR wszNewFileName)
 static BOOL validate_endptr(LPCWSTR endptr, UNIT *punit)
 {
     if(punit != NULL)
-        *punit = UNIT_CM;
+        *punit = (UNIT)generalOptions.unit;
     if(!endptr)
         return FALSE;
     if(!*endptr)
@@ -6269,6 +6318,11 @@ static BOOL validate_endptr(LPCWSTR endptr, UNIT *punit)
         endptr += lstrlenW(units_ptW);
     }
 
+    else if (!lstrcmpW(endptr, L"pc"))
+    {
+        *punit = UNIT_PICA;
+        endptr += 2;
+    }
     return *endptr == '\0';
 }
 
@@ -6800,6 +6854,7 @@ static void store_bar_state(int bandId, BOOL show)
         barState[formatIndex] |= (1 << bandId);
     else
         barState[formatIndex] &= ~(1 << bandId);
+    barState[1 - formatIndex] = barState[formatIndex];
 }
 
 static void set_toolbar_state(int bandId, BOOL show)
@@ -7579,6 +7634,251 @@ static BOOL rwp_recovery_read_field(const BYTE *rtf, SIZE_T size,
         at = groupEnd;
     }
     return hasTarget;
+}
+
+/* Keep the selected field's formatted result in a scratch RichEdit while
+ * preparing its replacement. The document receives one selection stream. */
+static BOOL rwp_stream_link_selection(HWND editor, RWP_LINKOUTPUT *output)
+{
+    EDITSTREAM stream = {0};
+    stream.dwCookie = (DWORD_PTR)output;
+    stream.pfnCallback = link_stream_out;
+    SendMessageW(editor, EM_STREAMOUT, SF_RTF | SFF_SELECTION, (LPARAM)&stream);
+    return !stream.dwError && output->data && output->used;
+}
+
+static BOOL rwp_read_link_stream(HWND editor, const RWP_LINKOUTPUT *output, DWORD flags)
+{
+    RWP_LINKINPUT input = {output->data, output->used, 0};
+    EDITSTREAM stream = {0};
+    stream.dwCookie = (DWORD_PTR)&input;
+    stream.pfnCallback = link_stream_in;
+    SendMessageW(editor, EM_STREAMIN, SF_RTF | flags, (LPARAM)&stream);
+    return !stream.dwError && input.offset == input.size;
+}
+
+static BOOL rwp_unwrap_link_results(RWP_LINKOUTPUT *source)
+{
+    SIZE_T at = 0;
+    while (at < source->used)
+    {
+        RWP_RECOVERY_FIELD field = {0};
+        if (source->data[at] == '{' && at + 7 < source->used &&
+            !memcmp(source->data + at, "{\\field", 7))
+        {
+            SIZE_T kept;
+            /* The parser records fldrslt for external fields as well.
+             * Its return value specifically classifies internal targets. */
+            rwp_recovery_read_field((const BYTE *)source->data, source->used, at, &field);
+            if (!field.resultAt || field.resultEnd < field.resultAt ||
+                field.end > source->used) return FALSE;
+            kept = field.resultEnd - field.resultAt;
+            memmove(source->data + at + 1, source->data + field.resultAt, kept);
+            source->data[at + 1 + kept] = '}';
+            memmove(source->data + at + 2 + kept, source->data + field.end,
+                    source->used - field.end);
+            source->used -= field.end - at - kept - 2;
+            at += kept + 2;
+        }
+        else at = rwp_recovery_step((const BYTE *)source->data, source->used, at);
+    }
+    return TRUE;
+}
+
+static BOOL rwp_replace_link(const RWP_LINKDIALOG *state, LPCWSTR text, LPCWSTR url)
+{
+    RWP_LINKOUTPUT source = {0}, replacement = {0}, backup = {0};
+    GETTEXTLENGTHEX lengthQuery = {GTL_PRECISE | GTL_NUMCHARS, 1200};
+    LONG previousLength;
+    CHARRANGE original;
+    HWND scratch;
+    BOOL ok = FALSE;
+    CHARRANGE end;
+    WCHAR label[RWP_LINK_MAX_NAME + 1];
+    if (!lstrcmpW(text, state->name) && !lstrcmpW(url, state->target)) return TRUE;
+    scratch = CreateWindowExW(0, L"RICHEDIT50W", NULL, WS_POPUP | ES_MULTILINE,
+                              0, 0, 0, 0, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (!scratch) return FALSE;
+    SendMessageW(scratch, EM_AUTOURLDETECT, FALSE, 0);
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&original);
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&state->field);
+    if (!rwp_stream_link_selection(hEditorWnd, &source)) goto done;
+    if (!rwp_unwrap_link_results(&source)) goto done;
+    if (!rwp_read_link_stream(scratch, &source, 0) ||
+        GetWindowTextLengthW(scratch) != lstrlenW(state->name) ||
+        !GetWindowTextW(scratch, label, RWP_LINK_MAX_NAME + 1) ||
+        lstrcmpW(label, state->name)) goto done;
+    SendMessageW(scratch, EM_SETSEL, 0, lstrlenW(label));
+    if (!insert_hyperlink(scratch, text, url)) goto done;
+    SendMessageW(scratch, EM_EXGETSEL, 0, (LPARAM)&end);
+    SendMessageW(scratch, EM_SETSEL, 0, end.cpMax);
+    if (!rwp_stream_link_selection(scratch, &replacement)) goto done;
+    if (!rwp_stream_link_selection(hEditorWnd, &backup)) goto done;
+    previousLength = (LONG)SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX, (WPARAM)&lengthQuery, 0);
+    ok = rwp_read_link_stream(hEditorWnd, &replacement, SFF_SELECTION);
+    if (!ok)
+    {
+        CHARRANGE affected = state->field;
+        LONG currentLength = (LONG)SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX,
+                                               (WPARAM)&lengthQuery, 0);
+        affected.cpMax += currentLength - previousLength;
+        SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&affected);
+        rwp_read_link_stream(hEditorWnd, &backup, SFF_SELECTION);
+    }
+    if (ok)
+    {
+        rwpRichFormattingChanged = TRUE;
+        SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+    }
+done:
+    if (!ok) SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&original);
+    if (source.data) HeapFree(GetProcessHeap(), 0, source.data);
+    if (replacement.data) HeapFree(GetProcessHeap(), 0, replacement.data);
+    if (backup.data) HeapFree(GetProcessHeap(), 0, backup.data);
+    DestroyWindow(scratch);
+    return ok;
+}
+
+/* Adjacent friendly-name fields may share the link format. A field is
+ * a hidden instruction followed by a visible label. Constrain the TOM
+ * formatting run to the field containing the clicked character. */
+static int rwp_hidden_at(ITextRange *range, LONG cp)
+{
+    ITextFont *font = NULL;
+    LONG hidden = 0;
+    HRESULT hr = range->lpVtbl->SetRange(range, cp, cp + 1);
+    if (SUCCEEDED(hr)) hr = range->lpVtbl->GetFont(range, &font);
+    if (FAILED(hr) || !font) return -1;
+    hr = font->lpVtbl->GetHidden(font, &hidden);
+    font->lpVtbl->Release(font);
+    return FAILED(hr) ? -1 : hidden != 0;
+}
+
+static BOOL rwp_limit_link_field(ITextRange *range, LONG cp, CHARRANGE *span)
+{
+    LONG visible = cp, first, last;
+    int hidden;
+    while (visible < span->cpMax)
+    {
+        hidden = rwp_hidden_at(range, visible);
+        if (hidden < 0) return FALSE;
+        if (!hidden) break;
+        ++visible;
+    }
+    if (visible >= span->cpMax) return FALSE;
+    first = last = visible;
+    while (first > span->cpMin && (hidden = rwp_hidden_at(range, first - 1)) == 0) --first;
+    if (first > span->cpMin && hidden < 0) return FALSE;
+    while (first > span->cpMin && (hidden = rwp_hidden_at(range, first - 1)) == 1) --first;
+    if (first > span->cpMin && hidden < 0) return FALSE;
+    while (last < span->cpMax && (hidden = rwp_hidden_at(range, last)) == 0) ++last;
+    if (last < span->cpMax && hidden < 0) return FALSE;
+    span->cpMin = first;
+    span->cpMax = last;
+    return TRUE;
+}
+
+static BOOL rwp_get_edit_field(LONG cp, RWP_LINKDIALOG *state)
+{
+    RWP_TEXT_RANGE2 *link = rwp_hyperlink_range_at(cp);
+    ITextRange *range = (ITextRange *)link;
+    BSTR encoded = NULL;
+    CHARRANGE previous;
+    GETTEXTEX request = {0};
+    WCHAR name[RWP_LINK_MAX_NAME + 1];
+    LRESULT length;
+    LONG delta;
+    BOOL ok = FALSE;
+    if (!link) return FALSE;
+    if (FAILED(link->lpVtbl->GetURL(link, &encoded)) || !encoded ||
+        !rwp_decode_context_link_url(encoded, state->target, RWP_LINK_MAX_URL) ||
+        FAILED(range->lpVtbl->Expand(range, (LONG)0x80000020, &delta)) || /* tomLink */
+        FAILED(range->lpVtbl->GetStart(range, &state->field.cpMin)) ||
+        FAILED(range->lpVtbl->GetEnd(range, &state->field.cpMax)) ||
+        cp < state->field.cpMin || cp >= state->field.cpMax ||
+        !rwp_limit_link_field(range, cp, &state->field)) goto done;
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&previous);
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&state->field);
+    if (state->target[0] != L'#' && !link_valid_url(state->target))
+    {
+        /* Imported local fields may use the Word local-target switch. */
+        RWP_LINKOUTPUT rtf = {0};
+        if (rwp_stream_link_selection(hEditorWnd, &rtf))
+        {
+            SIZE_T pos = 0;
+            while (pos < rtf.used)
+            {
+                RWP_RECOVERY_FIELD local;
+                if (rtf.data[pos] == '{' && rwp_recovery_read_field(
+                    (const BYTE *)rtf.data, rtf.used, pos, &local))
+                {
+                    state->target[0] = L'#';
+                    lstrcpyW(state->target + 1, local.name);
+                    break;
+                }
+                pos = rwp_recovery_step((const BYTE *)rtf.data, rtf.used, pos);
+            }
+        }
+        if (rtf.data) HeapFree(GetProcessHeap(), 0, rtf.data);
+    }
+    request.cb = sizeof(name);
+    request.flags = GT_SELECTION | GT_NOHIDDENTEXT;
+    request.codepage = 1200;
+    length = SendMessageW(hEditorWnd, EM_GETTEXTEX, (WPARAM)&request, (LPARAM)name);
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&previous);
+    if (length <= 0 || length >= RWP_LINK_MAX_NAME) goto done;
+    lstrcpyW(state->name, name);
+    ok = TRUE;
+done:
+    if (encoded) SysFreeString(encoded);
+    range->lpVtbl->Release(range);
+    return ok;
+}
+
+static void dialog_edit_context_link(LONG cp)
+{
+    RWP_LINKDIALOG state = {0}, neighbor = {0};
+    int n, split;
+    if (cp < 0 || fileFormat != SF_RTF ||
+        (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY)) return;
+    if (!rwp_get_edit_field(cp, &state))
+    {
+        MessageBoxW(hMainWnd, PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN ?
+            L"Impossibile leggere il collegamento completo." : L"Could not read the complete link.",
+            L"Link", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    /* Rejoin only the two exact halves produced by insert_hyperlink when
+     * the displayed text is the address itself. */
+    n = lstrlenW(state.target);
+    split = n / 2;
+    if (split && state.target[split] >= 0xDC00 && state.target[split] <= 0xDFFF) --split;
+    if (n < RWP_LINK_MAX_NAME && split && lstrlenW(state.name) < n)
+    {
+        if (lstrlenW(state.name) == split && !_wcsnicmp(state.name, state.target, split) &&
+            rwp_get_edit_field(state.field.cpMax, &neighbor) &&
+            neighbor.field.cpMin == state.field.cpMax &&
+            !lstrcmpW(neighbor.target, state.target) && !_wcsicmp(neighbor.name, state.target + split))
+        {
+            lstrcatW(state.name, neighbor.name);
+            state.field.cpMax = neighbor.field.cpMax;
+        }
+        else if (!_wcsicmp(state.name, state.target + split) && state.field.cpMin > 0 &&
+            rwp_get_edit_field(state.field.cpMin - 1, &neighbor) &&
+            neighbor.field.cpMax == state.field.cpMin && !lstrcmpW(neighbor.target, state.target) &&
+            lstrlenW(neighbor.name) == split && !_wcsnicmp(neighbor.name, state.target, split))
+        {
+            lstrcatW(neighbor.name, state.name);
+            lstrcpyW(state.name, neighbor.name);
+            state.field.cpMin = neighbor.field.cpMin;
+        }
+    }
+    rwp_bookmarks_prune_deleted();
+    state.editing = TRUE;
+    state.preferBookmark = state.target[0] == L'#';
+    state.matchingBookmark = state.preferBookmark ? rwp_bookmark_index(state.target + 1) : -1;
+    DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_LINK_UNIFIED),
+                    hMainWnd, hyperlink_dialog_proc, (LPARAM)&state);
 }
 
 /* Return only real internal HYPERLINK fields. An unrecognized or external
@@ -11556,7 +11856,89 @@ typedef struct
     DWORD originalBars;
 } RWP_VIEW_OPTIONS_PAGE;
 
-static RWP_VIEW_OPTIONS_PAGE rwpViewOptionsPages[2];
+static RWP_VIEW_OPTIONS_PAGE viewFormatPage;
+
+static void apply_word_selection(void)
+{
+    SendMessageW(hEditorWnd, EM_SETOPTIONS,
+        generalOptions.autoWord ? ECOOP_OR : ECOOP_AND,
+        generalOptions.autoWord ? ECO_AUTOWORDSELECTION : ~(LPARAM)ECO_AUTOWORDSELECTION);
+}
+
+/* Comctl32 can position a newly activated page using the original sheet
+ * dimensions. Fit it to the current tab display area on every layout. */
+static LRESULT CALLBACK rwp_options_page_layout(HWND page, UINT msg,
+        WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data)
+{
+    if (msg == WM_WINDOWPOSCHANGING)
+    {
+        WINDOWPOS *pos = (WINDOWPOS *)lp;
+        HWND parent = GetParent(page);
+        HWND tabs = PropSheet_GetTabControl(parent);
+        RECT rect;
+        if (tabs && !(pos->flags & SWP_NOSIZE && pos->flags & SWP_NOMOVE))
+        {
+            GetClientRect(tabs, &rect);
+            TabCtrl_AdjustRect(tabs, FALSE, &rect);
+            MapWindowPoints(tabs, parent, (POINT *)&rect, 2);
+            pos->x = rect.left;
+            pos->y = rect.top;
+            pos->cx = rect.right - rect.left;
+            pos->cy = rect.bottom - rect.top;
+            pos->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+        }
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(page, rwp_options_page_layout, id);
+    return DefSubclassProc(page, msg, wp, lp);
+}
+
+static void rwp_style_options_page(HWND page)
+{
+    rwp_theme_dialog(page);
+    rwp_enlarge_legacy_dialog(page);
+    SetWindowSubclass(page, rwp_options_page_layout, 1, 0);
+}
+
+static INT_PTR CALLBACK general_options_proc(HWND page, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_INITDIALOG)
+    {
+        if (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN)
+        {
+            SetDlgItemTextW(page, IDC_MEASURE_GROUP, L"Unità di misura");
+            SetDlgItemTextW(page, IDC_MEASURE_IN, L"Pollici");
+            SetDlgItemTextW(page, IDC_MEASURE_CM, L"Centimetri");
+            SetDlgItemTextW(page, IDC_MEASURE_PT, L"Punti");
+            SetDlgItemTextW(page, IDC_MEASURE_PC, L"Pica");
+            SetDlgItemTextW(page, IDC_AUTO_WORD, L"Selezione automatica parole");
+        }
+        rwp_style_options_page(page);
+        CheckRadioButton(page, IDC_MEASURE_CM, IDC_MEASURE_PC, IDC_MEASURE_CM + generalOptions.unit);
+        CheckDlgButton(page, IDC_AUTO_WORD, generalOptions.autoWord ? BST_CHECKED : BST_UNCHECKED);
+        return TRUE;
+    }
+    if (msg == WM_NOTIFY && ((NMHDR *)lp)->code == PSN_APPLY)
+    {
+        DWORD unit, saved[2];
+        for (unit = UNIT_CM; unit <= UNIT_PICA; ++unit)
+            if (IsDlgButtonChecked(page, IDC_MEASURE_CM + unit) == BST_CHECKED) break;
+        saved[0] = unit;
+        saved[1] = IsDlgButtonChecked(page, IDC_AUTO_WORD) == BST_CHECKED;
+        if (unit > UNIT_PICA || !rwp_write_binary_option(L"GeneralEditorOptions", saved, sizeof(saved)))
+        {
+            rwp_report_settings_save_error(page);
+            SetWindowLongPtrW(page, DWLP_MSGRESULT, PSNRET_INVALID_NOCHANGEPAGE);
+            return TRUE;
+        }
+        generalOptions.unit = unit;
+        generalOptions.autoWord = saved[1];
+        apply_word_selection();
+        redraw_ruler(GetDlgItem(GetDlgItem(hMainWnd, IDC_REBAR), IDC_RULER));
+        SetWindowLongPtrW(page, DWLP_MSGRESULT, PSNRET_NOERROR);
+        return TRUE;
+    }
+    return FALSE;
+}
 static BOOL rwpViewOptionsChanged;
 static const struct { int control; DWORD mask; } rwpViewOptionsBars[] =
 {
@@ -11570,7 +11952,7 @@ static const DWORD rwpViewOptionsWrap[] =
     ID_WORDWRAP_NONE, ID_WORDWRAP_WINDOW, ID_WORDWRAP_MARGIN
 };
 
-/* Keep the localized Text and Rich Text pages. Since the owner remains
+/* The shared Text and RTF page uses the localized controls. Since the owner remains
  * usable, apply only controls edited in the sheet and leave simultaneous
  * changes from the main View menu in place. */
 static INT_PTR CALLBACK formatopts_proc(HWND page, UINT message,
@@ -11588,7 +11970,7 @@ static INT_PTR CALLBACK formatopts_proc(HWND page, UINT message,
         SetWindowLongPtrW(page, DWLP_USER, (LONG_PTR)state);
         state->originalWrap = wordWrap[state->format];
         state->originalBars = barState[state->format];
-        rwp_theme_dialog(page);
+        rwp_style_options_page(page);
         for (i = 0; i < sizeof(rwpViewOptionsWrap) / sizeof(rwpViewOptionsWrap[0]); ++i)
             if (state->originalWrap == rwpViewOptionsWrap[i])
                 CheckRadioButton(page, IDC_PAGEFMT_WN, IDC_PAGEFMT_WM,
@@ -11622,7 +12004,7 @@ static INT_PTR CALLBACK formatopts_proc(HWND page, UINT message,
             if (rwpViewOptionsWrap[i] != state->originalWrap &&
                 IsDlgButtonChecked(page, IDC_PAGEFMT_WN + (int)i) == BST_CHECKED)
             {
-                wordWrap[state->format] = rwpViewOptionsWrap[i];
+                wordWrap[0] = wordWrap[1] = rwpViewOptionsWrap[i];
                 rwpViewOptionsChanged = TRUE;
                 break;
             }
@@ -11634,6 +12016,7 @@ static INT_PTR CALLBACK formatopts_proc(HWND page, UINT message,
             if (checked == ((state->originalBars & mask) != 0)) continue;
             if (checked) barState[state->format] |= mask;
             else barState[state->format] &= ~mask;
+            barState[1 - state->format] = barState[state->format];
             rwpViewOptionsChanged = TRUE;
         }
         SetWindowLongPtrW(page, DWLP_MSGRESULT, PSNRET_NOERROR);
@@ -11741,7 +12124,7 @@ static void dialog_viewproperties(void)
     PROPSHEETPAGEW pages[2];
     PROPSHEETHEADERW sheet;
     INT_PTR result;
-    size_t i;
+    BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     HINSTANCE instance = GetModuleHandleW(NULL);
 
     if (rwpViewOptionsWnd && IsWindow(rwpViewOptionsWnd))
@@ -11753,18 +12136,18 @@ static void dialog_viewproperties(void)
 
     rwpViewOptionsChanged = FALSE;
     ZeroMemory(pages, sizeof(pages));
-    for (i = 0; i < sizeof(pages) / sizeof(pages[0]); ++i)
-    {
-        rwpViewOptionsPages[i].format = reg_formatindex(i == 0 ? SF_TEXT : SF_RTF);
-        pages[i].dwSize = sizeof(pages[i]);
-        pages[i].dwFlags = PSP_USETITLE;
-        U(pages[i]).pszTemplate = MAKEINTRESOURCEW(IDD_FORMATOPTS);
-        pages[i].pfnDlgProc = formatopts_proc;
-        pages[i].hInstance = instance;
-        pages[i].lParam = (LPARAM)&rwpViewOptionsPages[i];
-        pages[i].pszTitle = MAKEINTRESOURCEW(i == 0 ?
-            STRING_VIEWPROPS_TEXT : STRING_VIEWPROPS_RICHTEXT);
-    }
+    viewFormatPage.format = reg_formatindex(SF_RTF);
+    pages[0].dwSize = sizeof(pages[0]);
+    pages[0].dwFlags = PSP_USETITLE;
+    pages[0].hInstance = instance;
+    U(pages[0]).pszTemplate = MAKEINTRESOURCEW(IDD_GENERAL_OPTIONS);
+    pages[0].pfnDlgProc = general_options_proc;
+    pages[0].pszTitle = italian ? L"Opzioni" : L"Options";
+    pages[1] = pages[0];
+    U(pages[1]).pszTemplate = MAKEINTRESOURCEW(IDD_FORMATOPTS);
+    pages[1].pfnDlgProc = formatopts_proc;
+    pages[1].lParam = (LPARAM)&viewFormatPage;
+    pages[1].pszTitle = italian ? L"Testo e RTF" : L"Text and RTF";
 
     ZeroMemory(&sheet, sizeof(sheet));
     sheet.dwSize = sizeof(sheet);
@@ -11776,10 +12159,16 @@ static void dialog_viewproperties(void)
     sheet.nPages = sizeof(pages) / sizeof(pages[0]);
     U3(sheet).ppsp = pages;
     U(sheet).pszIcon = MAKEINTRESOURCEW(IDI_WORDPAD);
-    U2(sheet).nStartPage = (fileFormat & SF_RTF) ? 1 : 0;
+    U2(sheet).nStartPage = 0;
     sheet.pfnCallback = rwp_options_sheet_callback;
     result = PropertySheetW(&sheet);
     rwpViewOptionsWnd = result > 0 ? (HWND)result : NULL;
+    if (rwpViewOptionsWnd)
+    {
+        HWND page = PropSheet_GetCurrentPageHwnd(rwpViewOptionsWnd);
+        rwp_enlarge_legacy_dialog(rwpViewOptionsWnd);
+        if (page) SetWindowPos(page, NULL, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER);
+    }
 }
 
 /* A modeless property sheet signals completion by dropping its current page.
@@ -17333,42 +17722,29 @@ static void dialog_find(LPFINDREPLACEW fr, BOOL replace)
 
 static int units_to_twips(UNIT unit, float number)
 {
-    int twips = 0;
+    return (int)(number * unitTwips[unit] + (number < 0 ? -0.5 : 0.5));
+}
 
-    switch(unit)
-    {
-    case UNIT_CM:
-        twips = (int)(number * 1000.0 / (float)CENTMM_PER_INCH * (float)TWIPS_PER_INCH);
-        break;
-
-    case UNIT_INCH:
-        twips = (int)(number * (float)TWIPS_PER_INCH);
-        break;
-
-    case UNIT_PT:
-        twips = (int)(number * (0.0138 * (float)TWIPS_PER_INCH));
-        break;
-    }
-
-    return twips;
+static LPCWSTR current_unit_suffix(void)
+{
+    LPCWSTR suffix[] = {units_cmW, units_inW, units_ptW, L"pc"};
+    return suffix[generalOptions.unit];
 }
 
 static void append_current_units(LPWSTR buffer)
 {
-    static const WCHAR space[] = {' ', 0};
-    lstrcatW(buffer, space);
-    lstrcatW(buffer, units_cmW);
+    if (lstrlenW(buffer) + lstrlenW(current_unit_suffix()) + 2 > MAX_STRING_LEN) return;
+    lstrcatW(buffer, L" ");
+    lstrcatW(buffer, current_unit_suffix());
 }
 
 static void number_with_units(LPWSTR buffer, int number)
 {
-    static const WCHAR fmt[] = {'%','.','2','f',' ','%','s','\0'};
-    float converted = (float)number / (float)TWIPS_PER_INCH *(float)CENTMM_PER_INCH / 1000.0;
-
+    double converted = number / unitTwips[generalOptions.unit];
 #ifdef __RWORDPAD__
-    _swprintf(buffer, fmt, converted, units_cmW);
+    _swprintf(buffer, L"%.2f %s", converted, current_unit_suffix());
 #else
-    sprintfW(buffer, fmt, converted, units_cmW);
+    sprintfW(buffer, L"%.2f %s", converted, current_unit_suffix());
 #endif
 }
 
@@ -20081,6 +20457,16 @@ static LRESULT OnCreate( HWND hWnd )
         return -1;
     }
     assert(hEditorWnd);
+    {
+        DWORD saved[2], size = sizeof(saved);
+        if (rwp_read_binary_option(L"GeneralEditorOptions", saved, &size) &&
+            size == sizeof(saved) && saved[0] <= UNIT_PICA && saved[1] <= 1)
+        {
+            generalOptions.unit = saved[0];
+            generalOptions.autoWord = saved[1];
+        }
+        apply_word_selection();
+    }
 
     /* Rich Edit defaults to a 32,767-character input limit. Large documents
      * can therefore become effectively read-only once their text exceeds that
@@ -20116,6 +20502,9 @@ static LRESULT OnCreate( HWND hWnd )
 
     registry_read_filelist(hWnd);
     registry_read_formatopts_all(barState, wordWrap);
+    /* Migrate the former format-specific preferences using the RTF view. */
+    barState[reg_formatindex(SF_TEXT)] = barState[reg_formatindex(SF_RTF)];
+    wordWrap[reg_formatindex(SF_TEXT)] = wordWrap[reg_formatindex(SF_RTF)];
     registry_read_options();
     rwp_backup_load_preferences();
     rwp_load_highlight_visibility(hWnd);
@@ -27254,7 +27643,7 @@ static LRESULT rwp_show_editor_context_menu(HWND editor, LPARAM lParam)
     DestroyMenu(menu);
     if (command)
     {
-        if (command != ID_REMOVE_LINK && command != ID_COPY_LINK)
+        if (command != ID_REMOVE_LINK && command != ID_COPY_LINK && command != ID_EDIT_CONTEXT_LINK)
             rwpLinkContextCp = -1;
         PostMessageW(hMainWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
     }
@@ -28874,6 +29263,13 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         dialog_insert_hyperlink(FALSE);
         break;
 
+    case ID_EDIT_CONTEXT_LINK:
+    {
+        LONG cp = rwpLinkContextCp;
+        rwpLinkContextCp = -1;
+        dialog_edit_context_link(cp);
+        break;
+    }
     case ID_COPY_LINK:
     {
         LONG cp = rwpLinkContextCp;

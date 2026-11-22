@@ -85,6 +85,18 @@ LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
 /* Automatic backups: shared English/Italian resource, using the established UI font. */
 /* Compact layout: same configured 14-point UI font, smaller margins and
  * row spacing. The check option is custom-painted like selected radios. */
+IDD_GENERAL_OPTIONS DIALOGEX 0, 0, 280, 110
+STYLE DS_SHELLFONT | DS_CONTROL | WS_CHILD
+FONT 8, "MS Shell Dlg"
+BEGIN
+    GROUPBOX "Measurement units", IDC_MEASURE_GROUP, 5, 8, 266, 59
+    AUTORADIOBUTTON "Inches", IDC_MEASURE_IN, 15, 22, 96, 15, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "Centimeters", IDC_MEASURE_CM, 125, 22, 126, 15
+    AUTORADIOBUTTON "Points", IDC_MEASURE_PT, 15, 42, 96, 15
+    AUTORADIOBUTTON "Picas", IDC_MEASURE_PC, 125, 42, 126, 15
+    AUTOCHECKBOX "Automatic word selection", IDC_AUTO_WORD, 8, 78, 250, 18, WS_GROUP | WS_TABSTOP
+END
+
 IDD_AUTOMATIC_BACKUP DIALOGEX 0, 0, 274, 114
 STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Automatic Backup"
