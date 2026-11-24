@@ -12254,7 +12254,55 @@ static const COLORREF textcolors[]=
 
 /* Bulk Format Tool: locate matches before making any changes.  Formatting
  * affects only selected attributes, never document text or embedded objects. */
-#define RWP_BULK_MAX_MATCHES 200000
+/* Match storage is bounded by addressable memory, not an arbitrary count.
+ * Do not modify the document until every original match has been collected. */
+static BOOL rwp_search_append_range(CHARRANGE **ranges, SIZE_T *used,
+                                     SIZE_T *capacity, const CHARRANGE *range)
+{
+    const SIZE_T maximum = (SIZE_T)-1 / sizeof(**ranges);
+    if (*used == *capacity)
+    {
+        SIZE_T next;
+        CHARRANGE *grown;
+        if (*capacity >= maximum) return FALSE;
+        next = *capacity ? (*capacity > maximum / 2 ? maximum : *capacity * 2)
+                         : (maximum < 64 ? maximum : 64);
+        grown = *ranges ? HeapReAlloc(GetProcessHeap(), 0, *ranges,
+                                      next * sizeof(**ranges))
+                        : HeapAlloc(GetProcessHeap(), 0, next * sizeof(**ranges));
+        if (!grown) return FALSE;
+        *ranges = grown;
+        *capacity = next;
+    }
+    (*ranges)[(*used)++] = *range;
+    return TRUE;
+}
+
+/* Internal selections during scanning/editing must not refresh the entire
+ * toolbar, font picker, status bar and document counter for every match.
+ * Keep RichEdit notifications enabled so other editor behavior is unchanged. */
+static BOOL rwpSearchBatchActive = FALSE;
+
+static void rwp_search_batch_begin(void)
+{
+    rwpSearchBatchActive = TRUE;
+    SendMessageW(hEditorWnd, WM_SETREDRAW, FALSE, 0);
+}
+
+static void rwp_search_batch_end(const POINT *scroll, BOOL scrollCaret)
+{
+    SendMessageW(hEditorWnd, WM_SETREDRAW, TRUE, 0);
+    if (scroll) SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0, (LPARAM)scroll);
+    if (scrollCaret) SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
+    rwpSearchBatchActive = FALSE;
+    update_font_list();
+    rwp_header_refresh_character_count();
+    rwp_statusbar_update_editor_position();
+    SendMessageW(hMainWnd, WM_USER, 0, 0);
+    RedrawWindow(hEditorWnd, NULL, NULL,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
+
 #define RWP_COMMON_FIND_EDIT 0x0480 /* edt1 in the standard Find/Replace dialog */
 
 typedef struct RWP_BULK_DIALOG
@@ -12864,9 +12912,8 @@ static LONG rwp_bulk_apply(HWND dlg, const WCHAR *findText,
     search.lpstrText = (LPWSTR)findText;
     /* Collect results before editing, avoiding accidental new matches during
      * formatting. cpMax=-1 includes the remainder of the entire document. */
-    while (count < RWP_BULK_MAX_MATCHES)
+    for (;;)
     {
-        CHARRANGE *grown;
         search.chrg.cpMin = start;
         search.chrg.cpMax = -1;
         if (SendMessageW(hEditorWnd, EM_FINDTEXTEXW,
@@ -12874,28 +12921,15 @@ static LONG rwp_bulk_apply(HWND dlg, const WCHAR *findText,
             break;
         if (search.chrgText.cpMin < start ||
             search.chrgText.cpMax <= search.chrgText.cpMin) goto done;
-        if (count == capacity)
+        if (!rwp_search_append_range(&matches, &count, &capacity, &search.chrgText))
         {
-            SIZE_T next = capacity ? capacity * 2 : 64;
-            if (next > RWP_BULK_MAX_MATCHES) next = RWP_BULK_MAX_MATCHES;
-            grown = matches ? HeapReAlloc(GetProcessHeap(), 0, matches,
-                                          next * sizeof(CHARRANGE))
-                            : HeapAlloc(GetProcessHeap(), 0,
-                                        next * sizeof(CHARRANGE));
-            if (!grown) goto done;
-            matches = grown;
-            capacity = next;
+            MessageBoxW(dlg,
+                italian ? L"Memoria insufficiente per raccogliere le corrispondenze. Nessuna modifica apportata."
+                        : L"Not enough memory to collect matches. No changes were made.",
+                L"Bulk Format Tool", MB_OK | MB_ICONERROR);
+            goto done;
         }
-        matches[count++] = search.chrgText;
         start = search.chrgText.cpMax;
-    }
-    if (count == RWP_BULK_MAX_MATCHES)
-    {
-        MessageBoxW(dlg,
-             italian ? L"Troppe corrispondenze. Nessuna modifica apportata."
-                     : L"Too many matches. No changes have been made.",
-             L"Bulk Format Tool", MB_OK | MB_ICONWARNING);
-        goto done;
     }
     if (!count) { result = 0; goto done; }
 
@@ -12916,6 +12950,7 @@ static LONG rwp_bulk_apply(HWND dlg, const WCHAR *findText,
     SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
     hasScroll = (BOOL)SendMessageW(hEditorWnd, EM_GETSCROLLPOS, 0,
                                    (LPARAM)&scroll);
+    rwp_search_batch_begin();
     reset_background_history();
     for (n = 0; n < count; ++n)
     {
@@ -12944,7 +12979,9 @@ static LONG rwp_bulk_apply(HWND dlg, const WCHAR *findText,
     rwp_end_table_edit_collection(undo);
     undo = NULL;
     SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&selection);
-    if (hasScroll) SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
+    rwpRichFormattingChanged = TRUE;
+    rwpMultiRowAlignmentKnown = FALSE;
+    rwp_search_batch_end(hasScroll ? &scroll : NULL, FALSE);
     if (!success)
     {
         MessageBoxW(dlg,
@@ -12953,10 +12990,6 @@ static LONG rwp_bulk_apply(HWND dlg, const WCHAR *findText,
             L"Bulk Format Tool", MB_OK | MB_ICONERROR);
         goto done;
     }
-    rwpRichFormattingChanged = TRUE;
-    rwpMultiRowAlignmentKnown = FALSE;
-    RedrawWindow(hEditorWnd, NULL, NULL,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     result = (LONG)count;
 
 done:
@@ -13182,9 +13215,6 @@ typedef struct RWP_FORMAT_CRITERIA
     COLORREF highlightColor;
     int bold, underline, italic, strike, superscript, subscript; /* 0=Any, 1=On, 2=Off */
 } RWP_FORMAT_CRITERIA;
-
-#define RWP_FORMAT_SEARCH_MAX_CHARS 300000
-#define RWP_FORMAT_SEARCH_MAX_RUNS 200000
 
 static void rwp_format_add_state_options(HWND dlg, int id, BOOL italian)
 {
@@ -13429,7 +13459,8 @@ static LONG rwp_format_search_apply(HWND dlg,
     SIZE_T count = 0, capacity = 0, n;
     LONG length, cp, span, result = -1;
     GETTEXTLENGTHEX lengthQuery;
-    BOOL success = TRUE, hasScroll, redrawOff = FALSE;
+    BOOL success = TRUE, hasScroll;
+    LPCWSTR error = NULL;
     WCHAR text[8];
     POINT scroll;
     CHARFORMAT2W cf;
@@ -13443,22 +13474,20 @@ static LONG rwp_format_search_apply(HWND dlg,
     lengthQuery.codepage = 1200;
     length = (LONG)SendMessageW(hEditorWnd, EM_GETTEXTLENGTHEX,
                                 (WPARAM)&lengthQuery, 0);
-    if (length < 0 || length > RWP_FORMAT_SEARCH_MAX_CHARS)
+    if (length < 0)
     {
         MessageBoxW(dlg,
-            italian ? L"Documento troppo grande per questa versione della ricerca formato. Nessuna modifica apportata."
-                    : L"Document is too large for this version of Format Search. No changes were made.",
-            L"Bulk Format Tool", MB_OK | MB_ICONWARNING);
+            italian ? L"Impossibile determinare la lunghezza del documento. Nessuna modifica apportata."
+                    : L"Could not determine the document length. No changes were made.",
+            L"Bulk Format Tool", MB_OK | MB_ICONERROR);
         return -1;
     }
     SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&original);
     hasScroll = (BOOL)SendMessageW(hEditorWnd, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
-    SendMessageW(hEditorWnd, WM_SETREDRAW, FALSE, 0);
-    redrawOff = TRUE;
+    rwp_search_batch_begin();
 
     for (cp = 0; cp < length; cp += span)
     {
-        CHARRANGE *grown;
         span = 1;
         current.cpMin = cp;
         current.cpMax = cp + 1;
@@ -13504,27 +13533,12 @@ static LONG rwp_format_search_apply(HWND dlg,
             runs[count-1].cpMax = cp + span;
             continue;
         }
-        if (count >= RWP_FORMAT_SEARCH_MAX_RUNS)
+        if (!rwp_search_append_range(&runs, &count, &capacity, &current))
         {
-            MessageBoxW(dlg,
-                italian ? L"Troppe corrispondenze. Nessuna modifica apportata."
-                        : L"Too many matching text runs. No changes were made.",
-                L"Bulk Format Tool", MB_OK | MB_ICONWARNING);
+            error = italian ? L"Memoria insufficiente per raccogliere le corrispondenze. Nessuna modifica apportata."
+                            : L"Not enough memory to collect matches. No changes were made.";
             goto cleanup;
         }
-        if (count == capacity)
-        {
-            SIZE_T next = capacity ? capacity * 2 : 64;
-            if (next > RWP_FORMAT_SEARCH_MAX_RUNS) next = RWP_FORMAT_SEARCH_MAX_RUNS;
-            grown = runs ? HeapReAlloc(GetProcessHeap(), 0, runs, next * sizeof(*runs))
-                         : HeapAlloc(GetProcessHeap(), 0, next * sizeof(*runs));
-            if (!grown) goto cleanup;
-            runs = grown;
-            capacity = next;
-        }
-        runs[count].cpMin = cp;
-        runs[count].cpMax = cp + span;
-        ++count;
     }
     if (!count) { result = 0; goto cleanup; }
     /* Must be a single Ctrl+Z even when thousands of runs match. Refuse all
@@ -13535,10 +13549,8 @@ static LONG rwp_format_search_apply(HWND dlg,
     undo = rwp_begin_table_edit_collection((UINT)(count > 1 ? count : 2));
     if (!undo)
     {
-        MessageBoxW(dlg,
-            italian ? L"Annulla in un solo passaggio non disponibile. Nessuna modifica apportata."
-                    : L"Single-step Undo is unavailable. No changes were made.",
-            L"Bulk Format Tool", MB_OK | MB_ICONERROR);
+        error = italian ? L"Annulla in un solo passaggio non disponibile. Nessuna modifica apportata."
+                        : L"Single-step Undo is unavailable. No changes were made.";
         goto cleanup;
     }
     reset_background_history();
@@ -13572,25 +13584,21 @@ static LONG rwp_format_search_apply(HWND dlg,
     }
     rwp_end_table_edit_collection(undo);
     undo = NULL;
-    if (!success)
-    {
-        MessageBoxW(dlg,
-            italian ? L"Alcune modifiche non sono state applicate. Puoi annullare l'operazione con Ctrl+Z."
-                    : L"Some formatting changes failed. You can undo the operation with Ctrl+Z.",
-            L"Bulk Format Tool", MB_OK | MB_ICONERROR);
-        goto cleanup;
-    }
     rwpRichFormattingChanged = TRUE;
     rwpMultiRowAlignmentKnown = FALSE;
+    if (!success)
+    {
+        error = italian ? L"Alcune modifiche non sono state applicate. Puoi annullare l'operazione con Ctrl+Z."
+                        : L"Some formatting changes failed. You can undo the operation with Ctrl+Z.";
+        goto cleanup;
+    }
     result = (LONG)count;
 cleanup:
     if (undo) rwp_end_table_edit_collection(undo);
     SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&original);
-    if (hasScroll) SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    if (redrawOff) SendMessageW(hEditorWnd, WM_SETREDRAW, TRUE, 0);
-    RedrawWindow(hEditorWnd, NULL, NULL,
-                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    rwp_search_batch_end(hasScroll ? &scroll : NULL, FALSE);
     if (runs) HeapFree(GetProcessHeap(), 0, runs);
+    if (error) MessageBoxW(dlg, error, L"Bulk Format Tool", MB_OK | MB_ICONERROR);
     return result;
 }
 
@@ -14879,7 +14887,9 @@ static BOOL rwp_unified_find(const RWP_UNIFIED_QUERY *q, LONG begin, LONG limit,
             search.chrg.cpMax = limit;
             if (SendMessageW(hEditorWnd, EM_FINDTEXTEXW, q->flags,
                              (LPARAM)&search) == -1) return FALSE;
-            if (search.chrgText.cpMax <= cp || search.chrgText.cpMax > limit)
+            if (search.chrgText.cpMin < cp ||
+                search.chrgText.cpMax <= search.chrgText.cpMin ||
+                search.chrgText.cpMax > limit)
                 return FALSE;
             if (!q->findFormat || rwp_unified_range_matches(&search.chrgText,
                                                               &q->criteria))
@@ -14936,21 +14946,28 @@ static LONG rwp_unified_execute(HWND dlg, const RWP_UNIFIED_QUERY *q,
     LONG length = rwp_unified_document_length(), start, count = 0;
     CHARRANGE previous, current, *matches = NULL;
     SIZE_T capacity = 0, used = 0, i;
-    BOOL success = TRUE;
     ITextDocument *undo = NULL;
     POINT scroll;
-    BOOL haveScroll = FALSE;
+    BOOL haveScroll, keepSelection = FALSE, noMatch = FALSE;
+    BOOL batch = all || !justFind || q->findFormat || q->textless;
     BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
-    if (length < 0 || length > RWP_FORMAT_SEARCH_MAX_CHARS)
+    LPCWSTR error = NULL;
+    UINT groupCount;
+    if (length < 0)
     {
-        MessageBoxW(dlg, italian ? L"Documento troppo grande per la ricerca combinata."
-                                : L"Document exceeds the unified search limit.",
-                    L"Search and Replace", MB_OK | MB_ICONWARNING);
+        MessageBoxW(dlg, italian ? L"Impossibile determinare la lunghezza del documento."
+                                : L"Could not determine the document length.",
+                    L"Search and Replace", MB_OK | MB_ICONERROR);
         return -1;
     }
+    if (all && q->textless)
+        return rwp_format_search_apply(dlg, &q->criteria, &q->cf, &q->pf);
+
     SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&previous);
+    haveScroll = (BOOL)SendMessageW(hEditorWnd, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
     start = all ? 0 : previous.cpMax;
     if (start < 0 || start > length) start = 0;
+    if (batch) rwp_search_batch_begin();
     if (!all)
     {
         BOOL selectedIsMatch = FALSE;
@@ -14963,98 +14980,94 @@ static LONG rwp_unified_execute(HWND dlg, const RWP_UNIFIED_QUERY *q,
             !rwp_unified_find(q, start, length, &current) &&
             !rwp_unified_find(q, 0, start, &current))
         {
-            MessageBoxW(dlg, italian ? L"Nessuna corrispondenza trovata."
-                                    : L"No matches found.",
-                        L"Search and Replace", MB_OK | MB_ICONINFORMATION);
-            SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&previous);
-            return 0;
+            noMatch = TRUE;
+            goto finish;
         }
         if (justFind)
         {
             SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&current);
-            SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
-            return 1;
+            keepSelection = TRUE;
+            count = 1;
+            goto finish;
         }
         undo = rwp_begin_table_edit_collection(2);
-        if (!undo && (q->cf.dwMask || q->pf.dwMask) && !q->keepText)
-            return -1;
-        success = rwp_unified_apply_one(q, &current);
-        rwp_end_table_edit_collection(undo);
-        SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
-        if (success)
+        if (!undo && ((!q->keepText && (q->cf.dwMask || q->pf.dwMask)) ||
+                      (q->cf.dwMask && q->pf.dwMask)))
+            goto undo_unavailable;
+        if (!rwp_unified_apply_one(q, &current)) goto edit_failed;
         {
             CHARRANGE nextCaret;
             nextCaret.cpMin = nextCaret.cpMax = current.cpMin +
                                (q->keepText ? current.cpMax - current.cpMin :
                                 lstrlenW(q->replace));
             SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&nextCaret);
-            if (q->cf.dwMask || q->pf.dwMask)
-                rwpRichFormattingChanged = TRUE;
-            rwpMultiRowAlignmentKnown = FALSE;
         }
-        return success ? 1 : -1;
+        keepSelection = TRUE;
+        count = 1;
+        goto changed;
     }
-    if (q->textless)
-        return rwp_format_search_apply(dlg, &q->criteria, &q->cf, &q->pf);
+
+    /* Collect original non-overlapping matches before editing. Allocation
+     * failure leaves the document unchanged; no fixed match ceiling. */
     start = 0;
-    while (used < RWP_BULK_MAX_MATCHES &&
-           rwp_unified_find(q, start, length, &current))
+    while (rwp_unified_find(q, start, length, &current))
     {
-        if (used == capacity)
+        if (!rwp_search_append_range(&matches, &used, &capacity, &current))
         {
-            SIZE_T next = capacity ? capacity * 2 : 64;
-            CHARRANGE *grown;
-            if (next > RWP_BULK_MAX_MATCHES) next = RWP_BULK_MAX_MATCHES;
-            grown = matches ? HeapReAlloc(GetProcessHeap(), 0, matches,
-                                         next * sizeof(*matches)) :
-                              HeapAlloc(GetProcessHeap(), 0,
-                                        next * sizeof(*matches));
-            if (!grown) { success = FALSE; goto finish; }
-            matches = grown;
-            capacity = next;
+            error = italian ? L"Memoria insufficiente per raccogliere le corrispondenze. Nessuna modifica apportata."
+                            : L"Not enough memory to collect matches. No changes were made.";
+            goto finish;
         }
-        matches[used++] = current;
         start = current.cpMax;
         if (start >= length) break;
     }
-    if (used >= RWP_BULK_MAX_MATCHES) { success = FALSE; goto finish; }
-    if (!used) { count = 0; goto finish; }
-    undo = rwp_begin_table_edit_collection((UINT)(used > 1 ? used :
-                              (!q->keepText && (q->cf.dwMask || q->pf.dwMask) ? 2 : 1)));
-    if (used > 1 && !undo) { success = FALSE; goto finish; }
-    haveScroll = (BOOL)SendMessageW(hEditorWnd, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    if (!used) goto finish;
+    /* The helper only needs to know whether grouping is necessary. Every
+     * non-overlapping match occupies at least one LONG-indexed code unit. */
+    groupCount = (used > 1 || (!q->keepText && (q->cf.dwMask || q->pf.dwMask)) ||
+                  (q->cf.dwMask && q->pf.dwMask)) ? 2 : 1;
+    undo = rwp_begin_table_edit_collection(groupCount);
+    if (groupCount > 1 && !undo) goto undo_unavailable;
     reset_background_history();
     /* Work backwards: replacing text cannot invalidate earlier match offsets. */
     for (i = used; i > 0; --i)
     {
-        if (!rwp_unified_apply_one(q, &matches[i-1]))
-        { success = FALSE; break; }
+        if (!rwp_unified_apply_one(q, &matches[i-1])) goto edit_failed;
         ++count;
     }
-    rwp_end_table_edit_collection(undo);
-    undo = NULL;
-    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&previous);
-    if (haveScroll) SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
-    if (success)
-    {
-        if (q->cf.dwMask || q->pf.dwMask)
-            rwpRichFormattingChanged = TRUE;
-        rwpMultiRowAlignmentKnown = FALSE;
-        RedrawWindow(hEditorWnd, NULL, NULL,
-                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
-    }
+changed:
+    if (q->cf.dwMask || q->pf.dwMask) rwpRichFormattingChanged = TRUE;
+    rwpMultiRowAlignmentKnown = FALSE;
+    goto finish;
+
+undo_unavailable:
+    error = italian ? L"Annulla in un solo passaggio non disponibile. Nessuna modifica apportata."
+                    : L"Single-step Undo is unavailable. No changes were made.";
+    goto finish;
+edit_failed:
+    if (q->cf.dwMask || q->pf.dwMask) rwpRichFormattingChanged = TRUE;
+    rwpMultiRowAlignmentKnown = FALSE;
+    error = italian ? L"Operazione non completata. Controlla il documento e, se necessario, usa Annulla."
+                    : L"Operation could not be completed. Check the document and use Undo if needed.";
 finish:
-    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&previous);
     if (undo) rwp_end_table_edit_collection(undo);
+    if (!keepSelection) SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&previous);
+    if (batch)
+        rwp_search_batch_end(!keepSelection && haveScroll ? &scroll : NULL, keepSelection);
+    else if (keepSelection)
+        SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
+    else if (haveScroll)
+        SendMessageW(hEditorWnd, EM_SETSCROLLPOS, 0, (LPARAM)&scroll);
     if (matches) HeapFree(GetProcessHeap(), 0, matches);
-    if (!success)
+    if (error)
     {
-        MessageBoxW(dlg,
-            italian ? L"Operazione non completata. Controlla il documento e, se necessario, usa Annulla."
-                    : L"Operation could not be completed. Check the document and use Undo if needed.",
-            L"Search and Replace", MB_OK | MB_ICONERROR);
+        MessageBoxW(dlg, error, L"Search and Replace", MB_OK | MB_ICONERROR);
         return -1;
     }
+    if (noMatch)
+        MessageBoxW(dlg, italian ? L"Nessuna corrispondenza trovata."
+                                : L"No matches found.",
+                    L"Search and Replace", MB_OK | MB_ICONINFORMATION);
     return count;
 }
 
@@ -20759,6 +20772,7 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
 
     if (pHdr->code == EN_SELCHANGE)
     {
+        if (rwpSearchBatchActive) return 1;
         update_font_list();
         rwp_statusbar_update_editor_position();
         SendMessageW(hWnd, WM_USER, 0, 0);
@@ -28519,8 +28533,11 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
             rwpMultiRowAlignmentKnown = FALSE;
             if (!backgroundUpdatingFontColor)
                 reset_background_history();
-            rwp_header_refresh_character_count();
-            rwp_statusbar_update_editor_position();
+            if (!rwpSearchBatchActive)
+            {
+                rwp_header_refresh_character_count();
+                rwp_statusbar_update_editor_position();
+            }
         }
         return 0;
     }
