@@ -18973,6 +18973,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"F3 = Trova successivo\r\n"
             L"Ctrl+H = Cerca e sostituisci\r\n"
             L"Ctrl+K = Inserisci link\r\n"
+            L"Ctrl+J = Aggiungi segnalibro (predefinito; configurabile)\r\n"
             L"Ctrl+B = Grassetto\r\n"
             L"Ctrl+I = Corsivo\r\n"
             L"Ctrl+U = Sottolineato\r\n"
@@ -19001,6 +19002,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"F3 = Find next\r\n"
             L"Ctrl+H = Find and replace\r\n"
             L"Ctrl+K = Insert link\r\n"
+            L"Ctrl+J = Add bookmark (default; configurable)\r\n"
             L"Ctrl+B = Bold\r\n"
             L"Ctrl+I = Italic\r\n"
             L"Ctrl+U = Underline\r\n"
@@ -19061,6 +19063,7 @@ static const struct
 {
     {0, L"Unassigned", L"Non assegnato"},
     {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
+    {ID_BOOKMARK_ADD, L"Add bookmark", L"Aggiungi segnalibro"},
     {ID_FORMAT_COLOR, L"Reapply last text color", L"Applica l'ultimo colore del testo"},
     {ID_FORMAT_COLOR_PICK, L"Open text color picker", L"Apri selezione colore del testo"},
     {ID_COLOR_WHITE, L"Text color: White", L"Colore del testo: Bianco"},
@@ -19106,12 +19109,13 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
-/* Version 3 retains version 2's assignment table and Insert text payloads.
- * Its magic also records that the Alt+W default has been considered, so an
- * explicitly removed shortcut stays removed after restarting the editor. */
+/* Version 4 retains the assignment table and Insert text payloads.
+ * Version 3 recorded the Alt+W default; version 4 records the Ctrl+J
+ * default. A shortcut explicitly removed in its own version stays removed. */
 #define RWP_SHORTCUT_TEXT_MAX 512
 #define RWP_SHORTCUT_BLOB_MAGIC_V2 0x32535752UL /* RWS2 */
-#define RWP_SHORTCUT_BLOB_MAGIC 0x33535752UL /* RWS3 */
+#define RWP_SHORTCUT_BLOB_MAGIC_V3 0x33535752UL /* RWS3 */
+#define RWP_SHORTCUT_BLOB_MAGIC 0x34535752UL /* RWS4 */
 typedef struct
 {
     DWORD magic;
@@ -19192,6 +19196,7 @@ static BOOL rwp_default_shortcut_assignments(
     rwp_clear_shortcut_texts(texts);
     bindings->keys[RWP_SHORTCUT_ALT]['A'] = ID_INSERT_TEXT;
     bindings->keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
+    bindings->keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
     return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
 }
 
@@ -19238,7 +19243,7 @@ static BOOL rwp_shortcut_key_supported(UINT key, UINT modifiers)
 }
 
 /* Protect the app's accelerator table, menu access keys, and Rich Edit's
- * native editing commands. WordPad already suppresses native Ctrl+R. */
+ * native editing commands. Native Ctrl+R and Ctrl+J are suppressed. */
 static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
 {
     UINT accelFlags = 0;
@@ -19286,7 +19291,7 @@ static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
             key == VK_NUMPAD5 || (key >= VK_PRIOR && key <= VK_DOWN) ||
             key == 'C' || key == 'V' || key == 'X')
             return TRUE;
-        if (!shift && (key == 'J' || key == 'L' ||
+        if (!shift && (key == 'L' ||
                        key == '1' || key == '2' || key == '5'))
             return TRUE;
         if (shift && (key == 'A' || key == 'L'))
@@ -19329,7 +19334,7 @@ static void rwp_apply_shortcut_bindings(const RWP_SHORTCUT_ASSIGNMENTS *saved)
 }
 
 /* Validate the whole versioned blob before accepting it. Older blobs acquire
- * Alt+W only when it is free; existing bindings and insertion text survive. */
+ * the new defaults only when free; existing bindings and insertion text survive. */
 static BOOL rwp_load_shortcut_assignments_v2(void)
 {
     BYTE *buffer;
@@ -19348,6 +19353,7 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         goto done;
     memcpy(&header, buffer, sizeof(header));
     if ((header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V3 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V2) ||
         header.textCount > RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT)
         goto done;
@@ -19410,6 +19416,10 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         !rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] &&
         !rwp_shortcut_key_in_use('W', RWP_SHORTCUT_ALT))
         rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] &&
+        !rwp_shortcut_key_in_use('J', RWP_SHORTCUT_CONTROL))
+        rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
     valid = TRUE;
 done:
     if (!valid)
@@ -19536,7 +19546,11 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
     chord = rwp_shortcut_chord_from_message(message);
     if (!chord) return FALSE;
     action = rwpShortcutCommands.keys[HIWORD(chord)][LOWORD(chord)];
-    if (!action || rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
+    /* Suppress native Rich Edit justification even if the user removes
+     * the Ctrl+J binding. Consume the key before WM_CHAR can be generated. */
+    if (!action)
+        return chord == MAKELONG('J', RWP_SHORTCUT_CONTROL);
+    if (rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
         return FALSE;
     if (!(message->lParam & (1UL << 30)))
     {
@@ -19557,24 +19571,46 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
 
 static void rwp_fill_shortcut_actions(HWND combo, BOOL italian, BOOL keyboard)
 {
-    size_t i;
+    size_t order[sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0])];
+    size_t i, count = 0;
     int height = rwp_dialog_input_height(combo);
     if (height > 0)
     {
         SendMessageW(combo, CB_SETITEMHEIGHT, 0, height);
         SendMessageW(combo, CB_SETITEMHEIGHT, (WPARAM)-1, height);
     }
-    for (i = 0; i < sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0]); ++i)
+    /* Keep Unassigned first and sort the remaining displayed labels.
+     * The action table and saved command IDs retain their original order. */
+    order[count++] = 0;
+    for (i = 1; i < sizeof(rwpShortcutActions) / sizeof(rwpShortcutActions[0]); ++i)
     {
-        LRESULT row;
+        size_t pos = count;
+        LPCWSTR label = italian ? rwpShortcutActions[i].italian :
+                                  rwpShortcutActions[i].english;
         /* Insertion text is associated with individual keyboard chords. */
         if (!keyboard && rwpShortcutActions[i].command == ID_INSERT_TEXT)
             continue;
-        row = SendMessageW(combo, CB_ADDSTRING, 0,
-            (LPARAM)(italian ? rwpShortcutActions[i].italian :
-                               rwpShortcutActions[i].english));
+        while (pos > 1)
+        {
+            size_t previous = order[pos - 1];
+            LPCWSTR previousLabel = italian ? rwpShortcutActions[previous].italian :
+                                              rwpShortcutActions[previous].english;
+            if (lstrcmpiW(previousLabel, label) <= 0)
+                break;
+            order[pos] = previous;
+            --pos;
+        }
+        order[pos] = i;
+        ++count;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        size_t index = order[i];
+        LRESULT row = SendMessageW(combo, CB_ADDSTRING, 0,
+            (LPARAM)(italian ? rwpShortcutActions[index].italian :
+                               rwpShortcutActions[index].english));
         if (row >= 0)
-            SendMessageW(combo, CB_SETITEMDATA, row, rwpShortcutActions[i].command);
+            SendMessageW(combo, CB_SETITEMDATA, row, rwpShortcutActions[index].command);
     }
 }
 
