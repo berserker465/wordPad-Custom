@@ -568,9 +568,19 @@ typedef struct RWP_CLOUD_DOC
     /* Missing in older documents:disabled,5-minute default. */
     BOOL periodicSaveEnabled;
     UINT periodicSaveSeconds;
+    UINT defaultZoom; /* 0 inherits the global default; 5-300 overrides it. */
 } RWP_CLOUD_DOC;
 static RWP_CLOUD_DOC rwpCloudDoc = {0};
 static BOOL rwpCloudMetadataUnsafe = FALSE;
+static UINT rwpSavedDocumentZoom = 0;
+static BOOL rwp_document_zoom_dirty(void)
+{
+    return rwpCloudDoc.defaultZoom != rwpSavedDocumentZoom;
+}
+static int rwp_effective_default_zoom(void)
+{
+    return rwpCloudDoc.defaultZoom ? (int)rwpCloudDoc.defaultZoom : rwpDefaultZoom;
+}
 /* Beta 1.6: one UI-thread queue, coalesced by document; network stays asynchronous. */
 static WCHAR rwpCloudAutoStatus[160] = L"";
 static WCHAR rwpStatusSelectionText[128] = L"Column: 1, Line: 1";
@@ -598,6 +608,7 @@ static void rwp_cloud_reset(void)
 {
     ++rwpCloudDocumentSerial;
     ZeroMemory(&rwpCloudDoc, sizeof(rwpCloudDoc));
+    rwpSavedDocumentZoom = 0;
     rwpCloudDoc.maxVersions = 30;
     rwpCloudDoc.retentionDays = 7;
     rwpCloudDoc.periodicSaveSeconds = RWP_CLOUD_PERIODIC_DEFAULT_SECONDS;
@@ -8753,7 +8764,7 @@ static void rwp_bookmark_repair_imported_show(HWND owner)
         return;
     }
     if (SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) ||
-        rwpRichFormattingChanged || rwpCloudMetadataUnsafe)
+        rwpRichFormattingChanged || rwp_document_zoom_dirty() || rwpCloudMetadataUnsafe)
     {
         MessageBoxW(owner, italian ?
             L"Salva o riapri il documento senza modifiche prima del ripristino." :
@@ -9519,6 +9530,7 @@ static BOOL rwp_cloud_json_decode(const char *text, RWP_CLOUD_DOC *settings)
     char folder[RWP_CLOUD_ID_CAP], remote[RWP_CLOUD_ID_CAP], docid[64];
     unsigned long schema, enabled, versions, retentionDays = 7, periodicEnabled, periodicMinutes;
     unsigned long periodicSeconds = RWP_CLOUD_PERIODIC_DEFAULT_SECONDS;
+    unsigned long defaultZoom = 0, cloudPresent = 1;
     BOOL hasSeconds;
     RWP_CLOUD_DOC result;
     ZeroMemory(&result, sizeof(result));
@@ -9552,8 +9564,19 @@ static BOOL rwp_cloud_json_decode(const char *text, RWP_CLOUD_DOC *settings)
         !rwp_cloud_ascii_id(folder, result.folder, RWP_CLOUD_ID_CAP) ||
         !rwp_cloud_ascii_id(remote, result.remoteFile, RWP_CLOUD_ID_CAP) ||
         !rwp_cloud_ascii_id(docid, result.documentID, 64)) return FALSE;
+    /* Old documents have neither optional field and retain their cloud state.
+     * Zoom-only metadata must not create a cloud identity or enable uploads. */
+    if (strstr(text, "\"DefaultZoom\":") &&
+        (!rwp_cloud_json_number(text, "DefaultZoom", &defaultZoom) ||
+         (defaultZoom && (defaultZoom < 5 || defaultZoom > 300)))) return FALSE;
+    if (strstr(text, "\"CloudSettingsPresent\":") &&
+        (!rwp_cloud_json_number(text, "CloudSettingsPresent", &cloudPresent) ||
+         cloudPresent > 1)) return FALSE;
+    if (!cloudPresent && (enabled || periodicEnabled || folder[0] || remote[0] || docid[0]))
+        return FALSE;
     result.enabled = enabled ? TRUE : FALSE;
-    result.present = TRUE;
+    result.present = cloudPresent ? TRUE : FALSE;
+    result.defaultZoom = (UINT)defaultZoom;
     result.maxVersions = (UINT)versions;
     result.retentionDays = (UINT)retentionDays;
     result.periodicSaveEnabled = periodicEnabled ? TRUE : FALSE;
@@ -9649,7 +9672,7 @@ static BOOL rwp_cloud_insert_rtf(RTF_MEMORY *rtf)
     SIZE_T pos, n, extra, i;
     BYTE *patched;
     int written;
-    if (!rwpCloudDoc.present) return TRUE;
+    if (!rwpCloudDoc.present && !rwpCloudDoc.defaultZoom) return TRUE;
     if (!rwp_cloud_valid_id(rwpCloudDoc.folder, TRUE) ||
         !rwp_cloud_valid_id(rwpCloudDoc.remoteFile, TRUE)) return FALSE;
     for (i = 0; i < RWP_CLOUD_ID_CAP && rwpCloudDoc.folder[i]; ++i)
@@ -9666,15 +9689,17 @@ static BOOL rwp_cloud_insert_rtf(RTF_MEMORY *rtf)
         "\"CloudBackupEnabled\":%u,\"RemoteFolderID\":\"%s\","
         "\"RemoteFileID\":\"%s\",\"MaxVersions\":%u,\"RetentionDays\":%u,"
         "\"PeriodicAutoSaveEnabled\":%u,\"PeriodicAutoSaveMinutes\":%u,"
-        "\"PeriodicAutoSaveSeconds\":%u}",
+        "\"PeriodicAutoSaveSeconds\":%u,\"CloudSettingsPresent\":%u,\"DefaultZoom\":%u}",
         docid, (unsigned)rwpCloudDoc.enabled,
-        folder, remote, rwpCloudDoc.maxVersions, rwpCloudDoc.retentionDays,
+        folder, remote, rwpCloudDoc.present ? rwpCloudDoc.maxVersions : 30U,
+        rwpCloudDoc.present ? rwpCloudDoc.retentionDays : 7U,
         (unsigned)rwpCloudDoc.periodicSaveEnabled,
         /* Legacy reader sees a conservative whole-minute interval. */
         ((rwpCloudDoc.periodicSaveSeconds ? rwpCloudDoc.periodicSaveSeconds :
            RWP_CLOUD_PERIODIC_DEFAULT_SECONDS) + 59U) / 60U,
         rwpCloudDoc.periodicSaveSeconds ? rwpCloudDoc.periodicSaveSeconds :
-            RWP_CLOUD_PERIODIC_DEFAULT_SECONDS);
+            RWP_CLOUD_PERIODIC_DEFAULT_SECONDS,
+        (unsigned)rwpCloudDoc.present, rwpCloudDoc.defaultZoom);
     if (written < 0 || written >= (int)sizeof(json)) return FALSE;
     n = rwp_cloud_base64_encode((BYTE *)json, written, encoded);
     extra = sizeof(RWP_CLOUD_META_PREFIX)-1 + n + sizeof(RWP_CLOUD_META_SUFFIX)-1;
@@ -10314,7 +10339,11 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
                     L"until the problem is resolved.",
                     L"Cloud Backup", MB_OK | MB_ICONERROR);
             }
-            else if (foundCloud) rwpCloudDoc = loadedCloud;
+            else if (foundCloud)
+            {
+                rwpCloudDoc = loadedCloud;
+                rwpSavedDocumentZoom = loadedCloud.defaultZoom;
+            }
             if (documentBackgroundPresent)
                 strip_editor_rtf_background(normalizedRtf.data, &normalizedRtf.size);
             normalizedRtf.pos = 0;
@@ -10366,7 +10395,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
 
     SetFocus(hEditorWnd);
 
-    rwp_apply_zoom(rwpDefaultZoom);
+    rwp_apply_zoom(rwp_effective_default_zoom());
     set_caption(szOpenFileName);
     if (szOpenFileName[0])
         SHAddToRecentDocs(SHARD_PATHW, szOpenFileName);
@@ -10423,18 +10452,21 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
                     L"Cloud Backup", MB_OK | MB_ICONERROR);
         return FALSE;
     }
-    if (format != SF_RTF && rwpCloudDoc.present)
+    if (format != SF_RTF && (rwpCloudDoc.present || rwpCloudDoc.defaultZoom))
     {
-        if (MessageBoxW(hMainWnd,
-            L"Plain text cannot contain document cloud settings. "
-            L"Save without the embedded cloud settings?",
-            L"Cloud Backup", MB_YESNO | MB_ICONWARNING) != IDYES)
+        LPCWSTR warning = rwpCloudDoc.defaultZoom ?
+            (rwpCloudDoc.present ?
+                L"Plain text cannot contain cloud settings or a document-specific default zoom. Save without these settings?" :
+                L"Plain text cannot contain a document-specific default zoom. Save without it?") :
+            L"Plain text cannot contain document cloud settings. Save without the embedded cloud settings?";
+        if (MessageBoxW(hMainWnd, warning, wszAppTitle,
+                        MB_YESNO | MB_ICONWARNING) != IDYES)
             return FALSE;
     }
     if (format == SF_RTF) rwp_bookmarks_prune_deleted();
     buffered = (format == SF_RTF &&
                 (documentBackgroundPresent || rwpOriginalImageCount > 0 ||
-                 rwpBookmarkCount > 0 || rwpCloudDoc.present));
+                 rwpBookmarkCount > 0 || rwpCloudDoc.present || rwpCloudDoc.defaultZoom));
     ZeroMemory(&memory, sizeof(memory));
 
     if (buffered)
@@ -10443,7 +10475,7 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
         stream.dwError = 0;
         stream.pfnCallback = stream_out_memory;
         ret = SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
-        if (memory.failed || stream.dwError || !ret || !memory.data ||
+        if (memory.failed || stream.dwError || !memory.used || !memory.data ||
             (documentBackgroundPresent &&
              !background_insertion_point(memory.data, memory.used)) ||
             !rwp_patch_rtf_with_original_images(&memory))
@@ -10473,8 +10505,8 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
         if (!rwp_cloud_insert_rtf(&memory))
         {
             HeapFree(GetProcessHeap(), 0, memory.data);
-            MessageBoxW(hMainWnd, L"Unable to serialize embedded cloud settings.",
-                        L"Cloud Backup", MB_OK | MB_ICONERROR);
+            MessageBoxW(hMainWnd, L"Unable to serialize embedded document settings.",
+                        wszAppTitle, MB_OK | MB_ICONERROR);
             return FALSE;
         }
     }
@@ -10580,6 +10612,7 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
     SendMessageW(hEditorWnd, EM_SETMODIFY, FALSE, 0);
     rwpRichFormattingChanged = FALSE;
     if (format != SF_RTF) rwp_cloud_reset();
+    else rwpSavedDocumentZoom = rwpCloudDoc.defaultZoom;
     if (!rwpCloudAutoSuppress)
         rwp_cloud_auto_after_save(wszSaveFileName, format);
 
@@ -10714,7 +10747,6 @@ static BOOL rwp_backup_write(void)
     WCHAR temporary[MAX_PATH], newest[MAX_PATH], source[MAX_PATH], target[MAX_PATH];
     HANDLE handle = INVALID_HANDLE_VALUE;
     BOOL success = FALSE;
-    LRESULT result;
     UINT i;
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
     /* An untitled document has never been saved manually: no backup yet.
@@ -10728,8 +10760,8 @@ static BOOL rwp_backup_write(void)
     ZeroMemory(&stream, sizeof(stream));
     stream.dwCookie = (DWORD_PTR)&memory;
     stream.pfnCallback = stream_out_memory;
-    result = SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
-    if (!result || stream.dwError || memory.failed || !memory.data ||
+    SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
+    if (stream.dwError || memory.failed || !memory.used || !memory.data ||
         !rwp_patch_rtf_with_original_images(&memory)) goto done;
     if (rwpBookmarkCount)
     {
@@ -10810,7 +10842,7 @@ static void rwp_backup_check_timer(void)
     if ((DWORD)(now - rwpBackupLastTick) < rwpBackupSeconds * 1000UL) return;
     rwpBackupLastTick = now;
     if (!SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) &&
-        !rwpRichFormattingChanged) return;
+        !rwpRichFormattingChanged && !rwp_document_zoom_dirty()) return;
     rwp_backup_write();
 }
 
@@ -11565,7 +11597,7 @@ static void rwp_cloud_periodic_check_timer(void)
     /* Don't keep trying to write every second if saving fails. */
     rwpCloudPeriodicLastTick = now;
     if (!SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) &&
-        !rwpRichFormattingChanged) return;
+        !rwpRichFormattingChanged && !rwp_document_zoom_dirty()) return;
 
     /* Give the existing .bak timer its due snapshot BEFORE this save resets
      * RichEdit's modified flag and the backup timer. */
@@ -11689,7 +11721,8 @@ static void rwp_cloud_upload_completed(BOOL succeeded, LPCWSTR returnedID, void 
         state->before.nFileSizeHigh == after.nFileSizeHigh &&
         state->before.nFileSizeLow == after.nFileSizeLow;
     canSave = sourceUnchanged && state->saveEpoch == backgroundSaveEpoch &&
-        !SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) && !rwpRichFormattingChanged;
+        !SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) && !rwpRichFormattingChanged &&
+        !rwp_document_zoom_dirty();
     if (canSave) {
         BOOL saved;
         ++rwpCloudAutoSuppress;
@@ -11720,7 +11753,8 @@ static void rwp_cloud_upload_beta(void)
     {
         if (!DialogSaveFile()) return;
     }
-    else if (rwpRichFormattingChanged || SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0))
+    else if (rwpRichFormattingChanged || rwp_document_zoom_dirty() ||
+             SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0))
     {
         if (MessageBoxW(hMainWnd,
               L"Save the latest changes before uploading the document?",
@@ -11764,7 +11798,7 @@ static void rwp_cloud_upload_beta(void)
 
 static BOOL prompt_save_changes(void)
 {
-    if(!wszFileName[0])
+    if(!wszFileName[0] && !rwp_document_zoom_dirty())
     {
         GETTEXTLENGTHEX gt;
         gt.flags = GTL_NUMCHARS;
@@ -11773,7 +11807,7 @@ static BOOL prompt_save_changes(void)
             return TRUE;
     }
 
-    if(!SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0))
+    if(!SendMessageW(hEditorWnd, EM_GETMODIFY, 0, 0) && !rwp_document_zoom_dirty())
     {
         return TRUE;
     } else
@@ -21388,6 +21422,8 @@ static void rwp_load_view_preferences(void)
         rwpDefaultZoom = zoom;
 }
 
+static ULONG rwpDefaultZoomDocumentSerial;
+
 static INT_PTR CALLBACK rwp_default_zoom_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp)
 {
     WCHAR text[40];
@@ -21402,16 +21438,44 @@ static INT_PTR CALLBACK rwp_default_zoom_proc(HWND dlg, UINT msg, WPARAM wp, LPA
         {
             SetWindowTextW(dlg, L"Zoom predefinito");
             SetDlgItemTextW(dlg, IDC_PREF_HINT, L"Zoom per documenti nuovi e aperti (5% - 300%):");
+            SetDlgItemTextW(dlg, IDC_PREF_DOCUMENT_ZOOM, L"Imposta questo zoom predefinito solo per questo documento");
             SetDlgItemTextW(dlg, IDCANCEL, L"Annulla");
         }
         rwp_fill_zoom(combo, FALSE);
         SendMessageW(combo, CB_LIMITTEXT, 16, 0);
-        wsprintfW(text, L"%d%%", rwpDefaultZoom);
+        rwpDefaultZoomDocumentSerial = rwpCloudDocumentSerial;
+        CheckDlgButton(dlg, IDC_PREF_DOCUMENT_ZOOM,
+            rwpCloudDoc.defaultZoom ? BST_CHECKED : BST_UNCHECKED);
+        EnableWindow(GetDlgItem(dlg, IDC_PREF_DOCUMENT_ZOOM),
+            fileFormat == SF_RTF && !rwpCloudMetadataUnsafe);
+        rwp_cloud_theme_checkbox(dlg, IDC_PREF_DOCUMENT_ZOOM);
+        wsprintfW(text, L"%d%%", rwp_effective_default_zoom());
         SetWindowTextW(combo, text);
         return TRUE;
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK)
         {
+            BOOL documentOnly = IsDlgButtonChecked(dlg, IDC_PREF_DOCUMENT_ZOOM) == BST_CHECKED;
+            if (rwpDefaultZoomDocumentSerial != rwpCloudDocumentSerial)
+            {
+                MessageBoxW(dlg, it ?
+                    L"Il documento e' cambiato. Riapri la finestra dello zoom predefinito." :
+                    L"The document has changed. Reopen Default Zoom to apply settings.",
+                    wszAppTitle, MB_OK | MB_ICONWARNING);
+                DestroyWindow(dlg);
+                return TRUE;
+            }
+            /* Unchecking an existing override removes it without writing the
+             * global preference. The text box is irrelevant in this case. */
+            if (!documentOnly && rwpCloudDoc.defaultZoom)
+            {
+                rwpCloudDoc.defaultZoom = 0;
+                SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+                DestroyWindow(dlg);
+                return TRUE;
+            }
+            if (documentOnly && (fileFormat != SF_RTF || rwpCloudMetadataUnsafe))
+                return TRUE;
             GetWindowTextW(combo, text, 40);
             zoom = rwp_parse_zoom(text);
             if (!zoom)
@@ -21421,12 +21485,23 @@ static INT_PTR CALLBACK rwp_default_zoom_proc(HWND dlg, UINT msg, WPARAM wp, LPA
                 SetFocus(combo);
                 return TRUE;
             }
-            if (!rwp_write_binary_option(L"DefaultDocumentZoom", &zoom, sizeof(zoom)))
+            if (documentOnly)
             {
-                rwp_report_settings_save_error(dlg);
-                return TRUE;
+                if (rwpCloudDoc.defaultZoom != (UINT)zoom)
+                {
+                    rwpCloudDoc.defaultZoom = (UINT)zoom;
+                    SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+                }
             }
-            rwpDefaultZoom = zoom;
+            else
+            {
+                if (!rwp_write_binary_option(L"DefaultDocumentZoom", &zoom, sizeof(zoom)))
+                {
+                    rwp_report_settings_save_error(dlg);
+                    return TRUE;
+                }
+                rwpDefaultZoom = zoom;
+            }
         }
         else if (LOWORD(wp) != IDCANCEL) break;
         /* fall through */
