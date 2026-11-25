@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <richedit.h>
+#include <commctrl.h>
 
 #include "wordpad.h"
 
@@ -77,6 +78,171 @@ static LRESULT registry_get_handle(HKEY *hKey, LPDWORD action, LPCWSTR subKey)
             HeapFree(GetProcessHeap(), 0, key);
 
         return ret;
+}
+
+/* The registry stores only a top-left screen position, plus the display
+ * geometry used to detect a changed monitor layout. No dialog size is saved. */
+typedef struct RWP_DIALOG_POSITION
+{
+    POINT origin;
+    RECT workArea;
+    RECT virtualScreen;
+} RWP_DIALOG_POSITION;
+
+typedef struct RWP_DIALOG_POSITION_STATE
+{
+    POINT start;
+    BOOL inMoveLoop;
+    BOOL moving;
+} RWP_DIALOG_POSITION_STATE;
+
+static const WCHAR rwp_dialog_positions_key[] = L"Options\\Dialog Positions";
+
+static void rwp_dialog_virtual_screen(RECT *rect)
+{
+    rect->left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    rect->top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    rect->right = rect->left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    rect->bottom = rect->top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+}
+
+static void rwp_save_dialog_position(HWND dialog, UINT positionId, const RECT *bounds)
+{
+    HKEY key;
+    DWORD action;
+    WCHAR name[32];
+    MONITORINFO monitor;
+    RWP_DIALOG_POSITION position;
+
+    monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST),
+                         &monitor)) return;
+    position.origin.x = bounds->left;
+    position.origin.y = bounds->top;
+    position.workArea = monitor.rcWork;
+    rwp_dialog_virtual_screen(&position.virtualScreen);
+    if (registry_get_handle(&key, &action, rwp_dialog_positions_key) != ERROR_SUCCESS)
+        return;
+    wsprintfW(name, L"Dialog_%u", positionId);
+    RegSetValueExW(key, name, 0, REG_BINARY, (const BYTE *)&position, sizeof(position));
+    RegCloseKey(key);
+}
+
+static LONG rwp_clamp_dialog_coordinate(LONG origin, LONG extent,
+                                       LONG workStart, LONG workEnd)
+{
+    LONG last = workEnd - extent;
+    if (last < workStart) last = workStart;
+    if (origin < workStart) return workStart;
+    if (origin > last) return last;
+    return origin;
+}
+
+static void rwp_restore_dialog_position(HWND dialog, UINT positionId)
+{
+    HKEY key;
+    DWORD type, size = sizeof(RWP_DIALOG_POSITION);
+    LONG status, x, y, width, height;
+    WCHAR name[32];
+    RECT bounds, target, desktop, caption, visible;
+    MONITORINFO monitor;
+    RWP_DIALOG_POSITION saved;
+
+    if (registry_get_handle(&key, NULL, rwp_dialog_positions_key) != ERROR_SUCCESS)
+        return; /* Keep the existing default placement on first use. */
+    wsprintfW(name, L"Dialog_%u", positionId);
+    status = RegQueryValueExW(key, name, NULL, &type, (LPBYTE)&saved, &size);
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS || type != REG_BINARY || size != sizeof(saved))
+        return;
+    if (!GetWindowRect(dialog, &bounds)) return;
+    width = bounds.right - bounds.left;
+    height = bounds.bottom - bounds.top;
+    x = saved.origin.x;
+    y = saved.origin.y;
+    /* Reject corrupt coordinates before doing rectangle arithmetic. */
+    if (x < -1000000 || x > 1000000 || y < -1000000 || y > 1000000 ||
+        width <= 0 || height <= 0) return;
+    SetRect(&target, x, y, x + width, y + height);
+    monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST),
+                         &monitor)) return;
+    rwp_dialog_virtual_screen(&desktop);
+    caption = target;
+    caption.bottom = caption.top + GetSystemMetrics(SM_CYCAPTION) +
+                     GetSystemMetrics(SM_CYFRAME);
+    /* Preserve the exact dragged location on an unchanged desktop, even if
+     * the user intentionally left part of the dialog outside the work area.
+     * On a changed display or inaccessible caption, clamp without resizing. */
+    if (!EqualRect(&saved.workArea, &monitor.rcWork) ||
+        !EqualRect(&saved.virtualScreen, &desktop) ||
+        !IntersectRect(&visible, &caption, &monitor.rcWork))
+    {
+        x = rwp_clamp_dialog_coordinate(x, width, monitor.rcWork.left, monitor.rcWork.right);
+        y = rwp_clamp_dialog_coordinate(y, height, monitor.rcWork.top, monitor.rcWork.bottom);
+    }
+    if (x != bounds.left || y != bounds.top)
+        SetWindowPos(dialog, NULL, x, y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+static LRESULT CALLBACK rwp_dialog_position_subclass(HWND dialog, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR data)
+{
+    RWP_DIALOG_POSITION_STATE *state = (RWP_DIALOG_POSITION_STATE *)data;
+    RECT bounds;
+
+    switch (message)
+    {
+    case WM_ENTERSIZEMOVE:
+        state->inMoveLoop = GetWindowRect(dialog, &bounds);
+        state->moving = FALSE;
+        if (state->inMoveLoop)
+        {
+            state->start.x = bounds.left;
+            state->start.y = bounds.top;
+        }
+        break;
+    case WM_MOVING:
+        if (state->inMoveLoop) state->moving = TRUE;
+        break;
+    case WM_EXITSIZEMOVE:
+        /* Ignore programmatic layout, resizing, cancelled drags and opening
+         * a dialog at its default or corrected off-screen position. */
+        if (state->inMoveLoop && state->moving &&
+            !IsIconic(dialog) && !IsZoomed(dialog) &&
+            GetWindowRect(dialog, &bounds) &&
+            (bounds.left != state->start.x || bounds.top != state->start.y))
+            rwp_save_dialog_position(dialog, (UINT)id, &bounds);
+        state->inMoveLoop = state->moving = FALSE;
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(dialog, rwp_dialog_position_subclass, id);
+        HeapFree(GetProcessHeap(), 0, state);
+        break;
+    }
+    return DefSubclassProc(dialog, message, wParam, lParam);
+}
+
+/* Call once after the dialog's normal creation and layout have finished.
+ * Explicit registration avoids affecting Windows Open/Save/Print/Color
+ * dialogs, message boxes, property-sheet pages or other transient windows. */
+void rwp_remember_dialog_position(HWND dialog, UINT positionId)
+{
+    RWP_DIALOG_POSITION_STATE *state;
+    DWORD_PTR existing;
+    if (!dialog || !IsWindow(dialog) ||
+        (GetWindowLongPtrW(dialog, GWL_STYLE) & WS_CHILD)) return;
+    if (GetWindowSubclass(dialog, rwp_dialog_position_subclass, positionId, &existing))
+        return;
+    state = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*state));
+    if (!state) return;
+    if (!SetWindowSubclass(dialog, rwp_dialog_position_subclass, positionId, (DWORD_PTR)state))
+    {
+        HeapFree(GetProcessHeap(), 0, state);
+        return;
+    }
+    rwp_restore_dialog_position(dialog, positionId);
 }
 
 void registry_set_options(HWND hMainWnd)

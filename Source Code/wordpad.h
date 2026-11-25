@@ -712,6 +712,13 @@ void registry_set_filelist(LPCWSTR, HWND);
 void registry_set_formatopts_all(DWORD[], DWORD[]);
 void registry_set_options(HWND);
 
+/* Track only explicitly registered top-level application dialogs. Resource
+ * IDs are stable position keys; these extra IDs identify non-resource frames. */
+#define RWP_POSITION_FIND       0x10000u
+#define RWP_POSITION_REPLACE    0x10001u
+#define RWP_POSITION_OPTIONS    0x10002u
+void rwp_remember_dialog_position(HWND dialog, UINT positionId);
+
 /* Prevent nested tables during Rich Edit clipboard paste and OLE drops. */
 BOOL rwp_editor_position_inside_table(HWND editor, LONG cp);
 BOOL rwp_rtf_data_has_table_markup(const BYTE *data, SIZE_T length);

@@ -1416,6 +1416,7 @@ BOOL rwp_drive_native_upload_async(HWND owner,LPCWSTR document,LPCWSTR folderOve
         return FALSE;
     }
     rwpDriveUploadWnd=dialog;
+    rwp_remember_dialog_position(dialog, IDD_CLOUD_NATIVE_UPLOAD);
     ShowWindow(dialog,SW_SHOWNORMAL);
     SetForegroundWindow(dialog);
     return TRUE;
@@ -2349,6 +2350,7 @@ BOOL rwp_drive_native_history_open(HWND owner,LPCWSTR document,
         MAKEINTRESOURCEW(IDD_CLOUD_HISTORY),owner,rwp_history_dialog,(LPARAM)h);
     if(!dialog){rwp_history_release(h);return FALSE;}
     rwpHistoryWnd=dialog;
+    rwp_remember_dialog_position(dialog, IDD_CLOUD_HISTORY);
     ShowWindow(dialog,SW_SHOWNORMAL);
     SetForegroundWindow(dialog);
     return TRUE;

@@ -4751,6 +4751,7 @@ static INT_PTR CALLBACK rwp_bookmark_choose_proc(HWND dialog, UINT message,
                               italian ? L"Elimina segnalibro" : L"Delete Bookmark");
         }
         if (italian) SetDlgItemTextW(dialog, IDCANCEL, L"Annulla");
+        rwp_remember_dialog_position(dialog, IDD_BOOKMARK_CHOOSE);
         return TRUE;
     }
     if (message == WM_COMMAND)
@@ -4897,6 +4898,7 @@ static void rwp_bookmark_show_dialog(BOOL add, BOOL createLink)
             HeapFree(GetProcessHeap(), 0, addState);
             return;
         }
+        rwp_remember_dialog_position(rwpBookmarkAddWnd, IDD_BOOKMARK_ADD);
         ShowWindow(rwpBookmarkAddWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpBookmarkAddWnd);
         return;
@@ -5610,6 +5612,7 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
             SetFocus(GetDlgItem(hwnd,
                 state->preferBookmark && (state->editing || rwpBookmarkCount > 0) ?
                     IDC_LINK_BOOKMARK : IDC_LINK_URL));
+            rwp_remember_dialog_position(hwnd, IDD_LINK_UNIFIED);
             return FALSE;
         }
         case WM_NCDESTROY:
@@ -8310,6 +8313,7 @@ static INT_PTR CALLBACK rwp_bookmark_recovery_proc(HWND dialog, UINT message,
             SetDlgItemTextW(dialog, IDCANCEL, L"Chiudi");
         }
         rwp_bookmark_recovery_fill(dialog, state);
+        rwp_remember_dialog_position(dialog, IDD_BOOKMARK_RECOVER);
         return TRUE;
     }
     if (message == WM_COMMAND)
@@ -10171,6 +10175,7 @@ static void rwp_open_cloud_doc_settings(void)
         rwp_cloud_doc_settings_proc, 0);
     if (rwpCloudSettingsWnd)
     {
+        rwp_remember_dialog_position(rwpCloudSettingsWnd, IDD_CLOUD_DOC_SETTINGS);
         ShowWindow(rwpCloudSettingsWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpCloudSettingsWnd);
     }
@@ -11088,6 +11093,7 @@ static void rwp_open_backup_preferences(void)
         rwp_backup_settings_proc, 0);
     if (rwpBackupSettingsWnd)
     {
+        rwp_remember_dialog_position(rwpBackupSettingsWnd, IDD_AUTOMATIC_BACKUP);
         ShowWindow(rwpBackupSettingsWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpBackupSettingsWnd);
     }
@@ -11146,6 +11152,7 @@ static INT_PTR CALLBACK rwp_backup_recovery_proc(HWND dialog, UINT msg,
                                 0, (LPARAM)label);
         }
         SendDlgItemMessageW(dialog, IDC_BACKUP_RECOVERY_LIST, LB_SETCURSEL, 0, 0);
+        rwp_remember_dialog_position(dialog, IDD_BACKUP_RECOVERY);
         return TRUE;
     }
     case WM_COMMAND:
@@ -12202,6 +12209,7 @@ static void dialog_viewproperties(void)
         HWND page = PropSheet_GetCurrentPageHwnd(rwpViewOptionsWnd);
         rwp_enlarge_legacy_dialog(rwpViewOptionsWnd);
         if (page) SetWindowPos(page, NULL, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOZORDER);
+        rwp_remember_dialog_position(rwpViewOptionsWnd, RWP_POSITION_OPTIONS);
     }
 }
 
@@ -14004,6 +14012,7 @@ static void rwp_open_bulk_format_dialog(HWND owner, LPCWSTR initialText,
         (LPARAM)&rwpBulkDialogState);
     if (rwpBulkDialogWnd)
     {
+        rwp_remember_dialog_position(rwpBulkDialogWnd, startInFormatMode ? IDD_BULK_FORMAT_SEARCH : IDD_BULK_FORMAT);
         ShowWindow(rwpBulkDialogWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpBulkDialogWnd);
     }
@@ -15500,6 +15509,7 @@ static void rwp_open_unified_dialog(HWND owner)
     {
         if (haveSelectedText)
             SetDlgItemTextW(rwpUnifiedWnd, IDC_UNIFIED_FIND_TEXT, initialFind);
+        rwp_remember_dialog_position(rwpUnifiedWnd, IDD_UNIFIED_REPLACE);
         ShowWindow(rwpUnifiedWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpUnifiedWnd);
     }
@@ -17370,6 +17380,7 @@ static void rwp_open_symbols_dialog(void)
                           rwp_symbol_dialog_proc, 0);
     if (rwpSymbols.window)
     {
+        rwp_remember_dialog_position(rwpSymbols.window, IDD_SYMBOL_PICKER);
         ShowWindow(rwpSymbols.window, SW_SHOWNORMAL);
         SetForegroundWindow(rwpSymbols.window);
     }
@@ -17456,6 +17467,7 @@ static UINT_PTR CALLBACK rwp_find_dialog_hook(HWND dlg, UINT message,
         rwp_theme_dialog_controls(dlg);
         rwp_enlarge_legacy_dialog(dlg);
         rwp_add_find_replace_button(dlg);
+        rwp_remember_dialog_position(dlg, RWP_POSITION_FIND);
         /* The common Find dialog starts with a stock light client area.
          * Fully repaint after moving/scaling controls so none of its
          * pre-theme pixels can remain exposed on Windows 10. */
@@ -17543,6 +17555,7 @@ static UINT_PTR CALLBACK rwp_replace_dialog_hook(HWND dlg, UINT message,
          * the dialog has already appeared. */
         rwp_theme_dialog_controls(dlg);
         rwp_enlarge_legacy_dialog(dlg);
+        rwp_remember_dialog_position(dlg, RWP_POSITION_REPLACE);
         return 1;
     case WM_COMMAND:
         if ((LOWORD(wParam) == IDC_BULK_REPLACE_LAUNCH ||
@@ -17906,6 +17919,7 @@ static INT_PTR CALLBACK datetime_proc(HWND hWnd, UINT message, WPARAM wParam, LP
                 /* This is a single-selection list box. */
                 SendMessageW(hListWnd, LB_SETCURSEL, 0, 0);
             }
+            rwp_remember_dialog_position(hWnd, IDD_DATETIME);
             break;
 
         case WM_COMMAND:
@@ -18033,6 +18047,7 @@ static INT_PTR CALLBACK paraformat_proc(HWND hWnd, UINT message, WPARAM wParam, 
                 number_with_units(buffer, -pf.dxOffset);
                 SetWindowTextW(hFirstWnd, buffer);
             }
+            rwp_remember_dialog_position(hWnd, IDD_PARAFORMAT);
             break;
 
         case WM_COMMAND:
@@ -18137,6 +18152,7 @@ static INT_PTR CALLBACK tabstops_proc(HWND hWnd, UINT message, WPARAM wParam, LP
                 }
                 SetFocus(hTabWnd);
             }
+            rwp_remember_dialog_position(hWnd, IDD_TABSTOPS);
             break;
 
         case WM_COMMAND:
@@ -18315,6 +18331,7 @@ static INT_PTR CALLBACK rwp_line_spacing_dialog_proc(HWND dialog, UINT message,
             SendDlgItemMessageW(dialog, IDC_LINE_SPACING_VALUE, EM_LIMITTEXT, 15, 0);
             SetFocus(GetDlgItem(dialog, IDC_LINE_SPACING_VALUE));
             SendDlgItemMessageW(dialog, IDC_LINE_SPACING_VALUE, EM_SETSEL, 0, -1);
+            rwp_remember_dialog_position(dialog, IDD_LINE_SPACING);
             return FALSE;
         }
     case WM_COMMAND:
@@ -18544,6 +18561,7 @@ static void rwp_open_general_font_resizer(void)
         rwp_general_font_resizer_dialog_proc, 0);
     if (rwpGeneralFontResizerWnd)
     {
+        rwp_remember_dialog_position(rwpGeneralFontResizerWnd, IDD_GENERAL_FONT_RESIZER);
         ShowWindow(rwpGeneralFontResizerWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpGeneralFontResizerWnd);
     }
@@ -18647,6 +18665,7 @@ static void rwp_open_shortcuts_dialog(void)
         rwp_shortcuts_dialog_proc, 0);
     if (rwpShortcutsWnd)
     {
+        rwp_remember_dialog_position(rwpShortcutsWnd, IDD_SHORTCUTS);
         ShowWindow(rwpShortcutsWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpShortcutsWnd);
     }
@@ -19753,6 +19772,7 @@ static INT_PTR CALLBACK rwp_shortcut_insert_text_proc(HWND dialog, UINT message,
                             RWP_SHORTCUT_TEXT_MAX, 0);
         SetFocus(GetDlgItem(dialog, IDC_SHORTCUT_INSERT_TEXT));
         SendDlgItemMessageW(dialog, IDC_SHORTCUT_INSERT_TEXT, EM_SETSEL, 0, -1);
+        rwp_remember_dialog_position(dialog, IDD_SHORTCUT_INSERT_TEXT);
         return FALSE;
     }
     case WM_COMMAND:
@@ -20055,8 +20075,11 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
 static void rwp_show_settings_window(HWND *window, UINT resource, DLGPROC procedure)
 {
     if (!*window || !IsWindow(*window))
+    {
         *window = CreateDialogParamW(GetModuleHandleW(NULL),
             MAKEINTRESOURCEW(resource), hMainWnd, procedure, 0);
+        rwp_remember_dialog_position(*window, resource);
+    }
     if (*window)
     {
         ShowWindow(*window, SW_RESTORE);
@@ -20140,6 +20163,7 @@ static void rwp_open_document_counter(void)
         rwp_counter_dialog_proc, 0);
     if (rwpCounterWnd)
     {
+        rwp_remember_dialog_position(rwpCounterWnd, IDD_DOCUMENT_COUNTER);
         ShowWindow(rwpCounterWnd, SW_SHOWNORMAL);
         SetForegroundWindow(rwpCounterWnd);
     }
@@ -20716,6 +20740,7 @@ static INT_PTR CALLBACK rwp_bookmark_missing_proc(HWND dialog, UINT message,
             SetDlgItemTextW(dialog, IDC_BOOKMARK_OPEN_RECOVERY,
                 L"Recupera segnalibri...");
         }
+        rwp_remember_dialog_position(dialog, IDD_BOOKMARK_MISSING);
         return TRUE;
     }
     if (message == WM_COMMAND)
@@ -21802,6 +21827,7 @@ static INT_PTR CALLBACK insert_table_proc(HWND hwnd, UINT msg, WPARAM wParam, LP
         }
         SetFocus(GetDlgItem(hwnd, IDC_TABLE_ROWS));
         SendDlgItemMessageW(hwnd, IDC_TABLE_ROWS, EM_SETSEL, 0, -1);
+        rwp_remember_dialog_position(hwnd, IDD_INSERT_TABLE);
         return FALSE;
 
     case WM_DRAWITEM:
@@ -21989,6 +22015,7 @@ static INT_PTR CALLBACK table_count_proc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         rwp_enlarge_legacy_dialog(hwnd);
         SetFocus(GetDlgItem(hwnd, IDC_TABLE_COUNT_VALUE));
         SendDlgItemMessageW(hwnd, IDC_TABLE_COUNT_VALUE, EM_SETSEL, 0, -1);
+        rwp_remember_dialog_position(hwnd, IDD_TABLE_COUNT);
         return FALSE;
 
     case WM_COMMAND:
@@ -24325,6 +24352,7 @@ static INT_PTR CALLBACK rwp_table_management_proc(HWND dialog, UINT message,
         rwp_theme_dialog(dialog);
         rwp_enlarge_legacy_dialog(dialog);
         SetFocus(GetDlgItem(dialog, IDC_TABLE_MGMT_HEIGHT));
+        rwp_remember_dialog_position(dialog, IDD_TABLE_MANAGEMENT);
         return FALSE;
 
     case WM_DRAWITEM:
@@ -27452,6 +27480,7 @@ static void rwp_open_image_compression_dialog(BOOL singleImage)
                          SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
     }
+    rwp_remember_dialog_position(rwpImageCompressionWnd, singleImage ? IDD_IMAGE_COMPRESSION : IDD_DOCUMENT_IMAGE_TOOLS);
     ShowWindow(rwpImageCompressionWnd, SW_SHOWNORMAL);
     SetForegroundWindow(rwpImageCompressionWnd);
     return;
@@ -27571,6 +27600,7 @@ static void rwp_open_image_display_size_dialog(void)
         MAKEINTRESOURCEW(IDD_IMAGE_DISPLAY_SIZE), hMainWnd,
         rwp_image_size_dialog_proc, (LPARAM)settings);
     if (!rwpImageSizeWnd) goto failed;
+    rwp_remember_dialog_position(rwpImageSizeWnd, IDD_IMAGE_DISPLAY_SIZE);
     ShowWindow(rwpImageSizeWnd, SW_SHOWNORMAL);
     SetForegroundWindow(rwpImageSizeWnd);
     if (original.data) HeapFree(GetProcessHeap(), 0, original.data);
