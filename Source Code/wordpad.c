@@ -1330,6 +1330,51 @@ static DWORD rwp_count_document_text_characters(void)
     return (DWORD)length;
 }
 
+/* Use the same rectangles for painting and invalidation. Each value owns
+ * its entire right-aligned row, so shorter replacement text is erased too. */
+static void rwp_header_value_rects(HWND window, RECT *date, RECT *count)
+{
+    RECT info;
+    SetRectEmpty(date);
+    SetRectEmpty(count);
+    if (!GetClientRect(window, &info)) return;
+    info.left = rwpMenuCount > 0 ? rwpMenuRects[rwpMenuCount - 1].right + 12 : 12;
+    info.right -= 12;
+    if (info.right <= info.left) return;
+
+    if (rwpHeaderDateVisible)
+    {
+        *date = info;
+        if (rwpHeaderCharactersVisible)
+        {
+            date->top = 1;
+            date->bottom = RWP_MENU_ROW_HEIGHT - 9;
+        }
+    }
+    if (rwpHeaderCharactersVisible)
+    {
+        *count = info;
+        if (rwpHeaderDateVisible)
+        {
+            count->top = RWP_MENU_ROW_HEIGHT - 9;
+            count->bottom = rwp_header_height() - 1;
+        }
+    }
+    /* Keep the invalidation inside the current client area during resizing. */
+    IntersectRect(date, date, &info);
+    IntersectRect(count, count, &info);
+}
+
+static void rwp_header_invalidate_value(HWND window, BOOL characters)
+{
+    RECT date, count;
+    const RECT *area;
+    if (!window) return;
+    rwp_header_value_rects(window, &date, &count);
+    area = characters ? &count : &date;
+    if (!IsRectEmpty(area)) InvalidateRect(window, area, FALSE);
+}
+
 static void rwp_header_refresh_character_count(void)
 {
     DWORD updated = rwp_count_document_text_characters();
@@ -1338,7 +1383,7 @@ static void rwp_header_refresh_character_count(void)
     {
         rwpHeaderCharacterCount = updated;
         if (rwpMenuWnd && rwpHeaderCharactersVisible)
-            InvalidateRect(rwpMenuWnd, NULL, FALSE);
+            rwp_header_invalidate_value(rwpMenuWnd, TRUE);
     }
 }
 
@@ -1469,85 +1514,106 @@ static BOOL rwp_open_menu_mnemonic(WCHAR key)
     return TRUE;
 }
 
+/* Paint with the existing font, geometry and colors into either a memory
+ * DC or the clipped paint DC if a temporary buffer cannot be allocated. */
+static void rwp_menu_paint(HWND window, HDC dc, const RECT *dirty)
+{
+    RECT dateRect, countRect, countHit;
+    int i;
+    HFONT font = rwpUiFont ? rwpUiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HGDIOBJ old = SelectObject(dc, font);
+
+    FillRect(dc, dirty, rwpBarBrush ? rwpBarBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RWP_BAR_TEXT);
+    rwp_layout_menu(window);
+    for (i = 0; i < rwpMenuCount; ++i)
+    {
+        WCHAR label[128]; RECT r = rwpMenuRects[i], intersection;
+        if (!IntersectRect(&intersection, &r, dirty)) continue;
+        rwp_menu_label(i, label, 128, FALSE);
+        if (i == rwpMenuActive || i == rwpMenuHover)
+            FillRect(dc, &r, i == rwpMenuActive ? rwpBarActiveBrush : rwpBarHotBrush);
+        DrawTextW(dc, label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    }
+
+    rwp_header_value_rects(window, &dateRect, &countRect);
+    SetRectEmpty(&countHit);
+    if (!IsRectEmpty(&dateRect))
+    {
+        RECT intersection;
+        if (IntersectRect(&intersection, &dateRect, dirty))
+        {
+            WCHAR timestamp[64];
+            rwp_format_header_datetime(timestamp,
+                             sizeof(timestamp) / sizeof(timestamp[0]));
+            DrawTextW(dc, timestamp, -1, &dateRect,
+                      DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
+        }
+    }
+    if (!IsRectEmpty(&countRect))
+    {
+        WCHAR grouped[32], total[80];
+        SIZE size = {0, 0};
+        RECT intersection;
+        const BOOL italian =
+            PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+        rwp_format_grouped_counter(rwpHeaderCharacterCount, grouped);
+        wsprintfW(total, italian ? L"%s caratteri" : L"%s characters", grouped);
+        if (IntersectRect(&intersection, &countRect, dirty))
+            DrawTextW(dc, total, -1, &countRect,
+                      DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_END_ELLIPSIS);
+        if (GetTextExtentPoint32W(dc, total, lstrlenW(total), &size))
+        {
+            countHit = countRect;
+            if (countHit.left < countHit.right - size.cx)
+                countHit.left = countHit.right - size.cx;
+        }
+    }
+    rwp_header_update_tooltip(&countHit);
+    SelectObject(dc, old);
+}
+
 static LRESULT CALLBACK rwp_menu_proc(HWND window, UINT message, WPARAM wp, LPARAM lp)
 {
     switch (message)
     {
         case WM_ERASEBKGND: return 1;
+        case WM_SIZE:
+            /* A changed layout must repaint both values and all menu items. */
+            InvalidateRect(window, NULL, FALSE);
+            break;
         case WM_PAINT:
         {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(window, &ps);
-            RECT bounds; int i; HFONT font; HGDIOBJ old;
-            GetClientRect(window, &bounds);
-            FillRect(dc, &bounds, rwpBarBrush ? rwpBarBrush : (HBRUSH)GetStockObject(BLACK_BRUSH));
-            font = rwpUiFont ? rwpUiFont : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            old = SelectObject(dc, font);
-            SetBkMode(dc, TRANSPARENT);
-            rwp_layout_menu(window);
-            for (i = 0; i < rwpMenuCount; ++i)
+            if (dc && !IsRectEmpty(&ps.rcPaint))
             {
-                WCHAR label[128]; RECT r = rwpMenuRects[i];
-                rwp_menu_label(i, label, 128, FALSE);
-                if (i == rwpMenuActive || i == rwpMenuHover)
-                    FillRect(dc, &r, i == rwpMenuActive ? rwpBarActiveBrush : rwpBarHotBrush);
-                SetTextColor(dc, RWP_BAR_TEXT);
-                DrawTextW(dc, label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-            }
-            {
-                RECT infoRect = bounds, countHit;
-                SetRectEmpty(&countHit);
-                infoRect.left = (rwpMenuCount > 0 ?
-                    rwpMenuRects[rwpMenuCount - 1].right + 12 : 12);
-                infoRect.right -= 12;
-                if (infoRect.right > infoRect.left)
+                int width = ps.rcPaint.right - ps.rcPaint.left;
+                int height = ps.rcPaint.bottom - ps.rcPaint.top;
+                HDC buffer = CreateCompatibleDC(dc);
+                HBITMAP bitmap = buffer ? CreateCompatibleBitmap(dc, width, height) : NULL;
+                HGDIOBJ oldBitmap = bitmap ? SelectObject(buffer, bitmap) : NULL;
+                BOOL painted = FALSE;
+
+                if (oldBitmap && oldBitmap != HGDI_ERROR &&
+                    SetViewportOrgEx(buffer, -ps.rcPaint.left, -ps.rcPaint.top, NULL))
                 {
-                    SetTextColor(dc, RWP_BAR_TEXT);
-                    if (rwpHeaderDateVisible)
-                    {
-                        WCHAR timestamp[64];
-                        RECT dateRect = infoRect;
-                        rwp_format_header_datetime(timestamp,
-                                         sizeof(timestamp) / sizeof(timestamp[0]));
-                        if (rwpHeaderCharactersVisible)
-                        {
-                            dateRect.top = 1;
-                            dateRect.bottom = RWP_MENU_ROW_HEIGHT - 9;
-                        }
-                        DrawTextW(dc, timestamp, -1, &dateRect,
-                                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT |
-                                  DT_END_ELLIPSIS);
-                    }
-                    if (rwpHeaderCharactersVisible)
-                    {
-                        WCHAR grouped[32], total[80];
-                        SIZE size = {0, 0};
-                        RECT countRect = infoRect;
-                        const BOOL italian =
-                            PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
-                        rwp_format_grouped_counter(rwpHeaderCharacterCount, grouped);
-                        wsprintfW(total, italian ? L"%s caratteri" : L"%s characters",
-                                  grouped);
-                        if (rwpHeaderDateVisible)
-                        {
-                            countRect.top = RWP_MENU_ROW_HEIGHT - 9;
-                            countRect.bottom = rwp_header_height() - 1;
-                        }
-                        DrawTextW(dc, total, -1, &countRect,
-                                  DT_SINGLELINE | DT_VCENTER | DT_RIGHT |
-                                  DT_END_ELLIPSIS);
-                        if (GetTextExtentPoint32W(dc, total,
-                                                  lstrlenW(total), &size))
-                        {
-                            countHit = countRect;
-                            if (countHit.left < countHit.right - size.cx)
-                                countHit.left = countHit.right - size.cx;
-                        }
-                    }
+                    /* Compose just the dirty rectangle off-screen. The viewport
+                     * keeps all drawing coordinates in the original client space. */
+                    rwp_menu_paint(window, buffer, &ps.rcPaint);
+                    painted = BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+                                     width, height, buffer,
+                                     ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
                 }
-                rwp_header_update_tooltip(&countHit);
+                if (oldBitmap && oldBitmap != HGDI_ERROR)
+                    SelectObject(buffer, oldBitmap);
+                if (bitmap) DeleteObject(bitmap);
+                if (buffer) DeleteDC(buffer);
+
+                /* Still paint correctly if GDI resources are unavailable. */
+                if (!painted) rwp_menu_paint(window, dc, &ps.rcPaint);
             }
-            SelectObject(dc, old);
             EndPaint(window, &ps);
             return 0;
         }
@@ -1559,7 +1625,7 @@ static LRESULT CALLBACK rwp_menu_proc(HWND window, UINT message, WPARAM wp, LPAR
                 if (rwpHeaderCharactersVisible)
                     rwp_header_refresh_character_count();
                 if (rwpHeaderDateVisible)
-                    InvalidateRect(window, NULL, FALSE);
+                    rwp_header_invalidate_value(window, FALSE);
                 return 0;
             }
             break;
