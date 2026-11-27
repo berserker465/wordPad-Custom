@@ -66,6 +66,10 @@
 
 /* Runtime-only Help menu command; no resource changes required. */
 #define ID_DEBUG_EXPORT_RAW_RTF 1642
+/* Configurable replacements for RichEdit native Ctrl+1/2/5. */
+#define ID_SHORTCUT_SPACING_SINGLE 1643
+#define ID_SHORTCUT_SPACING_DOUBLE 1644
+#define ID_SHORTCUT_SPACING_ONE_HALF 1645
 
 /* The 1080p-or-lower interface uses the application's original 96-DPI
  * dimensions even when Windows display scaling is above 100%. Above 1080p,
@@ -809,7 +813,18 @@ typedef struct
     int endPos;
     BOOL wrapped;
     WCHAR findBuffer[128];
+    WCHAR dialogBuffer[128];
+    DWORD lastFindFlags;
+    DWORD searchRevision;
+    LONG cycleStart;
+    CHARRANGE lastMatch; /* Actual selection, which RichEdit may expand. */
+    LONG lastMatchStart; /* First visible character of the match. */
+    BOOL cycleActive;
+    BOOL cycleWrapped;
 } FINDREPLACE_custom;
+
+/* Invalidate an unfinished Find cycle whenever document contents change. */
+static DWORD rwpFindDocumentRevision;
 
 /* Load string resources */
 static void DoLoadStrings(void)
@@ -10471,6 +10486,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     es.dwCookie = (DWORD_PTR)hFile;
     es.pfnCallback = stream_in;
 
+    ++rwpFindDocumentRevision;
     rwp_original_images_clear();
     rwp_bookmarks_clear();
     rwp_reset_applied_text_color();
@@ -17743,12 +17759,197 @@ static UINT_PTR CALLBACK rwp_replace_dialog_hook(HWND dlg, UINT message,
     return 0;
 }
 
+/* Search the visible story, not the hidden friendly-name hyperlink
+ * instructions. Raw story coordinates are retained for every visible UTF-16
+ * unit, so selection can span a link and the surrounding ordinary text.
+ * Use non-selection TOM ranges: inspecting visibility must not edit the
+ * story, disturb its selection, or create undo records. */
+static BOOL rwp_get_raw_document(WCHAR **textOut, LONG *lengthOut);
+
+typedef struct
+{
+    WCHAR *text;
+    LONG *positions;
+    LONG length;
+} RWP_VISIBLE_FIND;
+
+/* Query entire spans first. Uniform spans need only one TOM font query;
+ * recursively split mixed hidden/visible spans rather than querying every
+ * character of ordinary text separately. */
+static BOOL rwp_find_collect_visible(ITextRange *range, const WCHAR *raw,
+                                    LONG first, LONG end, RWP_VISIBLE_FIND *view)
+{
+    ITextFont *font = NULL;
+    LONG hidden, cp, middle;
+    HRESULT hr;
+    if (first >= end) return TRUE;
+    hr = range->lpVtbl->SetRange(range, first, end);
+    if (SUCCEEDED(hr)) hr = range->lpVtbl->GetFont(range, &font);
+    if (FAILED(hr) || !font) return FALSE;
+    hr = font->lpVtbl->GetHidden(font, &hidden);
+    font->lpVtbl->Release(font);
+    if (FAILED(hr)) return FALSE;
+    if (hidden == 0) /* tomFalse */
+    {
+        memcpy(view->text + view->length, raw + first,
+               (SIZE_T)(end - first) * sizeof(WCHAR));
+        for (cp = first; cp < end; ++cp)
+            view->positions[view->length++] = cp;
+        return TRUE;
+    }
+    if (hidden == -1) return TRUE; /* tomTrue */
+    /* tomUndefined: the span has mixed visibility. */
+    if (end - first <= 1) return FALSE;
+    middle = first + (end - first) / 2;
+    return rwp_find_collect_visible(range, raw, first, middle, view) &&
+           rwp_find_collect_visible(range, raw, middle, end, view);
+}
+
+static void rwp_find_free_visible(RWP_VISIBLE_FIND *view)
+{
+    if (view->text) HeapFree(GetProcessHeap(), 0, view->text);
+    if (view->positions) HeapFree(GetProcessHeap(), 0, view->positions);
+    ZeroMemory(view, sizeof(*view));
+}
+
+static BOOL rwp_find_build_visible(RWP_VISIBLE_FIND *view)
+{
+    WCHAR *raw = NULL;
+    LONG length = 0;
+    ITextRange *range = NULL;
+    BOOL ok = FALSE;
+    ZeroMemory(view, sizeof(*view));
+    if (!rwp_get_raw_document(&raw, &length)) return FALSE;
+    if (length == 0) { ok = TRUE; goto done; }
+    if (length < 0 || (SIZE_T)length > ((SIZE_T)-1) / sizeof(LONG)) goto done;
+    view->text = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)length * sizeof(WCHAR));
+    view->positions = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)length * sizeof(LONG));
+    if (!view->text || !view->positions) goto done;
+    range = rwp_bookmark_capture_range(0, length);
+    if (!range) goto done;
+    ok = rwp_find_collect_visible(range, raw, 0, length, view);
+done:
+    if (range) range->lpVtbl->Release(range);
+    HeapFree(GetProcessHeap(), 0, raw);
+    if (!ok) rwp_find_free_visible(view);
+    return ok;
+}
+
+/* First visible index whose original story position is at least cp. */
+static LONG rwp_find_visible_lower_bound(const RWP_VISIBLE_FIND *view, LONG cp)
+{
+    LONG first = 0, end = view->length;
+    while (first < end)
+    {
+        LONG mid = first + (end - first) / 2;
+        if (view->positions[mid] < cp) first = mid + 1;
+        else end = mid;
+    }
+    return first;
+}
+
+static BOOL rwp_find_word_character(WCHAR ch)
+{
+    WORD type = 0, marks = 0;
+    if (ch == L'_') return TRUE;
+    if (GetStringTypeW(CT_CTYPE1, &ch, 1, &type) &&
+        (type & (C1_ALPHA | C1_DIGIT))) return TRUE;
+    return GetStringTypeW(CT_CTYPE3, &ch, 1, &marks) &&
+           (marks & (C3_NONSPACING | C3_DIACRITIC | C3_VOWELMARK));
+}
+
+static BOOL rwp_find_visible_span(const RWP_VISIBLE_FIND *view, LPCWSTR query,
+                                  DWORD flags, LONG begin, LONG limit,
+                                  CHARRANGE *match)
+{
+    LONG i, count = lstrlenW(query);
+    if (!count || count > view->length) return FALSE;
+    for (i = rwp_find_visible_lower_bound(view, begin);
+         i <= view->length - count && (limit < 0 || view->positions[i] < limit);
+         ++i)
+    {
+        BOOL equal = (flags & FR_MATCHCASE) ?
+            memcmp(view->text + i, query, (SIZE_T)count * sizeof(WCHAR)) == 0 :
+            CompareStringW(LOCALE_USER_DEFAULT, NORM_IGNORECASE,
+                           view->text + i, count, query, count) == CSTR_EQUAL;
+        if (!equal) continue;
+        if ((flags & FR_WHOLEWORD) &&
+            ((i > 0 && rwp_find_word_character(view->text[i - 1])) ||
+             (i + count < view->length && rwp_find_word_character(view->text[i + count]))))
+            continue;
+        match->cpMin = view->positions[i];
+        match->cpMax = view->positions[i + count - 1] + 1;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Return 1 for a match, 0 after one complete cycle, -1 if the visible
+ * story could not be retrieved. Rebuild on each request so changes in
+ * hidden formatting cannot leave a stale visibility map. */
+static int rwp_find_next_wrapped(FINDREPLACE_custom *data, DWORD flags,
+                                const CHARRANGE *selection, FINDTEXTEXW *ft,
+                                BOOL restart)
+{
+    RWP_VISIBLE_FIND view;
+    LONG begin = selection->cpMin;
+    BOOL found = FALSE;
+    if (!rwp_find_build_visible(&view))
+    {
+        data->cycleActive = FALSE;
+        return -1;
+    }
+    if (restart || !data->cycleActive ||
+        data->searchRevision != rwpFindDocumentRevision ||
+        selection->cpMin != data->lastMatch.cpMin ||
+        selection->cpMax != data->lastMatch.cpMax)
+    {
+        if (selection->cpMin != selection->cpMax)
+        {
+            LONG i = rwp_find_visible_lower_bound(&view, begin);
+            if (i < view.length && view.positions[i] < selection->cpMax)
+                begin = view.positions[i] + 1;
+        }
+        data->cycleStart = begin;
+        data->cycleWrapped = FALSE;
+        data->cycleActive = TRUE;
+        data->searchRevision = rwpFindDocumentRevision;
+    }
+    else
+        begin = data->lastMatchStart + 1;
+
+    if (!data->cycleWrapped)
+    {
+        found = rwp_find_visible_span(&view, ft->lpstrText, flags, begin, -1,
+                                      &ft->chrgText);
+        if (!found)
+        {
+            data->cycleWrapped = TRUE;
+            begin = 0;
+        }
+    }
+    if (!found && begin < data->cycleStart)
+        found = rwp_find_visible_span(&view, ft->lpstrText, flags, begin,
+                                      data->cycleStart, &ft->chrgText);
+    rwp_find_free_visible(&view);
+    if (found)
+        data->lastMatchStart = ft->chrgText.cpMin;
+    else
+        data->cycleActive = FALSE;
+    return found ? 1 : 0;
+}
+
 static LRESULT handle_findmsg(LPFINDREPLACEW pFr)
 {
+    if (!pFr || !pFr->lCustData) return 0;
     if(pFr->Flags & FR_DIALOGTERM)
     {
+        FINDREPLACE_custom *data = (FINDREPLACE_custom*)pFr->lCustData;
         hFindWnd = 0;
-        pFr->Flags = FR_FINDNEXT;
+        /* F3 must reuse the last executed query and options, not any
+         * unsubmitted edits in the closed dialog. */
+        pFr->lpstrFindWhat = data->findBuffer;
+        pFr->Flags = FR_FINDNEXT | data->lastFindFlags;
         return 0;
     }
 
@@ -17761,21 +17962,58 @@ static LRESULT handle_findmsg(LPFINDREPLACEW pFr)
         LRESULT ret = -1;
         HMENU hMenu = GetMenu(hMainWnd);
         MENUITEMINFOW mi;
+        BOOL restart;
+        DWORD findOptions = pFr->Flags & (FR_MATCHCASE | FR_WHOLEWORD);
+        if (!pFr->lpstrFindWhat || !pFr->lpstrFindWhat[0]) return 0;
 
         mi.cbSize = sizeof(mi);
         mi.fMask = MIIM_DATA;
         mi.dwItemData = 1;
         SetMenuItemInfoW(hMenu, ID_FIND_NEXT, FALSE, &mi);
 
-        /* Make sure find field is saved. */
+        restart = lstrcmpW(custom_data->findBuffer, pFr->lpstrFindWhat) != 0 ||
+                  custom_data->lastFindFlags != findOptions;
+        /* Keep the live common-dialog buffer at a stable address. Save
+         * the executed query separately for subsequent Find Next (F3). */
         if (pFr->lpstrFindWhat != custom_data->findBuffer)
-        {
             lstrcpynW(custom_data->findBuffer, pFr->lpstrFindWhat,
                       sizeof(custom_data->findBuffer) / sizeof(WCHAR));
-            pFr->lpstrFindWhat = custom_data->findBuffer;
+        custom_data->lastFindFlags = findOptions;
+
+        SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&sel);
+        if (!(pFr->Flags & (FR_REPLACE | FR_REPLACEALL)))
+        {
+            int result;
+            ZeroMemory(&ft, sizeof(ft));
+            ft.lpstrText = custom_data->findBuffer;
+            result = rwp_find_next_wrapped(custom_data, FR_DOWN | findOptions,
+                                           &sel, &ft, restart);
+            if (result > 0)
+            {
+                SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+                SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&custom_data->lastMatch);
+                SendMessageW(hEditorWnd, EM_SCROLLCARET, 0, 0);
+            }
+            else if (result < 0)
+            {
+                BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+                MessageBoxW(hFindWnd ? hFindWnd : hMainWnd,
+                    italian ? L"Impossibile leggere il testo visibile del documento." :
+                              L"Unable to read the document's visible text.",
+                    wszAppTitle, MB_OK | MB_ICONWARNING);
+            }
+            else
+            {
+                EnableWindow(hMainWnd, FALSE);
+                MessageBoxWithResStringW(hFindWnd, MAKEINTRESOURCEW(STRING_SEARCH_FINISHED),
+                                         wszAppTitle, MB_OK | MB_ICONASTERISK | MB_TASKMODAL);
+                EnableWindow(hMainWnd, TRUE);
+            }
+            return 0;
         }
 
-        SendMessageW(hEditorWnd, EM_GETSEL, (WPARAM)&sel.cpMin, (LPARAM)&sel.cpMax);
+        /* Legacy Replace dialog; the normal Ctrl+H uses the unified tool. */
+        custom_data->cycleActive = FALSE;
         if(custom_data->endPos == -1) {
             custom_data->endPos = sel.cpMin;
             custom_data->wrapped = FALSE;
@@ -17873,7 +18111,6 @@ static void rwp_activate_find_window(HWND dialog)
 
 static void dialog_find(LPFINDREPLACEW fr, BOOL replace)
 {
-    static WCHAR selBuffer[128];
     static WCHAR replaceBuffer[128];
     static FINDREPLACE_custom custom_data;
 
@@ -17894,21 +18131,21 @@ static void dialog_find(LPFINDREPLACEW fr, BOOL replace)
     ZeroMemory(fr, sizeof(FINDREPLACEW));
     fr->lStructSize = sizeof(FINDREPLACEW);
     fr->hwndOwner = hMainWnd;
-    fr->Flags = FR_HIDEUPDOWN;
-    /* Prefill with the selected visible text, excluding hidden hyperlink
-     * destinations. Keep the previous query for empty/multiline/long selections.
-     * Use a temporary buffer; the saved query is unchanged until execution. */
-    if (rwp_unified_selection_to_find(selBuffer,
-                      sizeof(selBuffer)/sizeof(selBuffer[0])))
-        fr->lpstrFindWhat = selBuffer;
-    else
-        fr->lpstrFindWhat = custom_data.findBuffer;
+    fr->Flags = FR_HIDEUPDOWN | FR_DOWN;
+    /* Prefill with selected visible text, or the last executed query.
+     * The common dialog always uses the same buffer until it closes. */
+    if (!rwp_unified_selection_to_find(custom_data.dialogBuffer,
+                       sizeof(custom_data.dialogBuffer)/sizeof(WCHAR)))
+        lstrcpynW(custom_data.dialogBuffer, custom_data.findBuffer,
+                  sizeof(custom_data.dialogBuffer)/sizeof(WCHAR));
+    fr->lpstrFindWhat = custom_data.dialogBuffer;
     fr->lpstrReplaceWith = replaceBuffer;
     custom_data.endPos = -1;
     custom_data.wrapped = FALSE;
+    custom_data.cycleActive = FALSE;
     fr->lCustData = (LPARAM)&custom_data;
     /* FINDREPLACEW lengths are WCHAR counts, not buffer byte sizes. */
-    fr->wFindWhatLen = sizeof(custom_data.findBuffer) / sizeof(WCHAR);
+    fr->wFindWhatLen = sizeof(custom_data.dialogBuffer) / sizeof(WCHAR);
     fr->wReplaceWithLen = sizeof(replaceBuffer) / sizeof(WCHAR);
 
     if(replace)
@@ -19240,6 +19477,9 @@ static const struct
 {
     {0, L"Unassigned", L"Non assegnato"},
     {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
+    {ID_SHORTCUT_SPACING_SINGLE, L"Line spacing: Single", L"Interlinea: Singola"},
+    {ID_SHORTCUT_SPACING_DOUBLE, L"Line spacing: Double", L"Interlinea: Doppia"},
+    {ID_SHORTCUT_SPACING_ONE_HALF, L"Line spacing: 1.5 lines", L"Interlinea: 1,5 righe"},
     {ID_BOOKMARK_ADD, L"Add bookmark", L"Aggiungi segnalibro"},
     {ID_FORMAT_COLOR, L"Reapply last text color", L"Applica l'ultimo colore del testo"},
     {ID_FORMAT_COLOR_PICK, L"Open text color picker", L"Apri selezione colore del testo"},
@@ -19286,13 +19526,14 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
-/* Version 4 retains the assignment table and Insert text payloads.
- * Version 3 recorded the Alt+W default; version 4 records the Ctrl+J
- * default. A shortcut explicitly removed in its own version stays removed. */
+/* Version 5 makes the native Ctrl+1/2/5 line-spacing defaults editable.
+ * Versions 3 and 4 recorded Alt+W and Ctrl+J, respectively. A shortcut
+ * explicitly removed in its own version stays removed. */
 #define RWP_SHORTCUT_TEXT_MAX 512
 #define RWP_SHORTCUT_BLOB_MAGIC_V2 0x32535752UL /* RWS2 */
 #define RWP_SHORTCUT_BLOB_MAGIC_V3 0x33535752UL /* RWS3 */
-#define RWP_SHORTCUT_BLOB_MAGIC 0x34535752UL /* RWS4 */
+#define RWP_SHORTCUT_BLOB_MAGIC_V4 0x34535752UL /* RWS4 */
+#define RWP_SHORTCUT_BLOB_MAGIC 0x35535752UL /* RWS5 */
 typedef struct
 {
     DWORD magic;
@@ -19365,6 +19606,14 @@ static BOOL rwp_copy_shortcut_texts(
     return TRUE;
 }
 
+static void rwp_add_number_shortcut_defaults(RWP_SHORTCUT_ASSIGNMENTS *bindings)
+{
+    DWORD *keys = bindings->keys[RWP_SHORTCUT_CONTROL];
+    if (!keys['1']) keys['1'] = ID_SHORTCUT_SPACING_SINGLE;
+    if (!keys['2']) keys['2'] = ID_SHORTCUT_SPACING_DOUBLE;
+    if (!keys['5']) keys['5'] = ID_SHORTCUT_SPACING_ONE_HALF;
+}
+
 static BOOL rwp_default_shortcut_assignments(
     RWP_SHORTCUT_ASSIGNMENTS *bindings,
     WCHAR *texts[RWP_SHORTCUT_MODIFIER_COUNT][RWP_SHORTCUT_KEY_COUNT])
@@ -19374,6 +19623,7 @@ static BOOL rwp_default_shortcut_assignments(
     bindings->keys[RWP_SHORTCUT_ALT]['A'] = ID_INSERT_TEXT;
     bindings->keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
     bindings->keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
+    rwp_add_number_shortcut_defaults(bindings);
     return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
 }
 
@@ -19468,9 +19718,10 @@ static BOOL rwp_shortcut_key_in_use(UINT key, UINT modifiers)
             key == VK_NUMPAD5 || (key >= VK_PRIOR && key <= VK_DOWN) ||
             key == 'C' || key == 'V' || key == 'X')
             return TRUE;
-        if (!shift && (key == 'L' ||
-                       key == '1' || key == '2' || key == '5'))
-            return TRUE;
+        /* Plain Ctrl+1..9 are configurable, including the old native
+         * line-spacing chords. Leave Ctrl+Shift+number accents alone. */
+        if (!shift && key >= '1' && key <= '9') return FALSE;
+        if (!shift && key == 'L') return TRUE;
         if (shift && (key == 'A' || key == 'L'))
             return TRUE;
         for (i = 0; richEditPunctuation[i]; ++i)
@@ -19530,6 +19781,7 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         goto done;
     memcpy(&header, buffer, sizeof(header));
     if ((header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V4 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V3 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V2) ||
         header.textCount > RWP_SHORTCUT_MODIFIER_COUNT * RWP_SHORTCUT_KEY_COUNT)
@@ -19593,10 +19845,13 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         !rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] &&
         !rwp_shortcut_key_in_use('W', RWP_SHORTCUT_ALT))
         rwpShortcutCommands.keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
-    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+    if ((header.magic == RWP_SHORTCUT_BLOB_MAGIC_V2 ||
+         header.magic == RWP_SHORTCUT_BLOB_MAGIC_V3) &&
         !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] &&
         !rwp_shortcut_key_in_use('J', RWP_SHORTCUT_CONTROL))
         rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC)
+        rwp_add_number_shortcut_defaults(&rwpShortcutCommands);
     valid = TRUE;
 done:
     if (!valid)
@@ -19723,10 +19978,12 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
     chord = rwp_shortcut_chord_from_message(message);
     if (!chord) return FALSE;
     action = rwpShortcutCommands.keys[HIWORD(chord)][LOWORD(chord)];
-    /* Suppress native Rich Edit justification even if the user removes
-     * the Ctrl+J binding. Consume the key before WM_CHAR can be generated. */
+    /* An explicitly unassigned number chord must not fall through to
+     * RichEdit's built-in line-spacing command. */
     if (!action)
-        return chord == MAKELONG('J', RWP_SHORTCUT_CONTROL);
+        return HIWORD(chord) == RWP_SHORTCUT_CONTROL &&
+               (LOWORD(chord) == 'J' ||
+                (LOWORD(chord) >= '1' && LOWORD(chord) <= '9'));
     if (rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
         return FALSE;
     if (!(message->lParam & (1UL << 30)))
@@ -28888,6 +29145,7 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
     {
         if (HIWORD(wParam) == EN_CHANGE)
         {
+            ++rwpFindDocumentRevision;
             rwpMultiRowAlignmentKnown = FALSE;
             if (!backgroundUpdatingFontColor)
                 reset_background_history();
@@ -28935,6 +29193,7 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
             {
                 SETTEXTEX st;
 
+                ++rwpFindDocumentRevision;
                 rwp_backup_clean_document(wszFileName);
                 rwp_backup_begin_interval();
                 set_caption(NULL);
@@ -29532,6 +29791,24 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         }
         SendMessageW(hWnd, WM_USER, 0, 0);
         return 0;
+
+    case ID_SHORTCUT_SPACING_SINGLE:
+    case ID_SHORTCUT_SPACING_DOUBLE:
+    case ID_SHORTCUT_SPACING_ONE_HALF:
+        {
+            PARAFORMAT2 paragraph;
+            if (SendMessageW(hwndEditor, EM_GETOPTIONS, 0, 0) & ECO_READONLY)
+                return 0;
+            ZeroMemory(&paragraph, sizeof(paragraph));
+            paragraph.cbSize = sizeof(paragraph);
+            paragraph.dwMask = PFM_LINESPACING;
+            paragraph.bLineSpacingRule = LOWORD(wParam) == ID_SHORTCUT_SPACING_SINGLE ? 0 :
+                LOWORD(wParam) == ID_SHORTCUT_SPACING_DOUBLE ? 2 : 1;
+            reset_background_history();
+            SendMessageW(hwndEditor, EM_SETPARAFORMAT, 0, (LPARAM)&paragraph);
+            SendMessageW(hWnd, WM_USER, 0, 0);
+        }
+        break;
 
     case ID_LINE_SPACING:
         rwp_open_line_spacing_dialog();
