@@ -404,6 +404,7 @@ static const WCHAR stringFormat[] = {'%','2','d','\0'};
 static HWND hMainWnd;
 static HWND hEditorWnd;
 static HWND rwpEditorHost;
+static HWND rwpLoadingCover;
 /* Only the outer application message loop completes a deferred activation. */
 static BOOL rwpEditorCompositionPending = TRUE;
 
@@ -3088,7 +3089,7 @@ static HWND rwp_create_editor_host(HWND parent, HINSTANCE instance)
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return NULL;
     return CreateWindowExW(WS_EX_CONTROLPARENT,
-                         name, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                         name, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
                          0, 0, 1000, 100, parent, NULL, instance, NULL);
 }
 
@@ -3125,6 +3126,49 @@ static BOOL rwp_set_editor_host_composition(HWND host, BOOL enabled)
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
                  SWP_FRAMECHANGED | SWP_NOREDRAW);
     return !!(GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_COMPOSITED) == !!enabled;
+}
+
+/* A child surface keeps native controls laid out and the document colors
+ * intact. Only the caller that creates the cover removes it: command-line
+ * startup spans the nested DoOpenFile call and the remaining UI setup. */
+static HWND rwp_show_loading_cover(void)
+{
+    static const WCHAR name[] = L"RWPDocumentLoadingCover";
+    WNDCLASSW wc;
+    RECT client;
+    HWND cover;
+    if (rwpLoadingCover || !hMainWnd || !GetClientRect(hMainWnd, &client))
+        return NULL;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(NULL);
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_WAIT);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = name;
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return NULL;
+    cover = CreateWindowExW(WS_EX_NOPARENTNOTIFY, name, NULL,
+                            WS_CHILD | WS_CLIPSIBLINGS, 0, 0, client.right,
+                            client.bottom, hMainWnd, NULL, wc.hInstance, NULL);
+    if (cover)
+    {
+        rwpLoadingCover = cover;
+        SetWindowPos(cover, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (IsWindowVisible(cover)) UpdateWindow(cover);
+    }
+    return cover;
+}
+
+static void rwp_remove_loading_cover(HWND cover)
+{
+    if (cover && cover == rwpLoadingCover)
+    {
+        rwpLoadingCover = NULL;
+        DestroyWindow(cover);
+        RedrawWindow(hMainWnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE |
+                     RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
 }
 
 static void rwp_defer_editor_composition(void)
@@ -10802,6 +10846,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     BOOL textUtf8Bom = FALSE;
     RTF_INPUT_MEMORY normalizedRtf;
     BOOL useNormalizedRtf = FALSE;
+    HWND loadingCover;
 
     if (rwp_activate_open_document(szOpenFileName)) return;
 
@@ -10865,6 +10910,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     es.dwCookie = (DWORD_PTR)hFile;
     es.pfnCallback = stream_in;
 
+    loadingCover = rwp_show_loading_cover();
     rwp_defer_editor_composition();
     ++rwpFindDocumentRevision;
     rwp_original_images_clear();
@@ -10970,6 +11016,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     rwp_cloud_periodic_reset_clock();
     registry_set_filelist(szOpenFileName, hMainWnd);
     update_font_list();
+    rwp_remove_loading_cover(loadingCover);
     rwp_document_view_ready();
 }
 
@@ -21233,9 +21280,9 @@ static LRESULT OnCreate( HWND hWnd )
     static const WCHAR wszRichEditDll[] = {'M','S','F','T','E','D','I','T','.','D','L','L','\0'};
     static const WCHAR wszRichEditText[] = {'R','i','c','h','E','d','i','t',' ','t','e','x','t','\0'};
 
-    CreateStatusWindowW(CCS_NODIVIDER|WS_CHILD|WS_VISIBLE, wszRichEditText, hWnd, IDC_STATUSBAR);
+    CreateStatusWindowW(CCS_NODIVIDER|WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS, wszRichEditText, hWnd, IDC_STATUSBAR);
 
-    rwpMenuWnd = CreateWindowExW(0, rwpMenuClass, NULL, WS_CHILD | WS_VISIBLE |
+    rwpMenuWnd = CreateWindowExW(0, rwpMenuClass, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS |
                                WS_TABSTOP, 0, 0, 100, RWP_MENU_HEIGHT, hWnd,
                                (HMENU)(UINT_PTR)18000, hInstance, NULL);
     if (!rwpMenuWnd) return -1;
@@ -21418,7 +21465,7 @@ static LRESULT OnCreate( HWND hWnd )
 
     rwpEditorHost = rwp_create_editor_host(hWnd, hInstance);
     hEditorWnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", NULL,
-      WS_CHILD|WS_VISIBLE|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
+      WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
       |ES_WANTRETURN|WS_VSCROLL|ES_NOHIDESEL|WS_HSCROLL,
       0, 0, 1000, 100, rwpEditorHost ? rwpEditorHost : hWnd,
       (HMENU)IDC_EDITOR, hInstance, NULL);
@@ -21427,7 +21474,7 @@ static LRESULT OnCreate( HWND hWnd )
         DestroyWindow(rwpEditorHost);
         rwpEditorHost = NULL;
         hEditorWnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", NULL,
-          WS_CHILD|WS_VISIBLE|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
+          WS_CHILD|WS_VISIBLE|WS_CLIPSIBLINGS|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
           |ES_WANTRETURN|WS_VSCROLL|ES_NOHIDESEL|WS_HSCROLL,
           0, 0, 1000, 100, hWnd, (HMENU)IDC_EDITOR, hInstance, NULL);
     }
@@ -30690,6 +30737,9 @@ static LRESULT OnSize( HWND hWnd, WPARAM wParam, LPARAM lParam )
     clientHeight = rc.bottom - rc.top;
     if (clientWidth < 0) clientWidth = 0;
     if (clientHeight < 0) clientHeight = 0;
+    if (rwpLoadingCover)
+        SetWindowPos(rwpLoadingCover, HWND_TOP, 0, 0, clientWidth, clientHeight,
+                     SWP_NOACTIVATE);
 
     if (hwndStatusBar)
     {
@@ -30837,6 +30887,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         return OnCommand( hWnd, wParam, lParam );
 
     case WM_DESTROY:
+        rwpLoadingCover = NULL;
         {
             unsigned iconIndex;
             HWND status = GetDlgItem(hWnd, IDC_STATUSBAR);
@@ -30982,6 +31033,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     HWND hRulerWnd;
     POINTL EditPoint;
     DWORD bMaximized;
+    BOOL openingStartupFile = FALSE;
+    HWND startupCover = NULL;
     LPWSTR *commandArguments;
     int argumentCount, argumentIndex;
     static const WCHAR wszAccelTable[] = {'M','A','I','N','A','C','C','E','L',
@@ -31001,6 +31054,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                 (candidate[1] == L'p' || candidate[1] == L'P') &&
                 !candidate[2])
                 continue; /* Existing /p print option. */
+            openingStartupFile = candidate[0] != 0;
             if (rwp_activate_open_document(candidate))
             {
                 LocalFree(commandArguments);
@@ -31432,7 +31486,9 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     if ((nCmdShow == SW_SHOWNORMAL || nCmdShow == SW_SHOWDEFAULT)
 	     && bMaximized)
         nCmdShow = SW_SHOWMAXIMIZED;
+    if (openingStartupFile) startupCover = rwp_show_loading_cover();
     ShowWindow(hMainWnd, nCmdShow);
+    if (startupCover && IsWindowVisible(startupCover)) UpdateWindow(startupCover);
 
     set_caption(NULL);
     set_bar_states();
@@ -31453,6 +31509,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     HandleCommandLine(GetCommandLineW());
     rwp_header_refresh_character_count();
     rwp_statusbar_update_editor_position();
+    rwp_remove_loading_cover(startupCover);
     rwp_startup_profile_mark("Command-line document loaded; ready");
     rwp_startup_profile_write();
 
