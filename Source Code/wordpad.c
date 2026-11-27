@@ -404,6 +404,8 @@ static const WCHAR stringFormat[] = {'%','2','d','\0'};
 static HWND hMainWnd;
 static HWND hEditorWnd;
 static HWND rwpEditorHost;
+/* Only the outer application message loop completes a deferred activation. */
+static BOOL rwpEditorCompositionPending = TRUE;
 
 /* The editor may be nested in a dedicated composited child. Other modules
  * must use its actual RichEdit HWND, not the surrounding painting host. */
@@ -3085,7 +3087,7 @@ static HWND rwp_create_editor_host(HWND parent, HINSTANCE instance)
      * the paint DC is released. Do not enable composition on the main window. */
     if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
         return NULL;
-    return CreateWindowExW(WS_EX_COMPOSITED | WS_EX_CONTROLPARENT,
+    return CreateWindowExW(WS_EX_CONTROLPARENT,
                          name, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                          0, 0, 1000, 100, parent, NULL, instance, NULL);
 }
@@ -3125,6 +3127,21 @@ static BOOL rwp_set_editor_host_composition(HWND host, BOOL enabled)
     return !!(GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_COMPOSITED) == !!enabled;
 }
 
+static void rwp_defer_editor_composition(void)
+{
+    rwpEditorCompositionPending = TRUE;
+    if (rwpEditorHost)
+        rwp_set_editor_host_composition(rwpEditorHost, FALSE);
+}
+
+static void rwp_document_view_ready(void)
+{
+    /* An open can arrive as a sent message while GetMessage is blocked.
+     * Wake the outer loop even when the editor has no further dirty region.
+     * WM_NULL itself never enables buffering inside a nested modal loop. */
+    if (rwpEditorHost) PostMessageW(rwpEditorHost, WM_NULL, 0, 0);
+}
+
 static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
                  WPARAM wParam, LPARAM lParam, UINT_PTR ident, DWORD_PTR data)
 {
@@ -3159,7 +3176,8 @@ static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
             if (rwpEditorHost == host && IsWindow(host) && IsWindow(window) &&
                 GetParent(window) == host)
             {
-                rwp_set_editor_host_composition(host, TRUE);
+                if (!rwpEditorCompositionPending)
+                    rwp_set_editor_host_composition(host, TRUE);
                 rwp_bookmark_indicators_refresh(window);
                 /* Native tracking has already drawn the final scroll
                  * position; refresh only the bookmark footprints. */
@@ -10847,6 +10865,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     es.dwCookie = (DWORD_PTR)hFile;
     es.pfnCallback = stream_in;
 
+    rwp_defer_editor_composition();
     ++rwpFindDocumentRevision;
     rwp_original_images_clear();
     rwp_bookmarks_clear();
@@ -10951,6 +10970,7 @@ static void DoOpenFile(LPCWSTR szOpenFileName)
     rwp_cloud_periodic_reset_clock();
     registry_set_filelist(szOpenFileName, hMainWnd);
     update_font_list();
+    rwp_document_view_ready();
 }
 
 static void ShowWriteError(DWORD Code)
@@ -29691,6 +29711,7 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
             {
                 SETTEXTEX st;
 
+                rwp_defer_editor_composition();
                 ++rwpFindDocumentRevision;
                 rwp_backup_clean_document(wszFileName);
                 rwp_backup_begin_interval();
@@ -29719,6 +29740,7 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
                 SendMessageW(hEditorWnd, EM_SETMODIFY, FALSE, 0);
                 rwpRichFormattingChanged = FALSE;
                 update_font_list();
+                rwp_document_view_ready();
             }
         }
         break;
@@ -31434,9 +31456,20 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     rwp_startup_profile_mark("Command-line document loaded; ready");
     rwp_startup_profile_write();
 
-    while(GetMessageW(&msg,0,0,0))
+    for (;;)
     {
-        BOOL optionsMessage = rwpViewOptionsWnd &&
+        BOOL optionsMessage;
+        /* Reached only after startup or a dispatched command (including any
+         * nested dialog or scrollbar tracking) has completely unwound. Give
+         * queued input and native painting priority over changing the style. */
+        if (rwpEditorCompositionPending && !PeekMessageW(&msg, NULL, 0, 0, PM_NOREMOVE))
+        {
+            rwpEditorCompositionPending = FALSE;
+            if (rwpEditorHost)
+                rwp_set_editor_host_composition(rwpEditorHost, TRUE);
+        }
+        if (GetMessageW(&msg, NULL, 0, 0) <= 0) break;
+        optionsMessage = rwpViewOptionsWnd &&
             (msg.hwnd == rwpViewOptionsWnd || IsChild(rwpViewOptionsWnd, msg.hwnd));
         if (optionsMessage && PropSheet_IsDialogMessage(rwpViewOptionsWnd, &msg))
         {
