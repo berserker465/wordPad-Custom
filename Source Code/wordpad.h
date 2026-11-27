@@ -692,6 +692,7 @@ BOOL wordpad_get_document_background_color(COLORREF *color);
 /* print.c */
 void dialog_printsetup(HWND);
 void dialog_print(HWND, LPWSTR);
+HWND rwp_get_editor_window(HWND owner);
 void target_device(HWND, DWORD);
 void print_quick(HWND, LPWSTR);
 void get_default_printer_opts(void);

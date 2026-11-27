@@ -36,7 +36,6 @@ BEGIN
     "Q",          ID_FORMAT_COLOR,    VIRTKEY, ALT
     "W",          ID_ALIGN_CENTER,    VIRTKEY, CONTROL
     "E",          ID_ALIGN_RIGHT,     VIRTKEY, CONTROL
-    "F",          ID_FIND,            VIRTKEY, CONTROL
     "H",          ID_REPLACE,         VIRTKEY, CONTROL
     "K",          ID_INSERT_LINK,     VIRTKEY, CONTROL
     "A",          ID_EDIT_SELECTALL,  VIRTKEY, CONTROL

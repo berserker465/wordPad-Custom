@@ -146,7 +146,7 @@ static RECT get_print_rect(HDC hdc)
 
 void target_device(HWND hMainWnd, DWORD wordWrap)
 {
-    HWND hEditorWnd = GetDlgItem(hMainWnd, IDC_EDITOR);
+    HWND hEditorWnd = rwp_get_editor_window(hMainWnd);
 
     if(wordWrap == ID_WORDWRAP_MARGIN)
     {
@@ -836,7 +836,7 @@ static void print(LPPRINTDLGW pd, LPWSTR wszFileName)
 {
     FORMATRANGE fr;
     DOCINFOW di;
-    HWND hEditorWnd = GetDlgItem(pd->hwndOwner, IDC_EDITOR);
+    HWND hEditorWnd = rwp_get_editor_window(pd->hwndOwner);
     int printedPages = 0;
     COLORREF backgroundColor = RGB(255, 255, 255);
     HBRUSH backgroundBrush = NULL;
@@ -1063,7 +1063,7 @@ void print_quick(HWND hMainWnd, LPWSTR wszFileName)
 void dialog_print(HWND hMainWnd, LPWSTR wszFileName)
 {
     PRINTDLGW pd;
-    HWND hEditorWnd = GetDlgItem(hMainWnd, IDC_EDITOR);
+    HWND hEditorWnd = rwp_get_editor_window(hMainWnd);
     int from = 0;
     int to = 0;
 

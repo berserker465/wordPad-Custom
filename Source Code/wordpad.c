@@ -64,12 +64,21 @@
 #include "wordpad.h"
 #include "cloud_native.h"
 
+/* Older RosBE headers may not declare horizontal mouse-wheel messages. */
+#ifndef WM_MOUSEHWHEEL
+#define WM_MOUSEHWHEEL 0x020E
+#endif
+#ifndef WS_EX_COMPOSITED
+#define WS_EX_COMPOSITED 0x02000000L
+#endif
+
 /* Runtime-only Help menu command; no resource changes required. */
 #define ID_DEBUG_EXPORT_RAW_RTF 1642
 /* Configurable replacements for RichEdit native Ctrl+1/2/5. */
 #define ID_SHORTCUT_SPACING_SINGLE 1643
 #define ID_SHORTCUT_SPACING_DOUBLE 1644
 #define ID_SHORTCUT_SPACING_ONE_HALF 1645
+#define ID_TOGGLE_BOOKMARK_INDICATORS 1646
 
 /* The 1080p-or-lower interface uses the application's original 96-DPI
  * dimensions even when Windows display scaling is above 100%. Above 1080p,
@@ -349,6 +358,7 @@ static BOOL rwpMenuTracking = FALSE;
 #define RWP_MENU_COUNTER_TOOL_ID 1
 static BOOL rwpHeaderDateVisible = TRUE;
 static BOOL rwpHeaderCharactersVisible = TRUE;
+static BOOL rwpBookmarkIndicatorsVisible = TRUE;
 static DWORD rwpHeaderCharacterCount = 0;
 static HWND rwpHeaderCounterTooltip = NULL;
 static void rwp_format_grouped_counter(DWORD value, WCHAR *buffer);
@@ -393,6 +403,18 @@ static const WCHAR stringFormat[] = {'%','2','d','\0'};
 
 static HWND hMainWnd;
 static HWND hEditorWnd;
+static HWND rwpEditorHost;
+
+/* The editor may be nested in a dedicated composited child. Other modules
+ * must use its actual RichEdit HWND, not the surrounding painting host. */
+HWND rwp_get_editor_window(HWND owner)
+{
+    HWND editor = NULL;
+    if (rwpEditorHost && GetParent(rwpEditorHost) == owner)
+        editor = GetDlgItem(rwpEditorHost, IDC_EDITOR);
+    if (!editor && owner) editor = GetDlgItem(owner, IDC_EDITOR);
+    return editor;
+}
 static HWND hFindWnd;
 static HWND rwpShortcutsWnd;
 static HWND rwpViewOptionsWnd;
@@ -3012,6 +3034,96 @@ static int rwp_bookmark_index(LPCWSTR name);
 static BOOL rwp_bookmark_remove_index(int index);
 static BOOL rwp_bookmark_track(LPCWSTR name, LONG cpStart, LONG cpEnd);
 static BOOL rwp_bookmark_valid_name(LPCWSTR name);
+static void rwp_bookmark_indicators_refresh(HWND editor);
+static LRESULT rwp_paint_rich_editor(HWND editor, WPARAM wParam, LPARAM lParam);
+
+static LRESULT CALLBACK rwp_editor_host_proc(HWND window, UINT message,
+                                             WPARAM wp, LPARAM lp)
+{
+    HWND parent = GetParent(window);
+    switch (message)
+    {
+    case WM_COMMAND: case WM_NOTIFY: case WM_NOTIFYFORMAT:
+    case WM_CTLCOLOREDIT: case WM_CTLCOLORSTATIC:
+    case WM_HSCROLL: case WM_VSCROLL: case WM_CONTEXTMENU:
+    case WM_HELP: case WM_PARENTNOTIFY:
+        if (parent) return SendMessageW(parent, message, wp, lp);
+        break;
+    case WM_SIZE:
+    {
+        HWND editor = GetDlgItem(window, IDC_EDITOR);
+        RECT rc;
+        if (editor && GetClientRect(window, &rc))
+            MoveWindow(editor, 0, 0, rc.right, rc.bottom, TRUE);
+        return 0;
+    }
+    case WM_SETFOCUS:
+    {
+        HWND editor = GetDlgItem(window, IDC_EDITOR);
+        if (editor) SetFocus(editor);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        /* The native editor covers the complete host client area. */
+        return 1;
+    case WM_NCDESTROY:
+        if (rwpEditorHost == window) rwpEditorHost = NULL;
+        break;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+static HWND rwp_create_editor_host(HWND parent, HINSTANCE instance)
+{
+    static const WCHAR name[] = L"RWPCompositedEditorHost";
+    WNDCLASSW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.lpfnWndProc = rwp_editor_host_proc;
+    wc.hInstance = instance;
+    wc.lpszClassName = name;
+    /* No CS_OWNDC/CS_CLASSDC: composition must be free to present when
+     * the paint DC is released. Do not enable composition on the main window. */
+    if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return NULL;
+    return CreateWindowExW(WS_EX_COMPOSITED | WS_EX_CONTROLPARENT,
+                         name, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+                         0, 0, 1000, 100, parent, NULL, instance, NULL);
+}
+
+/* Native non-client scrollbar tracking can hold a drawing DC for the
+ * duration of the mouse gesture. With WS_EX_COMPOSITED on the ancestor,
+ * the thumb's updates can remain buffered until that gesture finishes.
+ * Temporarily opt out before entering the native tracking loop; do not
+ * translate SB_THUMBTRACK into SB_THUMBPOSITION (the native control owns
+ * scrolling, including positions beyond the 16-bit message field). */
+static BOOL rwp_is_native_scroll_tracking(UINT message, WPARAM wp)
+{
+    if (message == WM_NCLBUTTONDOWN || message == WM_NCLBUTTONDBLCLK)
+        return wp == HTVSCROLL || wp == HTHSCROLL;
+    if (message == WM_SYSCOMMAND)
+    {
+        UINT command = (UINT)(wp & 0xfff0);
+        return command == SC_VSCROLL || command == SC_HSCROLL;
+    }
+    return FALSE;
+}
+
+static BOOL rwp_set_editor_host_composition(HWND host, BOOL enabled)
+{
+    LONG_PTR style = GetWindowLongPtrW(host, GWL_EXSTYLE);
+    LONG_PTR desired = enabled ? (style | WS_EX_COMPOSITED) :
+                                 (style & ~(LONG_PTR)WS_EX_COMPOSITED);
+    if (style == desired) return TRUE;
+    SetLastError(0);
+    if (!SetWindowLongPtrW(host, GWL_EXSTYLE, desired) && GetLastError())
+        return FALSE;
+    /* Recalculate cached window attributes without resizing or erasing
+     * the editor. The native scroll handler controls drawing during drag. */
+    SetWindowPos(host, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                 SWP_FRAMECHANGED | SWP_NOREDRAW);
+    return !!(GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_COMPOSITED) == !!enabled;
+}
 
 static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
                  WPARAM wParam, LPARAM lParam, UINT_PTR ident, DWORD_PTR data)
@@ -3032,10 +3144,36 @@ static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
     RWP_BOOKMARK_CLIPBOARD *bookmarkPaste = NULL;
     LRESULT result;
     (void)ident; (void)data;
+    if (rwp_is_native_scroll_tracking(message, wParam))
+    {
+        HWND host = rwpEditorHost;
+        /* WM_NCLBUTTONDOWN can dispatch a nested WM_SYSCOMMAND. The
+         * style check ensures only the outermost call restores buffering. */
+        if (host && GetParent(window) == host &&
+            (GetWindowLongPtrW(host, GWL_EXSTYLE) & WS_EX_COMPOSITED) &&
+            rwp_set_editor_host_composition(host, FALSE))
+        {
+            result = DefSubclassProc(window, message, wParam, lParam);
+            /* The modal tracking call returns on release or cancellation.
+             * It can also dispatch messages that destroy the window. */
+            if (rwpEditorHost == host && IsWindow(host) && IsWindow(window) &&
+                GetParent(window) == host)
+            {
+                rwp_set_editor_host_composition(host, TRUE);
+                rwp_bookmark_indicators_refresh(window);
+                /* Native tracking has already drawn the final scroll
+                 * position; refresh only the bookmark footprints. */
+            }
+            return result;
+        }
+    }
+    if (message == WM_PAINT)
+        return rwp_paint_rich_editor(window, wParam, lParam);
     if (message == WM_MOUSEWHEEL && (LOWORD(wParam) & MK_CONTROL))
     {
         result = DefSubclassProc(window, message, wParam, lParam);
         rwp_refresh_zoom(window);
+        rwp_bookmark_indicators_refresh(window);
         return result;
     }
 
@@ -3263,8 +3401,32 @@ static LRESULT CALLBACK rwp_rich_editor_proc(HWND window, UINT message,
         rwpRichFormattingChanged = TRUE;
     if (richPaste && !(GetWindowLongW(window, GWL_STYLE) & ES_READONLY))
         rwpRichFormattingChanged = TRUE;
-    if (message == WM_NCDESTROY)
+    /* Native scrolling may copy overlay pixels. Refresh marker footprints
+     * (including their scrolled locations), not the entire editor. */
+    switch (message)
+    {
+    case WM_SIZE: case WM_SETFONT: case WM_HSCROLL: case WM_VSCROLL:
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+    case WM_KEYDOWN: case WM_LBUTTONUP:
+    case WM_SETFOCUS: case WM_KILLFOCUS:
+    case EM_SETSCROLLPOS: case EM_SCROLL: case EM_LINESCROLL:
+    case EM_EXSETSEL: case EM_SETSEL:
+    case EM_SCROLLCARET: case EM_SETZOOM: case EM_SETTARGETDEVICE:
+    case EM_SETRECT: case EM_SETRECTNP: case EM_SETBKGNDCOLOR:
+    case EM_SETCHARFORMAT: case EM_SETPARAFORMAT: case EM_STREAMIN:
+    case EM_SETTEXTEX: case WM_SETTEXT:
+        rwp_bookmark_indicators_refresh(window);
+        break;
+    case WM_MOUSEMOVE:
+        if (wParam & MK_LBUTTON) rwp_bookmark_indicators_refresh(window);
+        break;
+    case WM_SETREDRAW:
+        if (wParam) rwp_bookmark_indicators_refresh(window);
+        break;
+    case WM_NCDESTROY:
         RemoveWindowSubclass(window, rwp_rich_editor_proc, 1);
+        break;
+    }
     return result;
 }
 
@@ -3790,6 +3952,7 @@ static void rwp_execute_editor_shortcut(HWND editor, UINT command,
     }
 
     if (command != ID_EDIT_COPY && command != ID_EDIT_SELECTALL &&
+        command != ID_FIND &&
         (SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
         return;
     if (GetFocus() != editor) SetFocus(editor);
@@ -4201,6 +4364,200 @@ static int rwpBookmarkCount = 0;
 static RWP_BOOKMARK_FOUND rwpPendingBookmarks[RWP_BOOKMARK_LIMIT];
 static int rwpPendingBookmarkCount = 0;
 
+/* Cache only the screen-space footprints of the small bookmark ribbons.
+ * The OS owns the editor host's compositing surface; no document-sized
+ * bitmap or per-keystroke allocation is necessary. */
+static RECT rwpBookmarkPaintRects[RWP_BOOKMARK_LIMIT];
+static int rwpBookmarkPaintCount;
+static POINT rwpBookmarkPaintScroll;
+static BOOL rwpBookmarkPaintScrollValid;
+static BOOL rwpBookmarkRefreshBusy;
+
+static int rwp_collect_bookmark_rects(HWND editor, RECT *rects)
+{
+    RECT client, textRect;
+    HDC screen;
+    int width, height, gap, dpi = 96, i, count = 0;
+    if (!editor || !rwpBookmarkIndicatorsVisible || !rwpBookmarkCount ||
+        !IsWindowVisible(editor)) return 0;
+    /* A screen DC supplies the DPI without acquiring the composited editor's
+     * drawing DC during layout notifications. */
+    screen = GetDC(NULL);
+    if (screen)
+    {
+        dpi = rwp_ui_dpi(GetDeviceCaps(screen, LOGPIXELSX));
+        ReleaseDC(NULL, screen);
+    }
+    GetClientRect(editor, &client);
+    SendMessageW(editor, EM_GETRECT, 0, (LPARAM)&textRect);
+    width = MulDiv(8, dpi, 96);
+    height = MulDiv(12, dpi, 96);
+    gap = MulDiv(2, dpi, 96);
+    if (width < 4) width = 4;
+    if (height < 6) height = 6;
+    if (gap < 1) gap = 1;
+    for (i = 0; i < rwpBookmarkCount; ++i)
+    {
+        ITextRange *range = rwpBookmarks[i].range;
+        LONG start, end, sx, sy, line, lineStart;
+        POINT anchor;
+        int x, y;
+        if (!range || FAILED(range->lpVtbl->GetStart(range, &start))) continue;
+        /* A collapsed selected-text bookmark is pending deletion. Do not
+         * draw it, and do not prune it from inside a paint handler. */
+        if (rwpBookmarks[i].tracksText &&
+            (FAILED(range->lpVtbl->GetEnd(range, &end)) || end <= start)) continue;
+        if (range->lpVtbl->GetPoint(range, tomStart | TA_TOP | TA_LEFT,
+                                    &sx, &sy) != S_OK) continue;
+        anchor.x = sx; anchor.y = sy;
+        if (!ScreenToClient(editor, &anchor)) continue;
+        if (anchor.x < textRect.left || anchor.x > textRect.right ||
+            anchor.y < textRect.top || anchor.y >= textRect.bottom) continue;
+        line = (LONG)SendMessageW(editor, EM_EXLINEFROMCHAR, 0, (LPARAM)start);
+        lineStart = line >= 0 ? (LONG)SendMessageW(editor, EM_LINEINDEX,
+                                                    (WPARAM)line, 0) : -1;
+        if (start == lineStart && anchor.x - width - gap >= client.left)
+        {
+            /* At the start of a displayed line, use the free space at left. */
+            x = anchor.x - width - gap;
+            y = anchor.y;
+        }
+        else
+        {
+            /* Mid-line: stay above the starting character, never cover the
+             * preceding characters on this line. At the viewport's top
+             * edge keep the ribbon visible instead of clipping it away. */
+            x = anchor.x;
+            y = anchor.y - height;
+            if (y < client.top) y = client.top;
+        }
+        SetRect(&rects[count++], x, y, x + width, y + height);
+    }
+    return count;
+}
+
+static void rwp_bookmark_indicators_refresh(HWND editor)
+{
+    RECT next[RWP_BOOKMARK_LIMIT], client;
+    POINT scroll;
+    BOOL haveScroll;
+    int count, i;
+    LONGLONG dx = 0, dy = 0;
+    if (!editor || rwpBookmarkRefreshBusy ||
+        (!rwpBookmarkPaintCount &&
+         (!rwpBookmarkIndicatorsVisible || !rwpBookmarkCount))) return;
+    rwpBookmarkRefreshBusy = TRUE;
+    count = rwp_collect_bookmark_rects(editor, next);
+    haveScroll = !!SendMessageW(editor, EM_GETSCROLLPOS, 0, (LPARAM)&scroll);
+    GetClientRect(editor, &client);
+    if (haveScroll && rwpBookmarkPaintScrollValid)
+    {
+        dx = (LONGLONG)rwpBookmarkPaintScroll.x - scroll.x;
+        dy = (LONGLONG)rwpBookmarkPaintScroll.y - scroll.y;
+    }
+    for (i = 0; i < rwpBookmarkPaintCount; ++i)
+    {
+        RECT old = rwpBookmarkPaintRects[i], moved;
+        /* Include the polygon's rasterization edge as well. */
+        InflateRect(&old, 1, 1);
+        InvalidateRect(editor, &old, FALSE);
+        /* ScrollWindowEx may have moved a previously painted ribbon along
+         * with the text. Also erase its translated footprint if still visible. */
+        if ((dx || dy) && dx > -client.right && dx < client.right &&
+                         dy > -client.bottom && dy < client.bottom)
+        {
+            moved = old;
+            OffsetRect(&moved, (int)dx, (int)dy);
+            InvalidateRect(editor, &moved, FALSE);
+        }
+    }
+    for (i = 0; i < count; ++i)
+    {
+        RECT dirty = next[i];
+        InflateRect(&dirty, 1, 1);
+        InvalidateRect(editor, &dirty, FALSE);
+    }
+    if (count) memcpy(rwpBookmarkPaintRects, next, count * sizeof(next[0]));
+    rwpBookmarkPaintCount = count;
+    rwpBookmarkPaintScrollValid = haveScroll;
+    if (haveScroll) rwpBookmarkPaintScroll = scroll;
+    rwpBookmarkRefreshBusy = FALSE;
+}
+
+/* Paint native RichEdit normally: WM_PRINTCLIENT is not a reliable substitute
+ * for a live editor (selection/caret/scrolling). Hold the composition DC only
+ * for this paint call and draw the overlay in the native dirty region before
+ * releasing it. External printing never gets bookmark indicators. */
+static LRESULT rwp_paint_rich_editor(HWND editor, WPARAM wParam, LPARAM lParam)
+{
+    HRGN dirty;
+    HDC dc = NULL;
+    LRESULT result;
+    int saved = 0;
+    static BOOL painting;
+    if (painting || wParam || !rwpBookmarkIndicatorsVisible || !rwpBookmarkCount)
+        return DefSubclassProc(editor, WM_PAINT, wParam, lParam);
+    painting = TRUE;
+    dirty = CreateRectRgn(0, 0, 0, 0);
+    if (dirty)
+    {
+        int kind = GetUpdateRgn(editor, dirty, FALSE);
+        if (kind != ERROR && kind != NULLREGION)
+        {
+            dc = GetDC(editor);
+            if (dc) saved = SaveDC(dc);
+        }
+    }
+    result = DefSubclassProc(editor, WM_PAINT, wParam, lParam);
+    if (dc && saved && SelectClipRgn(dc, dirty) != ERROR)
+    {
+        RECT rects[RWP_BOOKMARK_LIMIT];
+        HBRUSH brush;
+        int i, count = rwp_collect_bookmark_rects(editor, rects);
+        brush = count ? CreateSolidBrush(RGB(40, 125, 235)) : NULL;
+        if (brush)
+        {
+            SelectObject(dc, brush);
+            SelectObject(dc, GetStockObject(NULL_PEN));
+            for (i = 0; i < count; ++i)
+            {
+                RECT r = rects[i];
+                LONG notch = MulDiv(3, r.bottom - r.top, 12);
+                POINT ribbon[5];
+                if (notch < 2) notch = 2;
+                ribbon[0].x = r.left;  ribbon[0].y = r.top;
+                ribbon[1].x = r.right; ribbon[1].y = r.top;
+                ribbon[2].x = r.right; ribbon[2].y = r.bottom;
+                ribbon[3].x = (r.left + r.right) / 2;
+                ribbon[3].y = r.bottom - notch;
+                ribbon[4].x = r.left;  ribbon[4].y = r.bottom;
+                Polygon(dc, ribbon, 5);
+            }
+            RestoreDC(dc, saved);
+            saved = 0;
+            DeleteObject(brush);
+            /* A file can be loaded while its window is hidden. The first
+             * visible paint then establishes the cache so turning indicators
+             * off (or scrolling) can erase those newly drawn pixels. */
+            if (count && !rwpBookmarkPaintCount && !rwpBookmarkRefreshBusy)
+            {
+                memcpy(rwpBookmarkPaintRects, rects, count * sizeof(rects[0]));
+                rwpBookmarkPaintCount = count;
+                rwpBookmarkPaintScrollValid = !!SendMessageW(editor,
+                    EM_GETSCROLLPOS, 0, (LPARAM)&rwpBookmarkPaintScroll);
+            }
+        }
+    }
+    if (dc)
+    {
+        if (saved) RestoreDC(dc, saved);
+        ReleaseDC(editor, dc);
+    }
+    if (dirty) DeleteObject(dirty);
+    painting = FALSE;
+    return result;
+}
+
 /* Keep the original selection while the non-modal Add Bookmark window is open. */
 typedef struct RWP_BOOKMARK_ADD_STATE
 {
@@ -4233,6 +4590,7 @@ static void rwp_bookmarks_clear(void)
     ZeroMemory(rwpBookmarks, sizeof(rwpBookmarks));
     rwpBookmarkCount = 0;
     rwpPendingBookmarkCount = 0;
+    rwp_bookmark_indicators_refresh(hEditorWnd);
 }
 
 static BOOL rwp_bookmark_valid_name(LPCWSTR name)
@@ -4316,6 +4674,7 @@ static BOOL rwp_bookmark_track(LPCWSTR name, LONG cpStart, LONG cpEnd)
     rwpBookmarks[rwpBookmarkCount].range = range;
     rwpBookmarks[rwpBookmarkCount].tracksText = (cpEnd > cpStart);
     ++rwpBookmarkCount;
+    rwp_bookmark_indicators_refresh(hEditorWnd);
     return TRUE;
 }
 
@@ -4568,6 +4927,7 @@ static BOOL rwp_bookmark_remove_index(int index)
                 (rwpBookmarkCount - index - 1) * sizeof(rwpBookmarks[0]));
     --rwpBookmarkCount;
     ZeroMemory(&rwpBookmarks[rwpBookmarkCount], sizeof(rwpBookmarks[0]));
+    rwp_bookmark_indicators_refresh(hEditorWnd);
     rwpRichFormattingChanged = TRUE;
     SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
     return TRUE;
@@ -4597,6 +4957,7 @@ static void rwp_bookmarks_prune_deleted(void)
                         (rwpBookmarkCount - i - 1) * sizeof(rwpBookmarks[0]));
             --rwpBookmarkCount;
             ZeroMemory(&rwpBookmarks[rwpBookmarkCount], sizeof(rwpBookmarks[0]));
+            rwp_bookmark_indicators_refresh(hEditorWnd);
             rwpRichFormattingChanged = TRUE;
             SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
         }
@@ -19383,7 +19744,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+Shift+V = Incolla senza formattazione\r\n"
             L"Ctrl+D = Incolla senza formattazione\r\n"
             L"Ctrl+A = Seleziona tutto\r\n"
-            L"Ctrl+F = Trova\r\n"
+            L"Ctrl+F = Trova (predefinito; configurabile)\r\n"
             L"F3 = Trova successivo\r\n"
             L"Ctrl+H = Cerca e sostituisci\r\n"
             L"Ctrl+K = Inserisci link\r\n"
@@ -19412,7 +19773,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Ctrl+Shift+V = Paste without formatting\r\n"
             L"Ctrl+D = Paste without formatting\r\n"
             L"Ctrl+A = Select all\r\n"
-            L"Ctrl+F = Find\r\n"
+            L"Ctrl+F = Search (default; configurable)\r\n"
             L"F3 = Find next\r\n"
             L"Ctrl+H = Find and replace\r\n"
             L"Ctrl+K = Insert link\r\n"
@@ -19477,6 +19838,7 @@ static const struct
 {
     {0, L"Unassigned", L"Non assegnato"},
     {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
+    {ID_FIND, L"Search", L"Cerca"},
     {ID_SHORTCUT_SPACING_SINGLE, L"Line spacing: Single", L"Interlinea: Singola"},
     {ID_SHORTCUT_SPACING_DOUBLE, L"Line spacing: Double", L"Interlinea: Doppia"},
     {ID_SHORTCUT_SPACING_ONE_HALF, L"Line spacing: 1.5 lines", L"Interlinea: 1,5 righe"},
@@ -19526,14 +19888,15 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
-/* Version 5 makes the native Ctrl+1/2/5 line-spacing defaults editable.
- * Versions 3 and 4 recorded Alt+W and Ctrl+J, respectively. A shortcut
- * explicitly removed in its own version stays removed. */
+/* Version 6 makes Ctrl+F configurable; version 5 made native line spacing
+ * configurable. Versions 3 and 4 recorded Alt+W and Ctrl+J, respectively.
+ * A shortcut explicitly removed in its own version stays removed. */
 #define RWP_SHORTCUT_TEXT_MAX 512
 #define RWP_SHORTCUT_BLOB_MAGIC_V2 0x32535752UL /* RWS2 */
 #define RWP_SHORTCUT_BLOB_MAGIC_V3 0x33535752UL /* RWS3 */
 #define RWP_SHORTCUT_BLOB_MAGIC_V4 0x34535752UL /* RWS4 */
-#define RWP_SHORTCUT_BLOB_MAGIC 0x35535752UL /* RWS5 */
+#define RWP_SHORTCUT_BLOB_MAGIC_V5 0x35535752UL /* RWS5 */
+#define RWP_SHORTCUT_BLOB_MAGIC 0x36535752UL /* RWS6 */
 typedef struct
 {
     DWORD magic;
@@ -19623,6 +19986,7 @@ static BOOL rwp_default_shortcut_assignments(
     bindings->keys[RWP_SHORTCUT_ALT]['A'] = ID_INSERT_TEXT;
     bindings->keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
     bindings->keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
+    bindings->keys[RWP_SHORTCUT_CONTROL]['F'] = ID_FIND;
     rwp_add_number_shortcut_defaults(bindings);
     return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
 }
@@ -19781,6 +20145,7 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         goto done;
     memcpy(&header, buffer, sizeof(header));
     if ((header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V5 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V4 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V3 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V2) ||
@@ -19850,8 +20215,13 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] &&
         !rwp_shortcut_key_in_use('J', RWP_SHORTCUT_CONTROL))
         rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
-    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC)
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        header.magic != RWP_SHORTCUT_BLOB_MAGIC_V5)
         rwp_add_number_shortcut_defaults(&rwpShortcutCommands);
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] &&
+        !rwp_shortcut_key_in_use('F', RWP_SHORTCUT_CONTROL))
+        rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] = ID_FIND;
     valid = TRUE;
 done:
     if (!valid)
@@ -19974,15 +20344,19 @@ static UINT rwp_shortcut_chord_from_message(const MSG *message)
 static BOOL rwp_dispatch_shortcut_key(const MSG *message)
 {
     UINT chord, action;
-    if (message->hwnd != hEditorWnd) return FALSE;
+    if (!hEditorWnd) return FALSE;
     chord = rwp_shortcut_chord_from_message(message);
     if (!chord) return FALSE;
     action = rwpShortcutCommands.keys[HIWORD(chord)][LOWORD(chord)];
-    /* An explicitly unassigned number chord must not fall through to
-     * RichEdit's built-in line-spacing command. */
+    if (message->hwnd != hEditorWnd &&
+        (action != ID_FIND ||
+         (message->hwnd != hMainWnd && !IsChild(hMainWnd, message->hwnd))))
+        return FALSE;
+    /* Explicitly unassigned former defaults must not fall through to
+     * native RichEdit commands. */
     if (!action)
         return HIWORD(chord) == RWP_SHORTCUT_CONTROL &&
-               (LOWORD(chord) == 'J' ||
+               (LOWORD(chord) == 'J' || LOWORD(chord) == 'F' ||
                 (LOWORD(chord) >= '1' && LOWORD(chord) <= '9'));
     if (rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
         return FALSE;
@@ -20093,6 +20467,51 @@ static void rwp_format_shortcut_chord(UINT chord, WCHAR *label)
               (modifiers & RWP_SHORTCUT_CONTROL) ? L"Ctrl+" : L"",
               (modifiers & RWP_SHORTCUT_ALT) ? L"Alt+" : L"",
               (modifiers & RWP_SHORTCUT_SHIFT) ? L"Shift+" : L"", name);
+}
+
+/* Update the existing localized Find label without losing its mnemonic or
+ * leaving Ctrl+F advertised after reassignment. Show one configured chord,
+ * preferring the original default if it is still assigned to Search. */
+static void rwp_refresh_search_shortcut_label(void)
+{
+    UINT modifiers, key, chord = 0;
+    int i;
+    if (!rwpMainMenu) return;
+    if (rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] == ID_FIND)
+        chord = MAKELONG('F', RWP_SHORTCUT_CONTROL);
+    for (modifiers = 0; !chord && modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
+        for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
+            if (rwpShortcutCommands.keys[modifiers][key] == ID_FIND)
+            {
+                chord = MAKELONG(key, modifiers);
+                break;
+            }
+    for (i = 0; i < GetMenuItemCount(rwpMainMenu); ++i)
+    {
+        HMENU menu = GetSubMenu(rwpMainMenu, i);
+        WCHAR label[256], shortcut[64], *tab;
+        MENUITEMINFOW item;
+        int length;
+        if (!menu || !GetMenuStringW(menu, ID_FIND, label,
+                                     sizeof(label) / sizeof(label[0]), MF_BYCOMMAND))
+            continue;
+        tab = wcschr(label, L'\t');
+        if (tab) *tab = 0;
+        length = lstrlenW(label);
+        if (chord && length < (int)(sizeof(label) / sizeof(label[0])) - 1)
+        {
+            rwp_format_shortcut_chord(chord, shortcut);
+            label[length++] = L'\t';
+            lstrcpynW(label + length, shortcut,
+                       (int)(sizeof(label) / sizeof(label[0])) - length);
+        }
+        ZeroMemory(&item, sizeof(item));
+        item.cbSize = sizeof(item);
+        item.fMask = MIIM_STRING;
+        item.dwTypeData = label;
+        SetMenuItemInfoW(menu, ID_FIND, FALSE, &item);
+        break;
+    }
 }
 
 static void rwp_select_shortcut_list_row(HWND dialog)
@@ -20457,6 +20876,7 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
                     return TRUE;
                 }
                 rwpShortcutCommands = rwpShortcutDraft;
+                rwp_refresh_search_shortcut_label();
                 rwp_clear_shortcut_texts(rwpShortcutText);
                 memcpy(rwpShortcutText, rwpShortcutDraftText, sizeof(rwpShortcutText));
                 ZeroMemory(rwpShortcutDraftText, sizeof(rwpShortcutDraftText));
@@ -20740,7 +21160,7 @@ static void rwp_save_highlight_visibility(void)
     }
 }
 
-/* Both top-right indicators are enabled on first run; unlike the document's
+/* View indicators are enabled on first run; unlike the document's
  * content, their View-menu state is a per-user application preference. */
 static void rwp_load_header_visibility(void)
 {
@@ -20758,6 +21178,11 @@ static void rwp_load_header_visibility(void)
                          (LPBYTE)&value, &size) == ERROR_SUCCESS &&
         type == REG_DWORD && size == sizeof(value))
         rwpHeaderCharactersVisible = value != 0;
+    size = sizeof(value);
+    if (RegQueryValueExW(key, L"BookmarkIndicatorsVisible", NULL, &type,
+                         (LPBYTE)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value))
+        rwpBookmarkIndicatorsVisible = value != 0;
     RegCloseKey(key);
 }
 
@@ -20766,6 +21191,7 @@ static void rwp_save_header_visibility(void)
     HKEY key;
     DWORD date = rwpHeaderDateVisible ? 1 : 0;
     DWORD characters = rwpHeaderCharactersVisible ? 1 : 0;
+    DWORD bookmarks = rwpBookmarkIndicatorsVisible ? 1 : 0;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, rwp_backup_registry_key(),
                         0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
                         NULL, &key, NULL) != ERROR_SUCCESS) return;
@@ -20773,6 +21199,8 @@ static void rwp_save_header_visibility(void)
                    (const BYTE *)&date, sizeof(date));
     RegSetValueExW(key, L"HeaderCharactersVisible", 0, REG_DWORD,
                    (const BYTE *)&characters, sizeof(characters));
+    RegSetValueExW(key, L"BookmarkIndicatorsVisible", 0, REG_DWORD,
+                   (const BYTE *)&bookmarks, sizeof(bookmarks));
     RegCloseKey(key);
 }
 
@@ -20968,10 +21396,21 @@ static LRESULT OnCreate( HWND hWnd )
         PostQuitMessage(1);
     }
 
+    rwpEditorHost = rwp_create_editor_host(hWnd, hInstance);
     hEditorWnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", NULL,
       WS_CHILD|WS_VISIBLE|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
       |ES_WANTRETURN|WS_VSCROLL|ES_NOHIDESEL|WS_HSCROLL,
-      0, 0, 1000, 100, hWnd, (HMENU)IDC_EDITOR, hInstance, NULL);
+      0, 0, 1000, 100, rwpEditorHost ? rwpEditorHost : hWnd,
+      (HMENU)IDC_EDITOR, hInstance, NULL);
+    if (!hEditorWnd && rwpEditorHost)
+    {
+        DestroyWindow(rwpEditorHost);
+        rwpEditorHost = NULL;
+        hEditorWnd = CreateWindowExW(WS_EX_CLIENTEDGE, L"RICHEDIT50W", NULL,
+          WS_CHILD|WS_VISIBLE|ES_SELECTIONBAR|ES_MULTILINE|ES_AUTOVSCROLL
+          |ES_WANTRETURN|WS_VSCROLL|ES_NOHIDESEL|WS_HSCROLL,
+          0, 0, 1000, 100, hWnd, (HMENU)IDC_EDITOR, hInstance, NULL);
+    }
 
     if (!hEditorWnd)
     {
@@ -21005,7 +21444,7 @@ static LRESULT OnCreate( HWND hWnd )
      * still needs a Windows runtime test. */
     SendMessageW(hEditorWnd, EM_SETEDITSTYLEEX, 0, SES_EX_HANDLEFRIENDLYURL);
     SendMessageW(hEditorWnd, EM_AUTOURLDETECT, FALSE, 0);
-    SendMessageW(hEditorWnd, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE | ENM_LINK);
+    SendMessageW(hEditorWnd, EM_SETEVENTMASK, 0, ENM_SELCHANGE | ENM_CHANGE | ENM_LINK | ENM_SCROLL);
 
     rwp_header_refresh_character_count();
     rwp_statusbar_update_editor_position();
@@ -21043,7 +21482,7 @@ static LRESULT OnCreate( HWND hWnd )
 
 static LRESULT OnUser( HWND hWnd )
 {
-    HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
+    HWND hwndEditor = rwp_get_editor_window(hWnd);
     HWND hwndReBar = GetDlgItem(hWnd, IDC_REBAR);
     HWND hwndToolBar = GetDlgItem(hwndReBar, IDC_TOOLBAR);
     HWND hwndFormatBar = GetDlgItem(hwndReBar, IDC_FORMATBAR);
@@ -21176,7 +21615,7 @@ static INT_PTR CALLBACK rwp_bookmark_missing_proc(HWND dialog, UINT message,
 
 static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
 {
-    HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
+    HWND hwndEditor = rwp_get_editor_window(hWnd);
     HWND hwndReBar = GetDlgItem(hWnd, IDC_REBAR);
     NMHDR *pHdr = (NMHDR *)lParam;
     /* A rebar row reflow can happen without a WM_SIZE on the main window. */
@@ -21282,6 +21721,7 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
 
     if (pHdr->code == EN_SELCHANGE)
     {
+        rwp_bookmark_indicators_refresh(hwndEditor);
         if (rwpSearchBatchActive) return 1;
         update_font_list();
         rwp_statusbar_update_editor_position();
@@ -26055,12 +26495,50 @@ static BOOL rwp_attachment_extract_rtf(const BYTE *buffer, SIZE_T length,
     return TRUE;
 }
 
+static BOOL rwp_attachment_maybe_at(HWND editor, LONG cp)
+{
+    ITextRange *range;
+    LONG ch = 0;
+    HRESULT hr;
+    if (cp < 0) return FALSE;
+    if (editor != hEditorWnd) return TRUE;
+    range = rwp_bookmark_capture_range(cp, cp + 1);
+    if (!range) return TRUE;
+    hr = range->lpVtbl->GetChar(range, &ch);
+    range->lpVtbl->Release(range);
+    /* RichEdit uses U+FFFC for both inline pictures and embedded objects.
+     * Unknown character data must fall back to the existing RTF inspection. */
+    return hr != S_OK || ch == 0xFFFC;
+}
+
+static ITextDocument *rwp_attachment_freeze(HWND editor)
+{
+    static const IID documentIID = {0x8CC497C0, 0xA1DF, 0x11CE,
+        {0x80,0x98,0x00,0xAA,0x00,0x47,0xBE,0x5D}};
+    IRichEditOle *ole = NULL;
+    ITextDocument *document = NULL;
+    LONG count = 0;
+    HRESULT hr;
+    if (!SendMessageW(editor, EM_GETOLEINTERFACE, 0, (LPARAM)&ole) || !ole)
+        return NULL;
+    hr = ole->lpVtbl->QueryInterface(ole, &documentIID, (void **)&document);
+    ole->lpVtbl->Release(ole);
+    if (FAILED(hr) || !document) return NULL;
+    if (document->lpVtbl->Freeze(document, &count) != S_OK)
+    {
+        document->lpVtbl->Release(document);
+        return NULL;
+    }
+    return document;
+}
+
 static BOOL rwp_attachment_read_at(HWND editor, LONG cp,
                                   RWP_ATTACHMENT_BYTES *attachment)
 {
     CHARRANGE oldRange, probeRange;
     POINT originalScroll, currentScroll;
-    BOOL haveScroll;
+    BOOL haveScroll, redrawSuspended;
+    ITextDocument *frozen = NULL;
     RTF_MEMORY rtf;
     EDITSTREAM stream;
     BOOL found = FALSE;
@@ -26075,13 +26553,16 @@ static BOOL rwp_attachment_read_at(HWND editor, LONG cp,
     if (cp >= textLength) return FALSE;
     ZeroMemory(&rtf, sizeof(rtf));
     ZeroMemory(&stream, sizeof(stream));
-    /* Inspecting a clicked attachment must not scroll a long selection to
-     * its far endpoint when EM_EXSETSEL restores the original range. */
+    /* Restoring a selection outside the viewport can scroll to its endpoint.
+     * Keep the intermediate selection and scroll changes off-screen. */
     haveScroll = !!SendMessageW(editor, EM_GETSCROLLPOS, 0,
                                  (LPARAM)&originalScroll);
     SendMessageW(editor, EM_EXGETSEL, 0, (LPARAM)&oldRange);
     probeRange.cpMin = cp;
     probeRange.cpMax = cp + 1;
+    frozen = rwp_attachment_freeze(editor);
+    redrawSuspended = !frozen && IsWindowVisible(editor);
+    if (redrawSuspended) SendMessageW(editor, WM_SETREDRAW, FALSE, 0);
     SendMessageW(editor, EM_EXSETSEL, 0, (LPARAM)&probeRange);
     stream.dwCookie = (DWORD_PTR)&rtf;
     stream.pfnCallback = stream_out_memory;
@@ -26092,6 +26573,18 @@ static BOOL rwp_attachment_read_at(HWND editor, LONG cp,
         (currentScroll.x != originalScroll.x ||
          currentScroll.y != originalScroll.y))
         SendMessageW(editor, EM_SETSCROLLPOS, 0, (LPARAM)&originalScroll);
+    if (frozen)
+    {
+        LONG count;
+        frozen->lpVtbl->Unfreeze(frozen, &count);
+        frozen->lpVtbl->Release(frozen);
+    }
+    if (redrawSuspended)
+    {
+        SendMessageW(editor, WM_SETREDRAW, TRUE, 0);
+        /* Compatibility fallback only; native TOM normally handles repaint. */
+        InvalidateRect(editor, NULL, FALSE);
+    }
     if (stream.dwError || rtf.failed || !rtf.data) goto done;
     /* stream_out_memory does not NUL-terminate its buffer. */
     {
@@ -26130,9 +26623,11 @@ BOOL rwp_prepare_attachment_export_context(HWND editor, LONG cp,
             ole->lpVtbl->Release(ole);
         }
     }
-    if (cp >= 0 && rwp_attachment_read_at(editor, cp, &sample))
+    if (cp >= 0 && (index >= 0 || rwp_attachment_maybe_at(editor, cp)) &&
+        rwp_attachment_read_at(editor, cp, &sample))
         rwpExportAttachmentCp = cp;
     else if (index < 0 && cp > 0 &&
+             rwp_attachment_maybe_at(editor, cp - 1) &&
              rwp_attachment_read_at(editor, cp - 1, &sample))
         rwpExportAttachmentCp = cp - 1;
     else return FALSE;
@@ -29138,13 +29633,16 @@ static void rwp_apply_palette_text_color(HWND editor, UINT command)
 
 static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
 {
-    HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
+    HWND hwndEditor = rwp_get_editor_window(hWnd);
     static FINDREPLACEW findreplace;
 
     if ((HWND)lParam == hwndEditor)
     {
+        if (HIWORD(wParam) == EN_VSCROLL || HIWORD(wParam) == EN_HSCROLL)
+            rwp_bookmark_indicators_refresh(hwndEditor);
         if (HIWORD(wParam) == EN_CHANGE)
         {
+            rwp_bookmark_indicators_refresh(hwndEditor);
             ++rwpFindDocumentRevision;
             rwpMultiRowAlignmentKnown = FALSE;
             if (!backgroundUpdatingFontColor)
@@ -29891,6 +30389,13 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         update_window();
         break;
 
+    case ID_TOGGLE_BOOKMARK_INDICATORS:
+        rwpBookmarkIndicatorsVisible = !rwpBookmarkIndicatorsVisible;
+        rwp_save_header_visibility();
+        /* Erase previous footprints even when disabling the overlay. */
+        rwp_bookmark_indicators_refresh(hwndEditor);
+        break;
+
     case ID_TOGGLE_HEADER_DATE:
         rwpHeaderDateVisible = !rwpHeaderDateVisible;
         rwp_save_header_visibility();
@@ -30033,7 +30538,7 @@ static LRESULT OnInitPopupMenu( HWND hWnd, WPARAM wParam )
 {
     HMENU hMenu = (HMENU)wParam;
     decorate_color_menu(hMenu);
-    HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
+    HWND hwndEditor = rwp_get_editor_window(hWnd);
     HWND hwndStatus = GetDlgItem(hWnd, IDC_STATUSBAR);
     PARAFORMAT pf;
     int nAlignment = -1;
@@ -30088,6 +30593,8 @@ static LRESULT OnInitPopupMenu( HWND hWnd, WPARAM wParam )
     CheckMenuItem(hMenu, ID_TOGGLE_STATUSBAR, IsWindowVisible(hwndStatus) ?
             MF_CHECKED : MF_UNCHECKED);
 
+    CheckMenuItem(hMenu, ID_TOGGLE_BOOKMARK_INDICATORS,
+                  rwpBookmarkIndicatorsVisible ? MF_CHECKED : MF_UNCHECKED);
     CheckMenuItem(hMenu, ID_TOGGLE_HEADER_DATE,
                   rwpHeaderDateVisible ? MF_CHECKED : MF_UNCHECKED);
     CheckMenuItem(hMenu, ID_TOGGLE_HEADER_CHARACTERS,
@@ -30148,7 +30655,7 @@ static LRESULT OnSize( HWND hWnd, WPARAM wParam, LPARAM lParam )
 {
     int nStatusSize = 0;
     RECT rc;
-    HWND hwndEditor = GetDlgItem(hWnd, IDC_EDITOR);
+    HWND hwndEditor = rwp_get_editor_window(hWnd);
     HWND hwndStatusBar = GetDlgItem(hWnd, IDC_STATUSBAR);
     HWND hwndReBar = GetDlgItem(hWnd, IDC_REBAR);
     HWND hRulerWnd = GetDlgItem(hwndReBar, IDC_RULER);
@@ -30192,8 +30699,8 @@ static LRESULT OnSize( HWND hWnd, WPARAM wParam, LPARAM lParam )
     {
         editorHeight = clientHeight - nStatusSize - menuHeight - rebarHeight;
         if (editorHeight < 0) editorHeight = 0;
-        MoveWindow(hwndEditor, 0, menuHeight + rebarHeight,
-                   clientWidth, editorHeight, TRUE);
+        MoveWindow(rwpEditorHost ? rwpEditorHost : hwndEditor,
+                   0, menuHeight + rebarHeight, clientWidth, editorHeight, TRUE);
     }
 
     redraw_ruler(hRulerWnd);
@@ -30406,7 +30913,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_ACTIVATE:
         if (LOWORD(wParam))
         {
-            SetFocus(GetDlgItem(hWnd, IDC_EDITOR));
+            SetFocus(rwp_get_editor_window(hWnd));
             PostMessageW(hWnd, WM_USER, 0, 0);
         }
         return 0;
@@ -30527,6 +31034,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     }
     if (!rwpMainMenu) return 1;
     rwp_load_shortcut_assignments(hAccel);
+    rwp_refresh_search_shortcut_label();
     /* The View menu is found by a stable command, not by its translated name. */
     {
         const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
@@ -30574,6 +31082,10 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                                 ID_TOGGLE_HEADER_CHARACTERS,
                                 italian ? L"Contatore caratteri nell'intestazione" :
                                           L"Header character count");
+                    InsertMenuW(view, j + 3, MF_BYPOSITION | MF_STRING,
+                                ID_TOGGLE_BOOKMARK_INDICATORS,
+                                italian ? L"Mostra indicatori dei segnalibri" :
+                                          L"Show Bookmark Indicators");
                     break;
                 }
             break;
@@ -30912,7 +31424,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     rwp_startup_profile_mark("Initial window, toolbar and wrapping ready");
 
     hRulerWnd = GetDlgItem(GetDlgItem(hMainWnd, IDC_REBAR), IDC_RULER);
-    SendMessageW(GetDlgItem(hMainWnd, IDC_EDITOR), EM_POSFROMCHAR, (WPARAM)&EditPoint, 0);
+    SendMessageW(rwp_get_editor_window(hMainWnd), EM_POSFROMCHAR, (WPARAM)&EditPoint, 0);
     hPrevRulerProc = SetWindowLongPtrW(hRulerWnd, GWLP_WNDPROC, (UINT_PTR)ruler_proc);
     SendMessageW(hRulerWnd, WM_USER, (WPARAM)&EditPoint, hPrevRulerProc);
 
