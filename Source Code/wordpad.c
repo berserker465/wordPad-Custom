@@ -3685,14 +3685,124 @@ static BOOL link_has_prefix(LPCWSTR s, LPCWSTR prefix)
     return _wcsnicmp(s, prefix, lstrlenW(prefix)) == 0;
 }
 
-/* Restrict link activation to web and mail URLs, not executable/file schemes. */
+/* Local file links are stored as ASCII file:/// URIs in RTF, avoiding both
+ * field-instruction backslash ambiguity and non-ASCII RTF escaping. Accept
+ * imported absolute drive paths as well. No device paths, UNC shares or
+ * alternate data streams are interpreted as local file links. */
+static BOOL rwp_file_path_valid(LPCWSTR path, BOOL folder)
+{
+    SIZE_T i, n = lstrlenW(path);
+    if (n < 3 || !((path[0] >= L'A' && path[0] <= L'Z') ||
+                    (path[0] >= L'a' && path[0] <= L'z')) ||
+        path[1] != L':' || (path[2] != L'\\' && path[2] != L'/')) return FALSE;
+    if (!folder && (n == 3 || path[n-1] == L'\\' || path[n-1] == L'/')) return FALSE;
+    for (i = 3; i < n; ++i)
+        if (path[i] < 32 || wcschr(L"\"<>|?*:", path[i])) return FALSE;
+    return TRUE;
+}
+
+static int rwp_file_hex(WCHAR c)
+{
+    if (c >= L'0' && c <= L'9') return c - L'0';
+    if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+    if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+    return -1;
+}
+
+static BOOL rwp_file_target_path(LPCWSTR target, WCHAR *path, SIZE_T capacity)
+{
+    SIZE_T i, usedPath = 0;
+    if (link_has_prefix(target, L"file:///") || link_has_prefix(target, L"file://localhost/"))
+    {
+        char utf8[RWP_LINK_MAX_URL];
+        SIZE_T used = 0;
+        const WCHAR *p = target + (link_has_prefix(target, L"file:///") ? 8 : 17);
+        while (*p)
+        {
+            unsigned int c = *p++;
+            if (c == '%')
+            {
+                int high, low;
+                if (!p[0] || !p[1]) return FALSE;
+                high = rwp_file_hex(p[0]); low = rwp_file_hex(p[1]);
+                if (high < 0 || low < 0) return FALSE;
+                c = (unsigned int)(high * 16 + low);
+                p += 2;
+            }
+            else if (c > 127 || c == '#' || c == '?') return FALSE;
+            if (!c || used + 1 >= sizeof(utf8)) return FALSE;
+            utf8[used++] = (char)c;
+        }
+        utf8[used] = 0;
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1,
+                                 path, (int)capacity)) return FALSE;
+    }
+    else
+    {
+        if ((SIZE_T)lstrlenW(target) >= capacity) return FALSE;
+        lstrcpyW(path, target);
+    }
+    if (!rwp_file_path_valid(path, FALSE)) return FALSE;
+    for (i = 0; path[i]; ++i)
+    {
+        WCHAR c = path[i] == L'/' ? L'\\' : path[i];
+        if (c == L'\\' && usedPath > 2 && path[usedPath-1] == L'\\') continue;
+        path[usedPath++] = c;
+    }
+    path[usedPath] = 0;
+    return TRUE;
+}
+
+static BOOL rwp_file_path_uri(LPCWSTR path, WCHAR *uri, SIZE_T capacity)
+{
+    static const WCHAR hex[] = L"0123456789ABCDEF";
+    char utf8[RWP_LINK_MAX_URL * 3];
+    SIZE_T i, used = 8;
+    if (!rwp_file_path_valid(path, FALSE) || capacity <= used ||
+        !WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8), NULL, NULL))
+        return FALSE;
+    lstrcpyW(uri, L"file:///");
+    for (i = 0; utf8[i]; ++i)
+    {
+        unsigned char c = (unsigned char)utf8[i];
+        if (c == '\\') c = '/';
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+            c == '~' || c == '/' || (i == 1 && c == ':'))
+        {
+            if (used + 1 >= capacity) return FALSE;
+            uri[used++] = (WCHAR)c;
+        }
+        else
+        {
+            if (used + 3 >= capacity) return FALSE;
+            uri[used++] = L'%'; uri[used++] = hex[c >> 4]; uri[used++] = hex[c & 15];
+        }
+    }
+    uri[used] = 0;
+    return TRUE;
+}
+
+static BOOL rwp_file_link_exists(LPCWSTR path)
+{
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL rwp_file_link_target(LPCWSTR target)
+{
+    WCHAR path[RWP_LINK_MAX_URL];
+    return rwp_file_target_path(target, path, RWP_LINK_MAX_URL);
+}
+
+/* Only supported web, mail and absolute local file destinations. */
 static BOOL link_valid_url(LPCWSTR url)
 {
     const WCHAR *p;
     if (link_has_prefix(url, L"https://") && url[8]) p = url + 8;
     else if (link_has_prefix(url, L"http://") && url[7]) p = url + 7;
     else if (link_has_prefix(url, L"mailto:") && url[7]) p = url + 7;
-    else return FALSE;
+    else return rwp_file_link_target(url);
     for (; *p; ++p)
         if (*p <= 32 || *p == '"' || *p == '<' || *p == '>') return FALSE;
     return TRUE;
@@ -3839,6 +3949,12 @@ static BOOL rwp_decode_context_link_url(LPCWSTR encoded, WCHAR *url,
     {
         ++first;
         --last;
+    }
+    if (last - first < capacity)
+    {
+        memcpy(url, encoded + first, (last - first) * sizeof(WCHAR));
+        url[last - first] = 0;
+        if (rwp_file_link_target(url)) return TRUE;
     }
 
     for (i = first; i < last; ++i)
@@ -6050,6 +6166,12 @@ static BOOL extract_url_from_rtf(const char *rtf, WCHAR *target, SIZE_T count)
                                       (link_valid_url(target) ||
                                        (target[0] == L'#' &&
                                         rwp_bookmark_valid_name(target+1))))) return TRUE;
+        if (*q == '"' && !internal && count <= RWP_LINK_MAX_URL)
+        {
+            WCHAR decoded[RWP_LINK_MAX_URL];
+            if (rwp_decode_context_link_url(target, decoded, count) && rwp_file_link_target(decoded))
+            { lstrcpyW(target, decoded); return TRUE; }
+        }
         p += 9;
     }
     return FALSE;
@@ -6080,6 +6202,13 @@ static BOOL find_hyperlink_target(const CHARRANGE *range, WCHAR *target, SIZE_T 
                  (direct[0] == L'#' && rwp_bookmark_valid_name(direct + 1))))
             {
                 lstrcpyW(target, direct);
+                SysFreeString(direct);
+                ((IUnknown *)range2)->lpVtbl->Release((IUnknown *)range2);
+                return TRUE;
+            }
+            if (direct && rwp_decode_context_link_url(direct, target, count) &&
+                rwp_file_link_target(target))
+            {
                 SysFreeString(direct);
                 ((IUnknown *)range2)->lpVtbl->Release((IUnknown *)range2);
                 return TRUE;
@@ -6118,20 +6247,57 @@ static BOOL find_hyperlink_target(const CHARRANGE *range, WCHAR *target, SIZE_T 
     return found;
 }
 
-static void rwp_link_dialog_switch_mode(HWND hwnd, BOOL bookmark)
+enum { RWP_LINK_WEB, RWP_LINK_BOOKMARK, RWP_LINK_FILE };
+
+static void rwp_link_dialog_switch_mode(HWND hwnd, int mode)
 {
     const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
-    CheckRadioButton(hwnd, IDC_LINK_KIND_URL, IDC_LINK_KIND_BOOKMARK,
-                     bookmark ? IDC_LINK_KIND_BOOKMARK : IDC_LINK_KIND_URL);
-    /* Native check-state changes do not always invalidate custom radio faces. */
+    BOOL bookmark = mode == RWP_LINK_BOOKMARK, file = mode == RWP_LINK_FILE;
+    /* The resource IDs are not contiguous; explicitly update all radios. */
+    CheckDlgButton(hwnd, IDC_LINK_KIND_URL, mode == RWP_LINK_WEB ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_LINK_KIND_BOOKMARK, bookmark ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(hwnd, IDC_LINK_KIND_FILE, file ? BST_CHECKED : BST_UNCHECKED);
     InvalidateRect(GetDlgItem(hwnd, IDC_LINK_KIND_URL), NULL, FALSE);
     InvalidateRect(GetDlgItem(hwnd, IDC_LINK_KIND_BOOKMARK), NULL, FALSE);
+    InvalidateRect(GetDlgItem(hwnd, IDC_LINK_KIND_FILE), NULL, FALSE);
     ShowWindow(GetDlgItem(hwnd, IDC_LINK_URL), bookmark ? SW_HIDE : SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_LINK_USE_SOURCE), bookmark ? SW_HIDE : SW_SHOW);
     ShowWindow(GetDlgItem(hwnd, IDC_LINK_BOOKMARK), bookmark ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd, IDC_LINK_BROWSE), file ? SW_SHOW : SW_HIDE);
+    SendDlgItemMessageW(hwnd, IDC_LINK_URL, EM_LIMITTEXT,
+        file || GetWindowLongPtrW(hwnd, DWLP_USER) ? RWP_LINK_MAX_URL - 1 : RWP_LINK_MAX_URL - 12, 0);
+    {
+        RECT bounds = {10, 105, file ? 267 : 338, 122};
+        MapDialogRect(hwnd, &bounds);
+        SetWindowPos(GetDlgItem(hwnd, IDC_LINK_URL), NULL, bounds.left, bounds.top,
+            bounds.right - bounds.left, bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     SetDlgItemTextW(hwnd, IDC_LINK_TARGET_LABEL,
         bookmark ? (italian ? L"Segnalibro di destinazione:" : L"Target bookmark:") :
-                   (italian ? L"Indirizzo (URL):" : L"Address (URL):"));
+        file ? (italian ? L"Percorso file locale:" : L"Local file path:") :
+               (italian ? L"Indirizzo (URL):" : L"Address (URL):"));
+}
+
+static void rwp_link_browse_file(HWND hwnd)
+{
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    WCHAR path[RWP_LINK_MAX_URL] = L"", uri[RWP_LINK_MAX_URL];
+    OPENFILENAMEW dialog = {0};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = italian ? L"Tutti i file (*.*)\0*.*\0\0" : L"All files (*.*)\0*.*\0\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = RWP_LINK_MAX_URL;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
+                   OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&dialog)) return;
+    if (!rwp_file_path_uri(path, uri, RWP_LINK_MAX_URL))
+    {
+        MessageBoxW(hwnd, italian ? L"Percorso non supportato o troppo lungo." :
+            L"Unsupported or too long local file path.", L"Link", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    SetDlgItemTextW(hwnd, IDC_LINK_URL, path);
 }
 
 static BOOL rwp_replace_link(const RWP_LINKDIALOG *state, LPCWSTR text, LPCWSTR url);
@@ -6150,8 +6316,12 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
     {
         case WM_INITDIALOG:
         {
-            int i;
+            int i, mode;
+            WCHAR filePath[RWP_LINK_MAX_URL];
             state = (RWP_LINKDIALOG *)lParam;
+            mode = state->editing && rwp_file_target_path(state->target, filePath, RWP_LINK_MAX_URL) ?
+                RWP_LINK_FILE : state->preferBookmark && (state->editing || rwpBookmarkCount > 0) ?
+                RWP_LINK_BOOKMARK : RWP_LINK_WEB;
             if (state->editing) SetWindowLongPtrW(hwnd, DWLP_USER, (LONG_PTR)state);
             rwp_theme_dialog(hwnd);
             if (italian)
@@ -6160,7 +6330,9 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 SetDlgItemTextW(hwnd, IDC_LINK_TEXT_LABEL, L"Testo da visualizzare:");
                 SetDlgItemTextW(hwnd, IDC_LINK_KIND_LABEL, L"Destinazione collegamento");
                 SetDlgItemTextW(hwnd, IDC_LINK_KIND_URL, L"Indirizzo web / email");
-                SetDlgItemTextW(hwnd, IDC_LINK_KIND_BOOKMARK, L"Segnalibro del documento");
+                SetDlgItemTextW(hwnd, IDC_LINK_KIND_BOOKMARK, L"Segnalibro documento");
+                SetDlgItemTextW(hwnd, IDC_LINK_KIND_FILE, L"File locale");
+                SetDlgItemTextW(hwnd, IDC_LINK_BROWSE, L"Sfoglia...");
                 SetDlgItemTextW(hwnd, IDC_LINK_USE_SOURCE, L"Usa testo sorgente");
                 SetDlgItemTextW(hwnd, IDOK, L"Aggiungi");
                 SetDlgItemTextW(hwnd, IDCANCEL, L"Annulla");
@@ -6169,13 +6341,14 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
             {
                 SetWindowTextW(hwnd, italian ? L"Modifica collegamento" : L"Edit link");
                 SetDlgItemTextW(hwnd, IDOK, italian ? L"Salva" : L"Save");
-                if (!state->preferBookmark) SetDlgItemTextW(hwnd, IDC_LINK_URL, state->target);
+                if (!state->preferBookmark) SetDlgItemTextW(hwnd, IDC_LINK_URL,
+                    mode == RWP_LINK_FILE ? filePath : state->target);
             }
             SetDlgItemTextW(hwnd, IDC_LINK_TEXT, state->name);
             SendDlgItemMessageW(hwnd, IDC_LINK_TEXT, EM_LIMITTEXT,
                                 RWP_LINK_MAX_NAME - 1, 0);
             SendDlgItemMessageW(hwnd, IDC_LINK_URL, EM_LIMITTEXT,
-                                state->editing ? RWP_LINK_MAX_URL - 1 : RWP_LINK_MAX_URL - 12, 0);
+                                RWP_LINK_MAX_URL - 1, 0);
             SendDlgItemMessageW(hwnd, IDC_LINK_BOOKMARK, CB_LIMITTEXT,
                                 RWP_BOOKMARK_NAME_LIMIT, 0);
             for (i = 0; i < rwpBookmarkCount; ++i)
@@ -6201,13 +6374,12 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                               rwp_bulk_radio_subclass, 1, 0);
             SetWindowSubclass(GetDlgItem(hwnd, IDC_LINK_KIND_BOOKMARK),
                               rwp_bulk_radio_subclass, 1, 0);
+            SetWindowSubclass(GetDlgItem(hwnd, IDC_LINK_KIND_FILE),
+                              rwp_bulk_radio_subclass, 1, 0);
             if (state->editing && state->preferBookmark)
                 SetDlgItemTextW(hwnd, IDC_LINK_BOOKMARK, state->target + 1);
-            rwp_link_dialog_switch_mode(hwnd,
-                state->preferBookmark && (state->editing || rwpBookmarkCount > 0));
-            SetFocus(GetDlgItem(hwnd,
-                state->preferBookmark && (state->editing || rwpBookmarkCount > 0) ?
-                    IDC_LINK_BOOKMARK : IDC_LINK_URL));
+            rwp_link_dialog_switch_mode(hwnd, mode);
+            SetFocus(GetDlgItem(hwnd, mode == RWP_LINK_BOOKMARK ? IDC_LINK_BOOKMARK : IDC_LINK_URL));
             rwp_remember_dialog_position(hwnd, IDD_LINK_UNIFIED);
             return FALSE;
         }
@@ -6228,6 +6400,16 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 rwp_link_dialog_switch_mode(hwnd, TRUE);
                 return TRUE;
             }
+            if (LOWORD(wParam) == IDC_LINK_KIND_FILE && HIWORD(wParam) == BN_CLICKED)
+            {
+                rwp_link_dialog_switch_mode(hwnd, RWP_LINK_FILE);
+                return TRUE;
+            }
+            if (LOWORD(wParam) == IDC_LINK_BROWSE && HIWORD(wParam) == BN_CLICKED)
+            {
+                rwp_link_browse_file(hwnd);
+                return TRUE;
+            }
             if (LOWORD(wParam) == IDCANCEL)
             {
                 rwp_close_link_dialog(hwnd, state != NULL);
@@ -6240,6 +6422,7 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                 WCHAR url[RWP_LINK_MAX_URL];
                 BOOL useSource = LOWORD(wParam) == IDC_LINK_USE_SOURCE;
                 BOOL bookmark = IsDlgButtonChecked(hwnd, IDC_LINK_KIND_BOOKMARK) == BST_CHECKED;
+                BOOL file = IsDlgButtonChecked(hwnd, IDC_LINK_KIND_FILE) == BST_CHECKED;
                 if (!hEditorWnd || fileFormat != SF_RTF ||
                     (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
                 {
@@ -6285,7 +6468,29 @@ static INT_PTR CALLBACK hyperlink_dialog_proc(HWND hwnd, UINT msg, WPARAM wParam
                     }
                     else
                         GetDlgItemTextW(hwnd, IDC_LINK_URL, input, RWP_LINK_MAX_URL);
-                    if (state && !lstrcmpW(input, state->target)) lstrcpyW(url, input);
+                    if (file || rwp_file_link_target(input))
+                    {
+                        WCHAR path[RWP_LINK_MAX_URL];
+                        if (!rwp_file_target_path(input, path, RWP_LINK_MAX_URL) ||
+                            !rwp_file_path_uri(path, url, RWP_LINK_MAX_URL))
+                        {
+                            MessageBoxW(hwnd, italian ? L"Inserisci un percorso assoluto di un file locale." :
+                                L"Enter an absolute local file path (for example C:\\Documents\\Text.txt).",
+                                L"Link", MB_OK | MB_ICONWARNING);
+                            return TRUE;
+                        }
+                        if (!text[0])
+                        {
+                            if (lstrlenW(path) >= RWP_LINK_MAX_NAME)
+                            {
+                                MessageBoxW(hwnd, italian ? L"Inserisci un testo da visualizzare piu' breve." :
+                                    L"Enter a shorter display label for this file.", L"Link", MB_OK | MB_ICONWARNING);
+                                return TRUE;
+                            }
+                            lstrcpyW(text, path);
+                        }
+                    }
+                    else if (state && !lstrcmpW(input, state->target)) lstrcpyW(url, input);
                     else if (!normalize_link_url(input, url, RWP_LINK_MAX_URL))
                     {
                         MessageBoxW(hwnd, italian ?
@@ -8839,6 +9044,376 @@ done:
     if (bookmarked.data) HeapFree(GetProcessHeap(), 0, bookmarked.data);
     if (source.data) HeapFree(GetProcessHeap(), 0, source.data);
     return changed;
+}
+
+/* Parse only the quoted destination of a HYPERLINK instruction. The offsets
+ * refer to the actual RTF bytes, so a replacement leaves the result/label,
+ * formatting, field switches and all surrounding document content intact. */
+typedef struct RWP_FILE_FIELD
+{
+    SIZE_T end, targetAt, targetLength;
+    WCHAR path[RWP_LINK_MAX_URL];
+} RWP_FILE_FIELD;
+
+static BOOL rwp_file_parse_instruction(const BYTE *rtf, SIZE_T begin,
+                                       SIZE_T end, RWP_FILE_FIELD *field)
+{
+    SIZE_T i = begin, p, start, used = 0;
+    WCHAR target[RWP_LINK_MAX_URL], decoded[RWP_LINK_MAX_URL];
+    /* RichEdit may surround its instruction with one or more groups. */
+    while (i < end && (rtf[i] == ' ' || rtf[i] == '\r' || rtf[i] == '\n' ||
+                       rtf[i] == '\t' || rtf[i] == '{')) ++i;
+    if (end - i < 10 || _strnicmp((const char *)rtf + i, "HYPERLINK", 9)) return FALSE;
+    p = i + 9;
+    while (p < end && (rtf[p] == ' ' || rtf[p] == '\r' || rtf[p] == '\n' || rtf[p] == '\t')) ++p;
+    if (p >= end || rtf[p++] != '"') return FALSE; /* not a bookmark switch */
+    start = p;
+    while (p < end && rtf[p] != '"')
+    {
+        unsigned int c = rtf[p++];
+        if (c == '\r' || c == '\n') continue;
+        if (c == '\\')
+        {
+            if (p >= end) return FALSE;
+            if (rtf[p] == '\\' || rtf[p] == '{' || rtf[p] == '}') c = rtf[p++];
+            else if (rtf[p] == 'u')
+            {
+                unsigned int number = 0;
+                BOOL negative = FALSE;
+                int digits = 0;
+                ++p;
+                if (p < end && rtf[p] == '-') { negative = TRUE; ++p; }
+                while (p < end && rtf[p] >= '0' && rtf[p] <= '9' && digits < 5)
+                { number = number * 10 + rtf[p++] - '0'; ++digits; }
+                if (!digits || number > (negative ? 32768U : 65535U)) return FALSE;
+                c = (unsigned short)(negative ? 0U - number : number);
+                if (p < end && rtf[p] == ' ') ++p;
+                /* WordPad uses one fallback character for Unicode escapes. */
+                if (p >= end || rtf[p] != '?') return FALSE;
+                ++p;
+            }
+            else if (rtf[p] == '\'' && end - p >= 3)
+            {
+                int high = rwp_file_hex(rtf[p+1]), low = rwp_file_hex(rtf[p+2]);
+                char bytes[2]; WCHAR wide[2];
+                if (high < 0 || low < 0) return FALSE;
+                bytes[0] = (char)(high * 16 + low); bytes[1] = 0;
+                if (MultiByteToWideChar(CP_ACP, 0, bytes, 1, wide, 2) != 1) return FALSE;
+                c = wide[0]; p += 3;
+            }
+            else return FALSE;
+        }
+        else if (c == '{' || c == '}' || c > 127) return FALSE;
+        if (!c || used + 1 >= RWP_LINK_MAX_URL) return FALSE;
+        target[used++] = (WCHAR)c;
+    }
+    if (p >= end || rtf[p] != '"') return FALSE;
+    target[used] = 0;
+    if (!rwp_file_target_path(target, field->path, RWP_LINK_MAX_URL) &&
+        (!rwp_decode_context_link_url(target, decoded, RWP_LINK_MAX_URL) ||
+         !rwp_file_target_path(decoded, field->path, RWP_LINK_MAX_URL))) return FALSE;
+    field->targetAt = start;
+    field->targetLength = p - start;
+    return TRUE;
+}
+
+static BOOL rwp_file_next_field(const BYTE *rtf, SIZE_T size,
+                               SIZE_T *cursor, RWP_FILE_FIELD *field)
+{
+    static const char fieldPrefix[] = "{\\field";
+    static const char instPrefix[] = "{\\*\\fldinst";
+    static const char altPrefix[] = "{\\fldinst";
+    SIZE_T at = *cursor;
+    while (at < size)
+    {
+        if (rtf[at] == '{' && size - at > sizeof(fieldPrefix) - 1 &&
+            !memcmp(rtf + at, fieldPrefix, sizeof(fieldPrefix) - 1) &&
+            !isalpha((unsigned char)rtf[at + sizeof(fieldPrefix) - 1]))
+        {
+            SIZE_T finish = rtf_group_end((const char *)rtf, size, at);
+            SIZE_T child = at + sizeof(fieldPrefix) - 1;
+            if (finish && finish <= size)
+            {
+                while (child < finish - 1)
+                {
+                    SIZE_T groupEnd, instruction = 0;
+                    if (rtf[child] != '{')
+                    { child = rwp_recovery_step(rtf, finish - 1, child); continue; }
+                    groupEnd = rtf_group_end((const char *)rtf, size, child);
+                    if (!groupEnd || groupEnd > finish) break;
+                    if (groupEnd - child > sizeof(instPrefix) - 1 &&
+                        !memcmp(rtf + child, instPrefix, sizeof(instPrefix) - 1) &&
+                        !isalpha((unsigned char)rtf[child + sizeof(instPrefix) - 1]))
+                        instruction = child + sizeof(instPrefix) - 1;
+                    else if (groupEnd - child > sizeof(altPrefix) - 1 &&
+                        !memcmp(rtf + child, altPrefix, sizeof(altPrefix) - 1) &&
+                        !isalpha((unsigned char)rtf[child + sizeof(altPrefix) - 1]))
+                        instruction = child + sizeof(altPrefix) - 1;
+                    if (instruction && rwp_file_parse_instruction(rtf, instruction, groupEnd - 1, field))
+                    {
+                        field->end = finish;
+                        *cursor = finish;
+                        return TRUE;
+                    }
+                    child = groupEnd;
+                }
+                /* Skip complete non-file fields, including their instructions. */
+                at = finish;
+                continue;
+            }
+        }
+        at = rwp_recovery_step(rtf, size, at);
+    }
+    *cursor = size;
+    return FALSE;
+}
+
+static BOOL rwp_file_stream_document(RTF_MEMORY *source)
+{
+    EDITSTREAM stream = {0};
+    stream.dwCookie = (DWORD_PTR)source;
+    stream.pfnCallback = stream_out_memory;
+    SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
+    return !source->failed && !stream.dwError && source->data && source->used;
+}
+
+/* Folder prefixes are case-insensitive on ordinary Windows paths. Require
+ * the separator so Template never matches Templates or TemplateBackup. */
+static BOOL rwp_file_folder_prefix(WCHAR *folder)
+{
+    SIZE_T i, n = lstrlenW(folder);
+    if (!rwp_file_path_valid(folder, TRUE)) return FALSE;
+    for (i = 0; i < n; ++i) if (folder[i] == L'/') folder[i] = L'\\';
+    if (folder[n-1] != L'\\')
+    {
+        if (n + 1 >= RWP_LINK_MAX_URL) return FALSE;
+        folder[n++] = L'\\'; folder[n] = 0;
+    }
+    return TRUE;
+}
+
+static int rwp_file_patch_targets(const BYTE *rtf, SIZE_T size,
+                                  LPCWSTR oldFolder, LPCWSTR newFolder,
+                                  RTF_MEMORY *result)
+{
+    RWP_FILE_FIELD field;
+    SIZE_T cursor = 0, last = 0, oldLength = lstrlenW(oldFolder), newLength = lstrlenW(newFolder);
+    int count = 0;
+    LONG written;
+    WCHAR path[RWP_LINK_MAX_URL], uri[RWP_LINK_MAX_URL];
+    char encoded[RWP_LINK_MAX_URL * 12];
+    while (rwp_file_next_field(rtf, size, &cursor, &field))
+    {
+        SIZE_T suffix, length;
+        if (_wcsnicmp(field.path, oldFolder, oldLength)) continue;
+        suffix = lstrlenW(field.path + oldLength);
+        if (newLength + suffix >= RWP_LINK_MAX_URL) return -1;
+        lstrcpyW(path, newFolder);
+        lstrcatW(path, field.path + oldLength);
+        if (!rwp_file_path_uri(path, uri, RWP_LINK_MAX_URL)) return -1;
+        length = link_encode_rtf_url(uri, encoded);
+        if (field.targetAt < last || field.targetAt + field.targetLength > size) return -1;
+        if (stream_out_memory((DWORD_PTR)result, (LPBYTE)(rtf + last),
+                              (LONG)(field.targetAt - last), &written) ||
+            stream_out_memory((DWORD_PTR)result, (LPBYTE)encoded, (LONG)length, &written)) return -1;
+        last = field.targetAt + field.targetLength;
+        ++count;
+    }
+    if (count && stream_out_memory((DWORD_PTR)result, (LPBYTE)(rtf + last),
+                                    (LONG)(size - last), &written)) return -1;
+    return count;
+}
+
+static BOOL rwp_file_check_refresh(HWND dialog)
+{
+    RTF_MEMORY source = {0};
+    RWP_FILE_FIELD field;
+    SIZE_T cursor = 0;
+    unsigned int total = 0, missing = 0;
+    WCHAR summary[256];
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    HWND list = GetDlgItem(dialog, IDC_INTERNAL_LINK_LIST);
+    BOOL ok = rwp_file_stream_document(&source);
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    if (ok)
+    {
+        while (rwp_file_next_field(source.data, source.used, &cursor, &field))
+        {
+            ++total;
+            if (!rwp_file_link_exists(field.path))
+            {
+                ++missing;
+                if (SendMessageW(list, LB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)field.path) == LB_ERR &&
+                    SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)field.path) < 0)
+                { ok = FALSE; break; }
+            }
+        }
+    }
+    if (ok)
+        wsprintfW(summary, italian ? L"Collegamenti: %u  |  Validi: %u  |  Mancanti/inaccessibili: %u" :
+            L"File links: %u  |  Valid: %u  |  Missing/inaccessible: %u", total, total - missing, missing);
+    else
+    {
+        SendMessageW(list, LB_RESETCONTENT, 0, 0);
+        lstrcpyW(summary, italian ? L"Impossibile completare il controllo." : L"Could not complete the file-link check.");
+    }
+    SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_SUMMARY, summary);
+    /* Horizontal scrolling keeps long filenames readable without resizing. */
+    if (ok)
+    {
+        HDC dc = GetDC(list);
+        if (dc)
+        {
+            HFONT font = (HFONT)SendMessageW(list, WM_GETFONT, 0, 0);
+            HGDIOBJ old = font ? SelectObject(dc, font) : NULL;
+            int j, width = 0, n = (int)SendMessageW(list, LB_GETCOUNT, 0, 0);
+            for (j = 0; j < n; ++j)
+            {
+                SIZE pixels;
+                if (SendMessageW(list, LB_GETTEXT, j, (LPARAM)field.path) >= 0 &&
+                    GetTextExtentPoint32W(dc, field.path, lstrlenW(field.path), &pixels) && pixels.cx > width)
+                    width = pixels.cx;
+            }
+            if (old) SelectObject(dc, old);
+            ReleaseDC(list, dc);
+            SendMessageW(list, LB_SETHORIZONTALEXTENT, width + 20, 0);
+        }
+    }
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, NULL, TRUE);
+    EnableWindow(GetDlgItem(dialog, IDC_INTERNAL_LINK_REPLACE), ok && total &&
+        !(SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY));
+    if (source.data) HeapFree(GetProcessHeap(), 0, source.data);
+    return ok;
+}
+
+static int rwp_file_replace_locations(HWND dialog, LPCWSTR oldFolder, LPCWSTR newFolder)
+{
+    RTF_MEMORY source = {0}, rewritten = {0}, backup = {0};
+    RWP_LINKOUTPUT bookmarked = {0};
+    CHARRANGE selection;
+    int changed = -1;
+    WCHAR prompt[256];
+    COLORREF background = documentBackgroundColor;
+    BOOL customBackground = documentBackgroundColorKnown;
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    if (SendMessageW(hEditorWnd, EM_GETOPTIONS, 0, 0) & ECO_READONLY) return -1;
+    SendMessageW(hEditorWnd, EM_EXGETSEL, 0, (LPARAM)&selection);
+    if (!rwp_file_stream_document(&source)) goto done;
+    /* Check whether there are matches before the expensive lossless image and
+     * bookmark preservation steps. This pass never touches the editor. */
+    {
+        RWP_FILE_FIELD field;
+        SIZE_T cursor = 0, prefix = lstrlenW(oldFolder);
+        int matches = 0;
+        while (rwp_file_next_field(source.data, source.used, &cursor, &field))
+            if (!_wcsnicmp(field.path, oldFolder, prefix)) ++matches;
+        if (!matches) { changed = 0; goto done; }
+        wsprintfW(prompt, italian ? L"Aggiornare %d collegamenti ai file? La cronologia Annulla verra' azzerata. Continuare?" :
+            L"Update %d file links? The document's Undo history will be reset. Continue?", matches);
+        if (MessageBoxW(dialog, prompt, L"Link", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+        { changed = -2; goto done; }
+    }
+    rwp_bookmarks_prune_deleted();
+    if (!rwp_patch_rtf_with_original_images(&source)) goto done;
+    if (rwpBookmarkCount)
+    {
+        if (!rwp_bookmarks_patch_saved_rtf(source.data, source.used, &bookmarked, FALSE)) goto done;
+        backup.data = (BYTE *)bookmarked.data;
+        backup.used = bookmarked.used;
+    }
+    else { backup.data = source.data; backup.used = source.used; }
+    changed = rwp_file_patch_targets(backup.data, backup.used, oldFolder, newFolder, &rewritten);
+    if (changed <= 0) goto done;
+    if (!rwp_recovery_reload_rtf(&rewritten))
+    {
+        rwp_recovery_reload_rtf(&backup);
+        changed = -1;
+    }
+    if (customBackground) SendMessageW(hEditorWnd, EM_SETBKGNDCOLOR, 0, background);
+    else SendMessageW(hEditorWnd, EM_SETBKGNDCOLOR, 1, 0);
+    SendMessageW(hEditorWnd, EM_EXSETSEL, 0, (LPARAM)&selection);
+    rwpRichFormattingChanged = TRUE;
+    SendMessageW(hEditorWnd, EM_SETMODIFY, TRUE, 0);
+    PostMessageW(hMainWnd, WM_USER, 0, 0);
+done:
+    if (rewritten.data) HeapFree(GetProcessHeap(), 0, rewritten.data);
+    if (bookmarked.data) HeapFree(GetProcessHeap(), 0, bookmarked.data);
+    if (source.data) HeapFree(GetProcessHeap(), 0, source.data);
+    return changed;
+}
+
+static INT_PTR CALLBACK rwp_file_check_proc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    (void)lParam;
+    if (message == WM_CLOSE) { EndDialog(dialog, 0); return TRUE; }
+    if (message == WM_INITDIALOG)
+    {
+        rwp_theme_dialog(dialog);
+        if (italian)
+        {
+            SetWindowTextW(dialog, L"Controllo collegamenti interni");
+            SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_GROUP, L"Sostituzione percorso");
+            SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_OLD_LABEL, L"Cartella precedente:");
+            SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_NEW_LABEL, L"Nuova cartella:");
+            SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_REPLACE, L"Sostituisci percorso");
+            SetDlgItemTextW(dialog, IDC_INTERNAL_LINK_REFRESH, L"Ricontrolla");
+            SetDlgItemTextW(dialog, IDCANCEL, L"Chiudi");
+        }
+        SendDlgItemMessageW(dialog, IDC_INTERNAL_LINK_OLD, EM_LIMITTEXT, RWP_LINK_MAX_URL - 1, 0);
+        SendDlgItemMessageW(dialog, IDC_INTERNAL_LINK_NEW, EM_LIMITTEXT, RWP_LINK_MAX_URL - 1, 0);
+        rwp_file_check_refresh(dialog);
+        rwp_remember_dialog_position(dialog, IDD_INTERNAL_LINK_CHECK);
+        return TRUE;
+    }
+    if (message == WM_COMMAND)
+    {
+        if (LOWORD(wParam) == IDCANCEL) { EndDialog(dialog, 0); return TRUE; }
+        if (LOWORD(wParam) == IDC_INTERNAL_LINK_REFRESH)
+        { rwp_file_check_refresh(dialog); return TRUE; }
+        if (LOWORD(wParam) == IDC_INTERNAL_LINK_REPLACE)
+        {
+            WCHAR oldFolder[RWP_LINK_MAX_URL], newFolder[RWP_LINK_MAX_URL], result[200];
+            int changed;
+            GetDlgItemTextW(dialog, IDC_INTERNAL_LINK_OLD, oldFolder, RWP_LINK_MAX_URL);
+            GetDlgItemTextW(dialog, IDC_INTERNAL_LINK_NEW, newFolder, RWP_LINK_MAX_URL);
+            if (!rwp_file_folder_prefix(oldFolder) || !rwp_file_folder_prefix(newFolder) ||
+                !lstrcmpW(oldFolder, newFolder))
+            {
+                MessageBoxW(dialog, italian ? L"Inserisci due percorsi assoluti di cartelle diversi." :
+                    L"Enter two different absolute folder paths.", L"Link", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            changed = rwp_file_replace_locations(dialog, oldFolder, newFolder);
+            if (changed == -2) return TRUE;
+            if (changed > 0)
+            {
+                rwp_file_check_refresh(dialog);
+                wsprintfW(result, italian ? L"Collegamenti aggiornati: %d." : L"File links updated: %d.", changed);
+            }
+            else lstrcpyW(result, changed == 0 ? (italian ? L"Nessun collegamento corrispondente." : L"No matching file links.") :
+                (italian ? L"Impossibile completare la sostituzione." : L"Could not complete location replacement."));
+            MessageBoxW(dialog, result, L"Link", MB_OK | (changed < 0 ? MB_ICONWARNING : MB_ICONINFORMATION));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void rwp_file_check_show(void)
+{
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    if (!hEditorWnd || fileFormat != SF_RTF)
+    {
+        MessageBoxW(hMainWnd, italian ? L"Questo strumento richiede un documento RTF." :
+            L"This tool requires an RTF document.", L"Link", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    DialogBoxParamW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDD_INTERNAL_LINK_CHECK),
+                    hMainWnd, rwp_file_check_proc, 0);
+    SetFocus(hEditorWnd);
 }
 
 /* The imported RTF repair runs only when its button is pressed. */
@@ -21779,6 +22354,27 @@ static LRESULT OnNotify( HWND hWnd, LPARAM lParam)
                              rwp_bookmark_missing_proc) == 1)
                         rwp_bookmark_recovery_show();
                 }
+                else if (rwp_file_link_target(url))
+                {
+                    WCHAR path[RWP_LINK_MAX_URL], prompt[RWP_LINK_MAX_URL + 160];
+                    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+                    if (rwp_file_target_path(url, path, RWP_LINK_MAX_URL))
+                    {
+                        if (!rwp_file_link_exists(path))
+                            MessageBoxW(hWnd, path, italian ? L"File non trovato o inaccessibile" :
+                                L"File missing or inaccessible", MB_OK | MB_ICONWARNING);
+                        else
+                        {
+                            lstrcpyW(prompt, italian ? L"Aprire questo file locale?\n\n" :
+                                L"Open this local file?\n\n");
+                            lstrcatW(prompt, path);
+                            if (MessageBoxW(hWnd, prompt, L"Link", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES &&
+                                (INT_PTR)ShellExecuteW(hWnd, L"open", path, NULL, NULL, SW_SHOWNORMAL) <= 32)
+                                MessageBoxW(hWnd, path, italian ? L"Impossibile aprire il file" :
+                                    L"Could not open file", MB_OK | MB_ICONWARNING);
+                        }
+                    }
+                }
                 else ShellExecuteW(hWnd, L"open", url, NULL, NULL, SW_SHOWNORMAL);
                 return 1;
             }
@@ -30524,6 +31120,10 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         rwp_bookmark_recovery_show();
         break;
 
+    case ID_INTERNAL_LINK_CHECK:
+        rwp_file_check_show();
+        break;
+
     case ID_SHOW_SHORTCUTS:
         rwp_open_shortcuts_dialog();
         break;
@@ -31340,7 +31940,9 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                     ID_DEBUG_EXPORT_RAW_RTF,
                     italian ? L"Debug - Esporta RTF dalla memoria..." :
                               L"Debug - Export RTF from memory...");
-                InsertMenuW(submenu, 6, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                InsertMenuW(submenu, 5, MF_BYPOSITION | MF_STRING, ID_INTERNAL_LINK_CHECK,
+                    italian ? L"Controllo collegamenti interni..." : L"Internal Link Check...");
+                InsertMenuW(submenu, 7, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
                 break;
             }
         }
