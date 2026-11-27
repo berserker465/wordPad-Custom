@@ -4130,7 +4130,7 @@ static void rwp_execute_editor_shortcut(HWND editor, UINT command,
     }
 
     if (command != ID_EDIT_COPY && command != ID_EDIT_SELECTALL &&
-        command != ID_FIND &&
+        command != ID_FIND && command != ID_FILE_NEW &&
         (SendMessageW(editor, EM_GETOPTIONS, 0, 0) & ECO_READONLY))
         return;
     if (GetFocus() != editor) SetFocus(editor);
@@ -20373,7 +20373,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
         SetDlgItemTextW(dialog, IDCANCEL, italian ? L"Chiudi" : L"Close");
         SetDlgItemTextW(dialog, IDC_SHORTCUTS_TEXT,
             italian ?
-            L"Ctrl+N = Nuovo\r\n"
+            L"Ctrl+N = Nuovo documento (predefinito; configurabile)\r\n"
             L"Ctrl+O = Apri\r\n"
             L"Ctrl+S = Salva\r\n"
             L"Shift+F12 = Salva\r\n"
@@ -20402,7 +20402,7 @@ static INT_PTR CALLBACK rwp_shortcuts_dialog_proc(HWND dialog, UINT message,
             L"Selezione colori: Su/Destra = su; Giù/Sinistra = giù; Invio = applica; Esc = annulla\r\n"
             L"Alt+A = Inserisci testo (predefinito: @; configurabile)"
             :
-            L"Ctrl+N = New\r\n"
+            L"Ctrl+N = Create new document (default; configurable)\r\n"
             L"Ctrl+O = Open\r\n"
             L"Ctrl+S = Save\r\n"
             L"Shift+F12 = Save\r\n"
@@ -20481,6 +20481,7 @@ static const struct
     {0, L"Unassigned", L"Non assegnato"},
     {ID_INSERT_TEXT, L"Insert text", L"Inserisci testo"},
     {ID_FIND, L"Search", L"Cerca"},
+    {ID_FILE_NEW, L"Create new document", L"Crea nuovo documento"},
     {ID_SHORTCUT_SPACING_SINGLE, L"Line spacing: Single", L"Interlinea: Singola"},
     {ID_SHORTCUT_SPACING_DOUBLE, L"Line spacing: Double", L"Interlinea: Doppia"},
     {ID_SHORTCUT_SPACING_ONE_HALF, L"Line spacing: 1.5 lines", L"Interlinea: 1,5 righe"},
@@ -20530,7 +20531,8 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 {
     IDC_SHORTCUT_MOUSE4, IDC_SHORTCUT_MOUSE5, IDC_SHORTCUT_WHEEL
 };
-/* Version 6 makes Ctrl+F configurable; version 5 made native line spacing
+/* Version 7 makes Ctrl+N configurable; version 6 did the same for Ctrl+F.
+ * Version 5 made native line spacing
  * configurable. Versions 3 and 4 recorded Alt+W and Ctrl+J, respectively.
  * A shortcut explicitly removed in its own version stays removed. */
 #define RWP_SHORTCUT_TEXT_MAX 512
@@ -20538,7 +20540,8 @@ static const int rwpShortcutMouseControls[RWP_MOUSE_SHORTCUT_COUNT] =
 #define RWP_SHORTCUT_BLOB_MAGIC_V3 0x33535752UL /* RWS3 */
 #define RWP_SHORTCUT_BLOB_MAGIC_V4 0x34535752UL /* RWS4 */
 #define RWP_SHORTCUT_BLOB_MAGIC_V5 0x35535752UL /* RWS5 */
-#define RWP_SHORTCUT_BLOB_MAGIC 0x36535752UL /* RWS6 */
+#define RWP_SHORTCUT_BLOB_MAGIC_V6 0x36535752UL /* RWS6 */
+#define RWP_SHORTCUT_BLOB_MAGIC 0x37535752UL /* RWS7 */
 typedef struct
 {
     DWORD magic;
@@ -20629,6 +20632,7 @@ static BOOL rwp_default_shortcut_assignments(
     bindings->keys[RWP_SHORTCUT_ALT]['W'] = ID_FORMAT_COLOR_PICK;
     bindings->keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
     bindings->keys[RWP_SHORTCUT_CONTROL]['F'] = ID_FIND;
+    bindings->keys[RWP_SHORTCUT_CONTROL]['N'] = ID_FILE_NEW;
     rwp_add_number_shortcut_defaults(bindings);
     return rwp_set_shortcut_text(texts, RWP_SHORTCUT_ALT, 'A', L"@");
 }
@@ -20787,6 +20791,7 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         goto done;
     memcpy(&header, buffer, sizeof(header));
     if ((header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V6 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V5 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V4 &&
          header.magic != RWP_SHORTCUT_BLOB_MAGIC_V3 &&
@@ -20858,12 +20863,18 @@ static BOOL rwp_load_shortcut_assignments_v2(void)
         !rwp_shortcut_key_in_use('J', RWP_SHORTCUT_CONTROL))
         rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['J'] = ID_BOOKMARK_ADD;
     if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        header.magic != RWP_SHORTCUT_BLOB_MAGIC_V6 &&
         header.magic != RWP_SHORTCUT_BLOB_MAGIC_V5)
         rwp_add_number_shortcut_defaults(&rwpShortcutCommands);
     if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        header.magic != RWP_SHORTCUT_BLOB_MAGIC_V6 &&
         !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] &&
         !rwp_shortcut_key_in_use('F', RWP_SHORTCUT_CONTROL))
         rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] = ID_FIND;
+    if (header.magic != RWP_SHORTCUT_BLOB_MAGIC &&
+        !rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['N'] &&
+        !rwp_shortcut_key_in_use('N', RWP_SHORTCUT_CONTROL))
+        rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['N'] = ID_FILE_NEW;
     valid = TRUE;
 done:
     if (!valid)
@@ -20991,7 +21002,7 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
     if (!chord) return FALSE;
     action = rwpShortcutCommands.keys[HIWORD(chord)][LOWORD(chord)];
     if (message->hwnd != hEditorWnd &&
-        (action != ID_FIND ||
+        ((action != ID_FIND && action != ID_FILE_NEW) ||
          (message->hwnd != hMainWnd && !IsChild(hMainWnd, message->hwnd))))
         return FALSE;
     /* Explicitly unassigned former defaults must not fall through to
@@ -20999,6 +21010,7 @@ static BOOL rwp_dispatch_shortcut_key(const MSG *message)
     if (!action)
         return HIWORD(chord) == RWP_SHORTCUT_CONTROL &&
                (LOWORD(chord) == 'J' || LOWORD(chord) == 'F' ||
+                LOWORD(chord) == 'N' ||
                 (LOWORD(chord) >= '1' && LOWORD(chord) <= '9'));
     if (rwp_shortcut_key_in_use(LOWORD(chord), HIWORD(chord)))
         return FALSE;
@@ -21111,19 +21123,18 @@ static void rwp_format_shortcut_chord(UINT chord, WCHAR *label)
               (modifiers & RWP_SHORTCUT_SHIFT) ? L"Shift+" : L"", name);
 }
 
-/* Update the existing localized Find label without losing its mnemonic or
- * leaving Ctrl+F advertised after reassignment. Show one configured chord,
- * preferring the original default if it is still assigned to Search. */
-static void rwp_refresh_search_shortcut_label(void)
+/* Update a localized menu label without losing its mnemonic or advertising
+ * a reassigned shortcut. Prefer the original default if still assigned. */
+static void rwp_refresh_command_shortcut_label(UINT command, UINT defaultKey)
 {
     UINT modifiers, key, chord = 0;
     int i;
     if (!rwpMainMenu) return;
-    if (rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL]['F'] == ID_FIND)
-        chord = MAKELONG('F', RWP_SHORTCUT_CONTROL);
+    if (rwpShortcutCommands.keys[RWP_SHORTCUT_CONTROL][defaultKey] == command)
+        chord = MAKELONG(defaultKey, RWP_SHORTCUT_CONTROL);
     for (modifiers = 0; !chord && modifiers < RWP_SHORTCUT_MODIFIER_COUNT; ++modifiers)
         for (key = 0; key < RWP_SHORTCUT_KEY_COUNT; ++key)
-            if (rwpShortcutCommands.keys[modifiers][key] == ID_FIND)
+            if (rwpShortcutCommands.keys[modifiers][key] == command)
             {
                 chord = MAKELONG(key, modifiers);
                 break;
@@ -21134,7 +21145,7 @@ static void rwp_refresh_search_shortcut_label(void)
         WCHAR label[256], shortcut[64], *tab;
         MENUITEMINFOW item;
         int length;
-        if (!menu || !GetMenuStringW(menu, ID_FIND, label,
+        if (!menu || !GetMenuStringW(menu, command, label,
                                      sizeof(label) / sizeof(label[0]), MF_BYCOMMAND))
             continue;
         tab = wcschr(label, L'\t');
@@ -21151,9 +21162,15 @@ static void rwp_refresh_search_shortcut_label(void)
         item.cbSize = sizeof(item);
         item.fMask = MIIM_STRING;
         item.dwTypeData = label;
-        SetMenuItemInfoW(menu, ID_FIND, FALSE, &item);
+        SetMenuItemInfoW(menu, command, FALSE, &item);
         break;
     }
+}
+
+static void rwp_refresh_configurable_shortcut_labels(void)
+{
+    rwp_refresh_command_shortcut_label(ID_FIND, 'F');
+    rwp_refresh_command_shortcut_label(ID_FILE_NEW, 'N');
 }
 
 static void rwp_select_shortcut_list_row(HWND dialog)
@@ -21518,7 +21535,7 @@ static INT_PTR CALLBACK rwp_shortcut_settings_proc(HWND dialog, UINT message,
                     return TRUE;
                 }
                 rwpShortcutCommands = rwpShortcutDraft;
-                rwp_refresh_search_shortcut_label();
+                rwp_refresh_configurable_shortcut_labels();
                 rwp_clear_shortcut_texts(rwpShortcutText);
                 memcpy(rwpShortcutText, rwpShortcutDraftText, sizeof(rwpShortcutText));
                 ZeroMemory(rwpShortcutDraftText, sizeof(rwpShortcutDraftText));
@@ -31710,7 +31727,7 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
     }
     if (!rwpMainMenu) return 1;
     rwp_load_shortcut_assignments(hAccel);
-    rwp_refresh_search_shortcut_label();
+    rwp_refresh_configurable_shortcut_labels();
     /* The View menu is found by a stable command, not by its translated name. */
     {
         const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
