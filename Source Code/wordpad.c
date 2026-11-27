@@ -64,6 +64,9 @@
 #include "wordpad.h"
 #include "cloud_native.h"
 
+/* Runtime-only Help menu command; no resource changes required. */
+#define ID_DEBUG_EXPORT_RAW_RTF 1642
+
 /* The 1080p-or-lower interface uses the application's original 96-DPI
  * dimensions even when Windows display scaling is above 100%. Above 1080p,
  * preserve the program's existing DPI-unaware/Windows-scaled behavior.
@@ -4989,13 +4992,53 @@ static void rwp_bookmark_show_dialog(BOOL add, BOOL createLink)
 /* Read native RTF bookmarks on open. Skip RTF header formatting, objects and
  * binary destinations while counting characters of the RichEdit text story.
  * Complex table/field structures may need further adjustment after tests. */
+/* Match the first control word of a group, with an optional ignorable
+ * destination marker. Never match a longer word such as fieldfoo. */
+static BOOL rwp_bookmark_rtf_group_is(const char *rtf, SIZE_T n, SIZE_T i,
+                                       const char *word)
+{
+    SIZE_T len = strlen(word), at;
+    if (i >= n || rtf[i] != '{') return FALSE;
+    at = i + 1;
+    while (at < n && (rtf[at] == '\r' || rtf[at] == '\n')) ++at;
+    if (n - at < 2 || rtf[at++] != '\\') return FALSE;
+    if (n - at >= 3 && rtf[at] == '*' && rtf[at+1] == '\\') at += 2;
+    return len < n - at && !memcmp(rtf + at, word, len) &&
+           !isalpha((unsigned char)rtf[at+len]);
+}
+
+/* A picture or object occupies one character in the RichEdit story; its
+ * embedded preview and binary/hex data occupy no further positions. */
+static BOOL rwp_bookmark_rtf_object(const char *rtf, SIZE_T n, SIZE_T i)
+{
+    return rwp_bookmark_rtf_group_is(rtf, n, i, "pict") ||
+           rwp_bookmark_rtf_group_is(rtf, n, i, "object") ||
+           rwp_bookmark_rtf_group_is(rtf, n, i, "shppict");
+}
+
+/* Share the character-producing control list between import and export.
+ * Formatting-only words do not occupy story positions. */
+static BOOL rwp_bookmark_rtf_text_word(const char *word)
+{
+    static const char *const words[] = {
+        "par", "line", "tab", "cell", "row", "emdash", "endash", "bullet",
+        "lquote", "rquote", "ldblquote", "rdblquote", "emspace", "enspace",
+        "qmspace", "ltrmark", "rtlmark", "zwj", "zwnj"
+    };
+    SIZE_T k;
+    for (k = 0; k < sizeof(words)/sizeof(words[0]); ++k)
+        if (!strcmp(word, words[k])) return TRUE;
+    return FALSE;
+}
+
 static BOOL rwp_bookmark_rtf_skip_destination(const char *rtf, SIZE_T n, SIZE_T i)
 {
     static const char *const hidden[] = {
         "fonttbl", "colortbl", "stylesheet", "info", "pict", "object",
         "header", "footer", "listtable", "listoverridetable", "xmlnstbl",
         "datastore", "themedata", "colorschememapping",
-        "generator", "revtbl", "filetbl", "latentstyles", "background"
+        "generator", "revtbl", "filetbl", "latentstyles", "background",
+        "nonshppict", "listtext", "pntext"
     };
     SIZE_T j, k;
     if (i + 2 >= n || rtf[i] != '{' || rtf[i+1] != '\\') return FALSE;
@@ -5026,6 +5069,7 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
     static const char prefix[] = "{\\*\\bkmkstart ";
     static const char endPrefix[] = "{\\*\\bkmkend ";
     BOOL skip[256];
+    int groupUc[256] = {1};
     int depth = 0, uc = 1;
     LONG cp = 0;
     SIZE_T i = 0;
@@ -5037,7 +5081,7 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
         unsigned char ch = (unsigned char)rtf[i];
         if (ch == '{')
         {
-            if (i + sizeof(prefix) - 1 < n &&
+            if (!(depth && skip[depth]) && i + sizeof(prefix) - 1 < n &&
                 !memcmp(rtf + i, prefix, sizeof(prefix) - 1) &&
                 rwpPendingBookmarkCount < RWP_BOOKMARK_LIMIT)
             {
@@ -5066,7 +5110,7 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
                     continue;
                 }
             }
-            if (i + sizeof(endPrefix) - 1 < n &&
+            if (!(depth && skip[depth]) && i + sizeof(endPrefix) - 1 < n &&
                 !memcmp(rtf + i, endPrefix, sizeof(endPrefix) - 1))
             {
                 WCHAR name[RWP_BOOKMARK_NAME_LIMIT+1];
@@ -5090,16 +5134,26 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
                     continue;
                 }
             }
-            if (depth < 255)
+            if (depth >= 255) { rwpPendingBookmarkCount = 0; return; }
             {
-                skip[depth+1] = (depth && skip[depth]) ||
+                BOOL parentSkipped = depth && skip[depth];
+                BOOL object = !parentSkipped && rwp_bookmark_rtf_object(rtf, n, i);
+                if (object) ++cp;
+                groupUc[depth+1] = uc;
+                skip[depth+1] = parentSkipped || object ||
                                   rwp_bookmark_rtf_skip_destination(rtf, n, i);
                 ++depth;
             }
             ++i;
             continue;
         }
-        if (ch == '}') { if (depth) --depth; ++i; continue; }
+        if (ch == '}')
+        {
+            if (depth) { uc = groupUc[depth]; --depth; }
+            ++i;
+            if (!depth) break;
+            continue;
+        }
         if (ch == '\\' && i + 1 < n)
         {
             char word[28];
@@ -5145,10 +5199,7 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
                 uc = (int)parameter;
             if (!(depth && skip[depth]))
             {
-                if (!strcmp(word, "par") || !strcmp(word, "line") ||
-                    !strcmp(word, "tab") || !strcmp(word, "cell") ||
-                    !strcmp(word, "row") || !strcmp(word, "emdash") ||
-                    !strcmp(word, "endash") || !strcmp(word, "bullet"))
+                if (rwp_bookmark_rtf_text_word(word))
                     ++cp;
                 else if (!strcmp(word, "u") && hasParameter)
                 {
@@ -5171,21 +5222,22 @@ static void rwp_bookmarks_scan_native_rtf(const char *rtf, SIZE_T n)
     }
 }
 
-/* Insert one empty native RTF bookmark at each live TOM anchor as part of the
+/* Insert native RTF bookmark ranges at live TOM anchors as part of the
  * FILE save operation, not EM_STREAMIN. MSFTEDIT drops the zero-width markers
  * when they are streamed into the edit selection.
  *
  * Offsets are calculated against its RTF output (never against the bytes of a
  * text file). Ignorable destinations and escaped RTF tokens do not count as
  * ordinary text. Hidden hyperlink instructions do occupy character positions
- * in RichEdit's text story. All markers are placed at token boundaries, so
- * RTF escape sequences, field text and binary data are not split. */
+ * in RichEdit's text story. Complete fields and embedded objects are atomic:
+ * never insert a bookmark into their structural groups or payloads. */
 typedef struct RWP_BOOKMARK_SAVE_POS
 {
     LONG cp;
     SIZE_T offset;
     int bookmark;
     BOOL endMarker;
+    BOOL collapsed;
     BOOL placed;
 } RWP_BOOKMARK_SAVE_POS;
 
@@ -5195,24 +5247,47 @@ static int rwp_bookmark_save_compare(const void *a, const void *b)
     const RWP_BOOKMARK_SAVE_POS *right = (const RWP_BOOKMARK_SAVE_POS *)b;
     if (left->cp < right->cp) return -1;
     if (left->cp > right->cp) return 1;
-    if (left->bookmark == right->bookmark)
-        return (int)left->endMarker - (int)right->endMarker;
-    /* End a previous range before opening the next at the same location. */
-    if (left->endMarker != right->endMarker)
-        return left->endMarker ? -1 : 1;
-    return left->bookmark - right->bookmark;
+    /* Total ordering, including several zero-length bookmarks at one CP. */
+    if (left->bookmark != right->bookmark)
+        return left->bookmark - right->bookmark;
+    return (int)left->endMarker - (int)right->endMarker;
+}
+
+static int rwp_bookmark_save_offset_compare(const void *a, const void *b)
+{
+    const RWP_BOOKMARK_SAVE_POS *left = (const RWP_BOOKMARK_SAVE_POS *)a;
+    const RWP_BOOKMARK_SAVE_POS *right = (const RWP_BOOKMARK_SAVE_POS *)b;
+    if (left->placed != right->placed) return left->placed ? -1 : 1;
+    if (left->offset < right->offset) return -1;
+    if (left->offset > right->offset) return 1;
+    return rwp_bookmark_save_compare(a, b);
+}
+
+/* Place ordinary anchors at a real story-character boundary, not at a
+ * formatting/destination control word. */
+static void rwp_bookmark_place_through(RWP_BOOKMARK_SAVE_POS *positions,
+                                      int count, int *pending, LONG cp, SIZE_T at)
+{
+    while (*pending < count && positions[*pending].cp <= cp)
+    {
+        positions[*pending].offset = at;
+        positions[(*pending)++].placed = TRUE;
+    }
 }
 
 static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
-                                          RWP_LINKOUTPUT *patched)
+                                          RWP_LINKOUTPUT *patched,
+                                          BOOL bestEffort)
 {
     RWP_BOOKMARK_SAVE_POS positions[2 * RWP_BOOKMARK_LIMIT];
     BOOL skip[256] = {FALSE};
-    BOOL fieldInstruction[256] = {FALSE};
+    int groupUc[256] = {1};
+    int atomicDepth = 0;
+    SIZE_T atomicStart = 0;
+    int placedCount[RWP_BOOKMARK_LIMIT] = {0};
     int count = 0, depth = 0, uc = 1, pending = 0;
     LONG cp = 0;
     SIZE_T i = 0, rootEnd = 0, extra = 0, last = 0, written = 0;
-    BOOL bodyStarted = FALSE;
     int k;
 
     ZeroMemory(patched, sizeof(*patched));
@@ -5228,18 +5303,23 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
                    rwpBookmarks[k].range, &start)) ||
             FAILED(rwpBookmarks[k].range->lpVtbl->GetEnd(
                    rwpBookmarks[k].range, &end)) || start < 0 || end < start)
+        {
+            if (bestEffort) continue;
             return FALSE;
+        }
         for (j = 0; j < 2; ++j)
         {
             positions[count].cp = j ? end : start;
             positions[count].bookmark = k;
             positions[count].endMarker = j != 0;
+            positions[count].collapsed = start == end;
             positions[count].offset = 0;
             positions[count].placed = FALSE;
             extra += (SIZE_T)lstrlenW(rwpBookmarks[k].name) + 24;
             ++count;
         }
     }
+    if (!count) return FALSE;
     qsort(positions, count, sizeof(positions[0]), rwp_bookmark_save_compare);
 
     while (i < n)
@@ -5248,25 +5328,49 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
         SIZE_T token = i;
         if (ch == '{')
         {
-            if (depth < 255)
+            BOOL parentSkipped = depth && skip[depth];
+            BOOL object = !parentSkipped &&
+                          rwp_bookmark_rtf_object((const char *)rtf, n, i);
+            BOOL field = !parentSkipped &&
+                         rwp_bookmark_rtf_group_is((const char *)rtf, n, i, "field");
+            if (depth >= 255) return FALSE;
+            if (!atomicDepth && (object || field))
             {
-                skip[depth+1] = (depth && skip[depth]) ||
-                    rwp_bookmark_rtf_skip_destination((const char *)rtf, n, i);
-                /* Count fldinst's hidden text, but never insert RTF groups
-                 * inside its literal HYPERLINK instruction/quoted address. */
-                fieldInstruction[depth+1] = (depth && fieldInstruction[depth]) ||
-                    (i + 11 < n &&
-                     (!memcmp(rtf+i, "{\\*\\fldinst", 11) ||
-                      !memcmp(rtf+i, "{\\fldinst", 9)));
-                ++depth;
+                /* The opening brace is part of the field/object. Markers at
+                 * its starting CP belong BEFORE that brace, not after it. */
+                rwp_bookmark_place_through(positions, count, &pending, cp, i);
+                atomicStart = i;
+                atomicDepth = depth + 1;
             }
+            if (object) ++cp;
+            groupUc[depth+1] = uc;
+            skip[depth+1] = parentSkipped || object ||
+                rwp_bookmark_rtf_skip_destination((const char *)rtf, n, i);
+            ++depth;
             ++i;
             continue;
         }
         if (ch == '}')
         {
-            if (depth == 1) rootEnd = i;
-            if (depth) --depth;
+            if (!depth) return FALSE;
+            if (atomicDepth && depth == atomicDepth)
+            {
+                /* Retain whole hyperlink fields byte-for-byte. A range with
+                 * an endpoint strictly inside the field expands to the edge;
+                 * a collapsed bookmark remains collapsed before the field. */
+                while (pending < count && positions[pending].cp <= cp)
+                {
+                    RWP_BOOKMARK_SAVE_POS *pos = &positions[pending++];
+                    pos->offset = (pos->cp == cp ||
+                                   (pos->endMarker && !pos->collapsed)) ?
+                                  i + 1 : atomicStart;
+                    pos->placed = TRUE;
+                }
+                atomicDepth = 0;
+            }
+            uc = groupUc[depth];
+            if (depth == 1) { rootEnd = i; break; }
+            --depth;
             ++i;
             continue;
         }
@@ -5283,12 +5387,8 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
                 {
                     if (!(depth && skip[depth]))
                     {
-                        if (bodyStarted && !(depth && fieldInstruction[depth]))
-                            while (pending < count && positions[pending].cp <= cp)
-                            {
-                                positions[pending].offset = token;
-                                positions[pending++].placed = TRUE;
-                            }
+                        if (!atomicDepth)
+                        rwp_bookmark_place_through(positions, count, &pending, cp, token);
                         ++cp;
                     }
                     j += 2;
@@ -5297,12 +5397,8 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
                          (symbol == '\\' || symbol == '{' || symbol == '}' ||
                           symbol == '~' || symbol == '_' || symbol == '-'))
                 {
-                    if (bodyStarted && !(depth && fieldInstruction[depth]))
-                        while (pending < count && positions[pending].cp <= cp)
-                        {
-                            positions[pending].offset = token;
-                            positions[pending++].placed = TRUE;
-                        }
+                    if (!atomicDepth)
+                        rwp_bookmark_place_through(positions, count, &pending, cp, token);
                     ++cp;
                 }
                 i = j;
@@ -5324,16 +5420,6 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
             }
             if (negative) parameter = -parameter;
             if (j < n && rtf[j] == ' ') ++j;
-            if (depth == 1 && (!strcmp(word, "pard") ||
-                               !strcmp(word, "trowd")))
-                bodyStarted = TRUE;
-            if (bodyStarted && !(depth && skip[depth]) &&
-                !(depth && fieldInstruction[depth]))
-                while (pending < count && positions[pending].cp <= cp)
-                {
-                    positions[pending].offset = token;
-                    positions[pending++].placed = TRUE;
-                }
             if (!strcmp(word, "bin") && hasParameter && parameter > 0)
             {
                 i = (SIZE_T)parameter > n-j ? n : j+(SIZE_T)parameter;
@@ -5343,14 +5429,17 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
                 uc = (int)parameter;
             if (!(depth && skip[depth]))
             {
-                if (!strcmp(word, "par") || !strcmp(word, "line") ||
-                    !strcmp(word, "tab") || !strcmp(word, "cell") ||
-                    !strcmp(word, "row") || !strcmp(word, "emdash") ||
-                    !strcmp(word, "endash") || !strcmp(word, "bullet"))
+                if (rwp_bookmark_rtf_text_word(word))
+                {
+                    if (!atomicDepth)
+                        rwp_bookmark_place_through(positions, count, &pending, cp, token);
                     ++cp;
+                }
                 else if (!strcmp(word, "u") && hasParameter)
                 {
                     int fallback = uc;
+                    if (!atomicDepth)
+                        rwp_bookmark_place_through(positions, count, &pending, cp, token);
                     ++cp;
                     while (fallback-- > 0 && j < n && rtf[j] != '{' && rtf[j] != '}')
                     {
@@ -5365,13 +5454,8 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
         }
         if (!(depth && skip[depth]) && ch != '\r' && ch != '\n' && ch != 0)
         {
-            if (!bodyStarted && depth == 1) bodyStarted = TRUE;
-            if (bodyStarted && !(depth && fieldInstruction[depth]))
-                while (pending < count && positions[pending].cp <= cp)
-                {
-                    positions[pending].offset = token;
-                    positions[pending++].placed = TRUE;
-                }
+            if (!atomicDepth)
+                rwp_bookmark_place_through(positions, count, &pending, cp, token);
             ++cp;
         }
         ++i;
@@ -5384,8 +5468,15 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
         positions[pending].offset = rootEnd;
         positions[pending++].placed = TRUE;
     }
-    if (pending != count || extra > (SIZE_T)-1 - n - 1) return FALSE;
+    if ((!bestEffort && pending != count) ||
+        extra > (SIZE_T)-1 - n - 1) return FALSE;
+    /* File saves are best-effort: omit both markers of an unmappable
+     * bookmark, never emit an orphaned start or end marker. In-memory RTF
+     * round trips still require every bookmark to survive. */
+    for (k = 0; k < count; ++k)
+        if (positions[k].placed) ++placedCount[positions[k].bookmark];
 
+    qsort(positions, count, sizeof(positions[0]), rwp_bookmark_save_offset_compare);
     patched->capacity = n + extra + 1;
     patched->data = HeapAlloc(GetProcessHeap(), 0, patched->capacity);
     if (!patched->data) return FALSE;
@@ -5395,6 +5486,7 @@ static BOOL rwp_bookmarks_patch_saved_rtf(const BYTE *rtf, SIZE_T n,
         int m = 0, j;
         LPCWSTR name = rwpBookmarks[positions[k].bookmark].name;
         SIZE_T at = positions[k].offset;
+        if (placedCount[positions[k].bookmark] != 2) continue;
         if (at < last || at > n) goto error;
         memcpy(patched->data + written, rtf + last, at - last);
         written += at - last;
@@ -8263,7 +8355,7 @@ static int rwp_bookmark_fix_dead_links(LPCWSTR oldName, LPCWSTR newName, BOOL un
     if (!rwp_patch_rtf_with_original_images(&source)) goto done;
     if (rwpBookmarkCount)
     {
-        if (!rwp_bookmarks_patch_saved_rtf(source.data, source.used, &bookmarked))
+        if (!rwp_bookmarks_patch_saved_rtf(source.data, source.used, &bookmarked, FALSE))
             goto done;
     }
     else
@@ -10559,19 +10651,16 @@ static BOOL DoSaveFile(LPCWSTR wszSaveFileName, WPARAM format,
         if (rwpBookmarkCount)
         {
             RWP_LINKOUTPUT withBookmarks;
-            if (!rwp_bookmarks_patch_saved_rtf(memory.data, memory.used,
-                                              &withBookmarks))
+            /* Bookmark serialization must not prevent saving document edits.
+             * Keep the original exported RTF if the patch itself fails. */
+            if (rwp_bookmarks_patch_saved_rtf(memory.data, memory.used,
+                                             &withBookmarks, TRUE))
             {
                 HeapFree(GetProcessHeap(), 0, memory.data);
-                MessageBoxW(hMainWnd,
-                    L"Unable to preserve bookmarks in the RTF document.",
-                    wszAppTitle, MB_OK | MB_ICONEXCLAMATION);
-                return FALSE;
+                memory.data = (BYTE *)withBookmarks.data;
+                memory.used = withBookmarks.used;
+                memory.capacity = withBookmarks.capacity;
             }
-            HeapFree(GetProcessHeap(), 0, memory.data);
-            memory.data = (BYTE *)withBookmarks.data;
-            memory.used = withBookmarks.used;
-            memory.capacity = withBookmarks.capacity;
         }
         if (!rwp_cloud_insert_rtf(&memory))
         {
@@ -10836,12 +10925,15 @@ static BOOL rwp_backup_write(void)
         !rwp_patch_rtf_with_original_images(&memory)) goto done;
     if (rwpBookmarkCount)
     {
-        if (!rwp_bookmarks_patch_saved_rtf(memory.data, memory.used,
-                                           &withBookmarks)) goto done;
-        HeapFree(GetProcessHeap(), 0, memory.data);
-        memory.data = (BYTE *)withBookmarks.data;
-        memory.used = withBookmarks.used;
-        memory.capacity = withBookmarks.capacity;
+        /* Local backups follow the same best-effort bookmark save policy. */
+        if (rwp_bookmarks_patch_saved_rtf(memory.data, memory.used,
+                                         &withBookmarks, TRUE))
+        {
+            HeapFree(GetProcessHeap(), 0, memory.data);
+            memory.data = (BYTE *)withBookmarks.data;
+            memory.used = withBookmarks.used;
+            memory.capacity = withBookmarks.capacity;
+        }
     }
     /* Local automatic .bak generations must retain document cloud settings. */
     if (fileFormat == SF_RTF && rwpCloudMetadataUnsafe) goto done;
@@ -22489,6 +22581,65 @@ static BOOL rwp_get_raw_document(WCHAR **textOut, LONG *lengthOut)
     return TRUE;
 }
 
+/* Diagnostic snapshot: stream the live document's native RTF directly to
+ * a text file, with no WordPad save-time patches or encoding conversion.
+ * RichEdit does not own the separate WordPad bookmark/cloud metadata. */
+static void rwp_debug_export_raw_rtf(HWND owner)
+{
+    WCHAR path[MAX_PATH] = L"WordPad_Debug_RTF.txt";
+    OPENFILENAMEW dialog;
+    HANDLE file;
+    EDITSTREAM stream;
+    LARGE_INTEGER size;
+    BOOL success;
+    const BOOL italian = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_ITALIAN;
+    const WCHAR *title = italian ? L"Esporta RTF di debug" : L"Export debug RTF";
+
+    if (!hEditorWnd || !IsWindow(hEditorWnd)) return;
+
+    ZeroMemory(&dialog, sizeof(dialog));
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrTitle = title;
+    dialog.lpstrFilter = italian ? L"File di testo (*.txt)\0*.txt\0\0" :
+                                     L"Text files (*.txt)\0*.txt\0\0";
+    dialog.lpstrFile = path;
+    dialog.nMaxFile = MAX_PATH;
+    dialog.lpstrDefExt = L"txt";
+    dialog.nFilterIndex = 1;
+    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT |
+                   OFN_HIDEREADONLY | OFN_ENABLESIZING | OFN_NOCHANGEDIR;
+
+    while (GetSaveFileNameW(&dialog))
+    {
+        if (wszFileName[0] && rwp_same_document_path(wszFileName, path))
+        {
+            MessageBoxW(owner, italian ? L"Scegli un file diverso dal documento aperto." :
+                        L"Choose a file other than the open document.", title,
+                        MB_OK | MB_ICONWARNING);
+            continue;
+        }
+
+        file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+        success = FALSE;
+        if (file != INVALID_HANDLE_VALUE)
+        {
+            ZeroMemory(&stream, sizeof(stream));
+            stream.dwCookie = (DWORD_PTR)file;
+            stream.pfnCallback = stream_out;
+            SendMessageW(hEditorWnd, EM_STREAMOUT, SF_RTF, (LPARAM)&stream);
+            success = !stream.dwError && GetFileSizeEx(file, &size) &&
+                      size.QuadPart > 0;
+            if (!CloseHandle(file)) success = FALSE;
+        }
+        if (!success)
+            MessageBoxW(owner, italian ? L"Impossibile esportare l'RTF di debug." :
+                        L"Unable to export the debug RTF.", title, MB_OK | MB_ICONERROR);
+        break;
+    }
+}
+
 /* Table count is derived from RichEdit's structural row markers, not from
  * occurrences of the word "table" or from the number of individual cells.
  * Consecutive structural rows belong to the same table. This read-only scan
@@ -27402,7 +27553,7 @@ static void rwp_apply_image_compression(RWP_IMAGE_COMPRESSION_OPTIONS *settings)
     if (rwpBookmarkCount)
     {
         if (!rwp_bookmarks_patch_saved_rtf(converted.data, converted.used,
-                                           &bookmarked)) goto done;
+                                           &bookmarked, FALSE)) goto done;
         finalized.data = (BYTE *)bookmarked.data;
         finalized.used = bookmarked.used;
     }
@@ -27410,7 +27561,7 @@ static void rwp_apply_image_compression(RWP_IMAGE_COMPRESSION_OPTIONS *settings)
     /* Cache the original bookmark-bearing stream before reload, because a
      * failed reload may have cleared the in-memory bookmark registry. */
     if (rwpBookmarkCount && !rwp_bookmarks_patch_saved_rtf(original.data,
-                                   original.used, &backupBookmarks)) goto done;
+                                   original.used, &backupBookmarks, FALSE)) goto done;
     if (!rwp_recovery_reload_rtf(&finalized))
     {
         RTF_MEMORY backup = original;
@@ -29553,6 +29704,10 @@ static LRESULT OnCommand( HWND hWnd, WPARAM wParam, LPARAM lParam)
         DialogBoxW(GetModuleHandleW(0), MAKEINTRESOURCEW(IDD_TABSTOPS), hWnd, tabstops_proc);
         break;
 
+    case ID_DEBUG_EXPORT_RAW_RTF:
+        rwp_debug_export_raw_rtf(hWnd);
+        break;
+
     case ID_ABOUT:
         dialog_about();
         break;
@@ -30316,7 +30471,11 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hOldInstance, LPSTR szCmdPar
                               L"Bookmark Tools...");
                 InsertMenuW(submenu, 3, MF_BYPOSITION | MF_STRING, ID_CONFIGURE_SIZES,
                     italian ? L"Configura dimensioni carattere..." : L"Configure font sizes...");
-                InsertMenuW(submenu, 5, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+                InsertMenuW(submenu, 5, MF_BYPOSITION | MF_STRING,
+                    ID_DEBUG_EXPORT_RAW_RTF,
+                    italian ? L"Debug - Esporta RTF dalla memoria..." :
+                              L"Debug - Export RTF from memory...");
+                InsertMenuW(submenu, 6, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
                 break;
             }
         }
